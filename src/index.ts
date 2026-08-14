@@ -1,18 +1,15 @@
 import { config } from "./config"
+import { runHarness } from "./core/harness"
 
 async function main() {
-  console.log("Ixa starting...")
-  console.log(`LLM backend: ${config.llm.baseURL}`)
-  console.log(`LLM model:   ${config.llm.model}`)
-  console.log(`Voice mode:  ${config.voice.enabled ? "enabled" : "disabled (text mode)"}`)
+  console.log(`Ixa — ${config.llm.model} @ ${config.llm.baseURL}`)
 
   if (!config.llm.apiKey) {
-    console.error("ERROR: LLM_API_KEY is not set. Copy .env.example to .env and fill in your Groq key.")
+    console.error("ERROR: LLM_API_KEY is not set. Copy .env.example to .env and fill in your key.")
     process.exit(1)
   }
 
-  // Phase 1: voice loop + basic chat
-  // Claude Code will build out from here.
+  await runHarness()
 }
 
 main().catch((err) => {
