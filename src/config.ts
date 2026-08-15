@@ -31,8 +31,8 @@ export const config = {
     url: process.env.NTFY_URL ?? "http://localhost:2586",
     topic: process.env.NTFY_TOPIC ?? "jarvis",
   },
-  brave: {
-    apiKey: process.env.BRAVE_API_KEY ?? "",
+  tavily: {
+    apiKey: process.env.TAVILY_API_KEY ?? "",
   },
   google: {
     clientId: process.env.GOOGLE_CLIENT_ID ?? "",

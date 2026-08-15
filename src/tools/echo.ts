@@ -10,6 +10,6 @@ export const echoTool: Tool = {
     },
     required: ["message"],
   },
-  requiresConfirmation: false,
+  requiresConfirmation: true,
   execute: async (input) => (input as { message: string }).message,
 }

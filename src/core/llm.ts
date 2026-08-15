@@ -20,7 +20,8 @@ export type LLMResponse =
 
 export async function chat(
   messages: Message[],
-  tools?: OpenAI.Chat.ChatCompletionTool[]
+  tools?: OpenAI.Chat.ChatCompletionTool[],
+  options?: { silent?: boolean }
 ): Promise<LLMResponse> {
   const stream = await client.chat.completions.create({
     model: config.llm.model,
@@ -37,8 +38,6 @@ export async function chat(
     if (!delta) continue
 
     if (delta.content) {
-      if (!textContent) process.stdout.write("Ixa: ")
-      process.stdout.write(delta.content)
       textContent += delta.content
     }
 
@@ -63,6 +62,14 @@ export async function chat(
     }
   }
 
-  process.stdout.write("\n\n")
+  // Groq/Llama sometimes outputs tool calls as raw text instead of via the API
+  // mechanism. Detect and throw so the session can retry without tools.
+  if (textContent.includes("<function")) {
+    throw new Error("malformed tool call in text content")
+  }
+
+  if (!options?.silent) {
+    process.stdout.write(`Ixa: ${textContent}\n\n`)
+  }
   return { type: "text", content: textContent }
 }

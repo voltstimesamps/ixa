@@ -1,5 +1,8 @@
+import "./tools/register"
 import { config } from "./config"
 import { runHarness } from "./core/harness"
+import { createRestServer } from "./api/rest"
+import { createWsServer } from "./api/websocket"
 
 async function main() {
   console.log(`Ixa — ${config.llm.model} @ ${config.llm.baseURL}`)
@@ -9,7 +12,17 @@ async function main() {
     process.exit(1)
   }
 
-  await runHarness()
+  await Promise.all([
+    createRestServer(config.server.port),
+    createWsServer(config.server.wsPort),
+  ])
+
+  if (config.voice.enabled) {
+    console.log("Voice mode: active. Awaiting WebSocket clients.")
+  } else {
+    console.log("Text mode: starting stdin REPL.")
+    await runHarness()
+  }
 }
 
 main().catch((err) => {

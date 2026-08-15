@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.1",
     "dotenv": "^16.4.0",
     "hono": "^4.4.0",
     "openai": "^4.52.0",
