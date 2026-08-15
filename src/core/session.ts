@@ -12,8 +12,12 @@ const SYSTEM_PROMPT =
   "- get_time: return the current local time.\n" +
   "- get_date: return today's date.\n" +
   "- echo: repeat text back.\n" +
-  "When a tool is available that can answer the user's question, use it — do not claim you lack the ability. " +
-  "For purely conversational messages with no informational need, respond directly without tools."
+  "Use tools whenever they are the right way to fulfill the user's request. " +
+  "Use shell_read for any filesystem, process, or system inspection tasks. " +
+  "Use shell_write for any filesystem modifications or directory changes. " +
+  "Use web_search for current events or facts you are uncertain about. " +
+  "For purely conversational messages with no action required, respond directly without tools. " +
+  "When reading file contents, prefer head -n 50 over cat to avoid large outputs unless the user explicitly asks for the full file."
 
 const DESCRIBE_ACTION_PROMPT =
   "You are describing an action about to be taken by an AI assistant. " +
@@ -24,7 +28,7 @@ const DESCRIBE_ACTION_PROMPT =
 export class Session {
   private readonly messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }]
   private readonly confirmer: Confirmer
-  private workingDirectory: string = os.homedir()
+  private workingDirectory: string = process.env.HOME ?? os.homedir()
 
   constructor(confirmer: Confirmer) {
     this.confirmer = confirmer
@@ -70,7 +74,9 @@ export class Session {
         if (!retrying && (
           msg.toLowerCase().includes("failed to call a function") ||
           msg.toLowerCase().includes("tool call validation failed") ||
-          msg.toLowerCase().includes("malformed tool call")
+          msg.toLowerCase().includes("malformed tool call") ||
+          msg.toLowerCase().includes("parsing failed") ||
+          msg.toLowerCase().includes("could not be parsed")
         )) {
           retrying = true
           continue
@@ -163,7 +169,6 @@ export class Session {
             // not a cd result, use result as-is
           }
         }
-
         this.messages.push({
           role: "tool",
           tool_call_id: tc.id,

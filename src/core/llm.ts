@@ -27,6 +27,8 @@ export async function chat(
     model: config.llm.model,
     messages,
     tools: tools?.length ? tools : undefined,
+    tool_choice: tools?.length ? "auto" : undefined,
+    temperature: 0.2,
     stream: true,
   })
 
