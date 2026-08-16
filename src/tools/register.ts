@@ -5,6 +5,7 @@ import { echoTool } from "./echo"
 import { searchTool } from "./search"
 import { shellReadTool } from "./shell-read"
 import { shellWriteTool } from "./shell-write"
+import { notifyTool } from "./notify"
 
 registry.register(timeTool)
 registry.register(dateTool)
@@ -12,3 +13,4 @@ registry.register(echoTool)
 registry.register(searchTool)
 registry.register(shellReadTool)
 registry.register(shellWriteTool)
+registry.register(notifyTool)

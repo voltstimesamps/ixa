@@ -3,6 +3,7 @@ import { config } from "./config"
 import { runHarness } from "./core/harness"
 import { createRestServer } from "./api/rest"
 import { createWsServer } from "./api/websocket"
+import { startScheduler } from "./proactive/scheduler"
 
 async function main() {
   console.log(`Ixa — ${config.llm.model} @ ${config.llm.baseURL}`)
@@ -16,6 +17,8 @@ async function main() {
     createRestServer(config.server.port),
     createWsServer(config.server.wsPort),
   ])
+
+  startScheduler()
 
   if (config.voice.enabled) {
     console.log("Voice mode: active. Awaiting WebSocket clients.")
