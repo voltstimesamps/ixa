@@ -2,6 +2,7 @@ import { WebSocketServer } from "ws"
 import { Session } from "../core/session"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
 import { speak } from "../voice/tts"
+import { transcribe, pcmToWav } from "../voice/stt"
 import type { WsMessage } from "./types"
 
 export function createWsServer(port: number): Promise<void> {
@@ -23,9 +24,32 @@ export function createWsServer(port: number): Promise<void> {
 
       send({ type: "sessionStart" })
 
+      const handleUserMessage = async (text: string) => {
+        try {
+          const result = await session.send(text)
+          send({ type: "assistant", content: result })
+
+          if (result.trim()) {
+            try {
+              const audio = await speak(result)
+              send({ type: "audioStart" })
+              ws.send(audio)
+              send({ type: "audioOutputEnd" })
+            } catch (err) {
+              console.error("TTS error:", err instanceof Error ? err.message : String(err))
+            }
+          }
+        } catch (err) {
+          const content = err instanceof Error ? err.message : String(err)
+          send({ type: "error", content })
+          ws.close()
+        }
+      }
+
       ws.on("message", async (data, isBinary) => {
         if (isBinary) {
-          console.log("binary frame received, ignoring (voice not yet implemented)")
+          const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer)
+          session.appendAudioChunk(chunk)
           return
         }
 
@@ -33,24 +57,23 @@ export function createWsServer(port: number): Promise<void> {
           const msg: WsMessage = JSON.parse(data.toString()) as WsMessage
 
           if (msg.type === "user") {
-            try {
-              const result = await session.send(msg.content ?? "")
-              send({ type: "assistant", content: result })
-
-              if (result.trim()) {
-                try {
-                  const audio = await speak(result)
-                  send({ type: "audioStart" })
-                  ws.send(audio)
-                  send({ type: "audioOutputEnd" })
-                } catch (err) {
-                  console.error("TTS error:", err instanceof Error ? err.message : String(err))
+            await handleUserMessage(msg.content ?? "")
+          } else if (msg.type === "audioStart") {
+            session.startAudioInput()
+          } else if (msg.type === "audioInputEnd") {
+            const pcm = session.endAudioInput()
+            if (pcm && pcm.length > 0) {
+              try {
+                const { text } = await transcribe(pcmToWav(pcm))
+                if (text.trim()) {
+                  await handleUserMessage(text)
+                } else {
+                  console.log("STT: empty transcript, discarding")
                 }
+              } catch (err) {
+                console.error("STT error:", err instanceof Error ? err.message : String(err))
+                send({ type: "error", content: "Transcription failed" })
               }
-            } catch (err) {
-              const content = err instanceof Error ? err.message : String(err)
-              send({ type: "error", content })
-              ws.close()
             }
           } else if (msg.type === "confirmReply") {
             if (msg.requestId && msg.content) {

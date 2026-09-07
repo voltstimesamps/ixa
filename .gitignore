@@ -13,6 +13,8 @@ __pycache__/
 *.pyo
 sidecars/**/venv/
 sidecars/**/__pycache__/
+clients/**/venv/
+clients/**/__pycache__/
 
 # OS
 .DS_Store

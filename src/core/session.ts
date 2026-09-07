@@ -29,6 +29,7 @@ export class Session {
   private readonly messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }]
   private readonly confirmer: Confirmer
   private workingDirectory: string = process.env.HOME ?? os.homedir()
+  private audioChunks: Buffer[] | null = null
 
   constructor(confirmer: Confirmer) {
     this.confirmer = confirmer
@@ -37,6 +38,21 @@ export class Session {
   async send(userInput: string): Promise<string> {
     this.messages.push({ role: "user", content: userInput })
     return this.runToolLoop()
+  }
+
+  startAudioInput(): void {
+    this.audioChunks = []
+  }
+
+  appendAudioChunk(chunk: Buffer): void {
+    this.audioChunks?.push(chunk)
+  }
+
+  endAudioInput(): Buffer | null {
+    if (!this.audioChunks) return null
+    const combined = Buffer.concat(this.audioChunks)
+    this.audioChunks = null
+    return combined
   }
 
   private async generateDescription(toolName: string, args: string): Promise<string> {
