@@ -9,6 +9,7 @@ export const config = {
   },
   voice: {
     enabled: process.env.VOICE_MODE === "true",
+    ttsUrl: process.env.TTS_URL ?? "http://localhost:5001",
   },
   qdrant: {
     url: process.env.QDRANT_URL ?? "http://localhost:6333",

@@ -1,6 +1,7 @@
 import { WebSocketServer } from "ws"
 import { Session } from "../core/session"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
+import { speak } from "../voice/tts"
 import type { WsMessage } from "./types"
 
 export function createWsServer(port: number): Promise<void> {
@@ -35,6 +36,17 @@ export function createWsServer(port: number): Promise<void> {
             try {
               const result = await session.send(msg.content ?? "")
               send({ type: "assistant", content: result })
+
+              if (result.trim()) {
+                try {
+                  const audio = await speak(result)
+                  send({ type: "audioStart" })
+                  ws.send(audio)
+                  send({ type: "audioOutputEnd" })
+                } catch (err) {
+                  console.error("TTS error:", err instanceof Error ? err.message : String(err))
+                }
+              }
             } catch (err) {
               const content = err instanceof Error ? err.message : String(err)
               send({ type: "error", content })
