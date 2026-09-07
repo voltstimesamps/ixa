@@ -29,3 +29,4 @@ logs/
 # Qdrant local data (if running without Docker)
 qdrant_storage/
 ixa-test.txt
+ixa-test.txt
