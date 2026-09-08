@@ -16,7 +16,7 @@ export function createRestServer(port: number): Promise<void> {
   app.post("/chat", async (c) => {
     try {
       const body = await c.req.json<{ message: string }>()
-      const response = await session.send(body.message)
+      const response = await session.send(body.message, "text")
       return c.json({ response })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)

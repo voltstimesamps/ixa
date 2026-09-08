@@ -25,6 +25,18 @@ const DESCRIBE_ACTION_PROMPT =
   "Be concrete about what will happen — include relevant details like recipient, subject, " +
   "or target from the context. Do not ask for confirmation yourself."
 
+const VOICE_RESPONSE_PROMPT =
+  "You are responding to a voice conversation. This response will be spoken aloud by a " +
+  "text-to-speech system, not displayed as text. Keep your response concise — a few sentences " +
+  "at most unless the user is explicitly asking for something that requires more detail (e.g. " +
+  "reciting a list they asked for). Do not use markdown formatting, code blocks, bullet points, " +
+  "headers, or any other visual formatting — write in plain spoken sentences only, since none of " +
+  "that renders in speech. If the user's request genuinely requires a long or code-heavy answer, " +
+  "say so briefly and ask if they'd like you to continue rather than producing a full " +
+  "essay-length spoken response."
+
+export type MessageOrigin = "voice" | "text"
+
 export class Session {
   private readonly messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }]
   private readonly confirmer: Confirmer
@@ -35,9 +47,9 @@ export class Session {
     this.confirmer = confirmer
   }
 
-  async send(userInput: string): Promise<string> {
+  async send(userInput: string, origin: MessageOrigin = "text"): Promise<string> {
     this.messages.push({ role: "user", content: userInput })
-    return this.runToolLoop()
+    return this.runToolLoop(origin)
   }
 
   startAudioInput(): void {
@@ -76,7 +88,12 @@ export class Session {
     return `Run tool '${toolName}' with arguments: ${args}`
   }
 
-  private async runToolLoop(): Promise<string> {
+  private messagesForCall(origin: MessageOrigin): Message[] {
+    if (origin !== "voice") return this.messages
+    return [...this.messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+  }
+
+  private async runToolLoop(origin: MessageOrigin): Promise<string> {
     const tools = registry.toOpenAI()
     let retrying = false
 
@@ -84,7 +101,7 @@ export class Session {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
       let response: LLMResponse
       try {
-        response = await chat(this.messages, retrying ? [] : tools)
+        response = await chat(this.messagesForCall(origin), retrying ? [] : tools)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (!retrying && (

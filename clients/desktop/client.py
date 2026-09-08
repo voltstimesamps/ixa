@@ -3,7 +3,10 @@ import io
 import json
 import logging
 import os
+import queue
 import sys
+import threading
+import time
 import wave
 
 import numpy as np
@@ -31,24 +34,46 @@ MIC_SAMPLE_RATE = SileroVAD.SAMPLE_RATE  # 16000 — required by Silero VAD and 
 RECORD_MODE = os.environ.get("IXA_RECORD_MODE", "vad")
 
 
-async def playWav(wavBytes: bytes, loop: asyncio.AbstractEventLoop) -> None:
+def decodeWavChunk(wavBytes: bytes) -> np.ndarray:
+    # Each binary frame from the harness is its own independently-valid WAV
+    # blob (one per TTS-synthesized chunk), so it's decoded standalone rather
+    # than concatenated with neighboring frames before parsing.
     buf = io.BytesIO(wavBytes)
     with wave.open(buf, "rb") as wf:
         frames = wf.readframes(wf.getnframes())
-        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767
-    sd.play(audio, samplerate=PLAYBACK_SAMPLE_RATE)
-    await loop.run_in_executor(None, sd.wait)
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767
+
+
+def playbackWorker(audioQueue: "queue.Queue") -> None:
+    # Runs on its own thread so it can block on stream writes while the
+    # asyncio receiver keeps pulling in later chunks concurrently — this is
+    # what actually lets playback start before the full reply has arrived.
+    stream = sd.OutputStream(samplerate=PLAYBACK_SAMPLE_RATE, channels=1, dtype="float32")
+    stream.start()
+    try:
+        while True:
+            block = audioQueue.get()
+            if block is None:
+                break
+            stream.write(block)
+    finally:
+        stream.stop()
+        stream.close()
 
 
 async def main() -> None:
     print(f"Connecting to {WS_URL}...")
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, max_size=20 * 1024 * 1024) as ws:
         print("Connected. Type a message and press Enter.\n")
         loop = asyncio.get_event_loop()
 
-        audioBuffer = bytearray()
+        audioQueue: "queue.Queue | None" = None
+        playbackThread: threading.Thread | None = None
         collectingAudio = False
         isSpeaking = False  # True while TTS audio is playing — gates the mic so playback can't trigger recording
+        chunkCount = 0
+        audioStartedAt = 0.0
+        firstChunkAt: float | None = None
 
         vad = SileroVAD()
         frameBuffer = FrameBuffer(window_samples=SileroVAD.CHUNK_SAMPLES)
@@ -67,11 +92,19 @@ async def main() -> None:
         recorder = VoiceActivityRecorder(onSpeechStart, onFrame, onSpeechEnd)
 
         async def receiver() -> None:
-            nonlocal audioBuffer, collectingAudio, isSpeaking
+            nonlocal audioQueue, playbackThread, collectingAudio, isSpeaking
+            nonlocal chunkCount, audioStartedAt, firstChunkAt
             async for message in ws:
                 if isinstance(message, bytes):
-                    if collectingAudio:
-                        audioBuffer.extend(message)
+                    if collectingAudio and audioQueue is not None:
+                        chunkCount += 1
+                        if firstChunkAt is None:
+                            firstChunkAt = time.monotonic()
+                            logger.debug(
+                                "First audio chunk arrived %.3fs after audioStart",
+                                firstChunkAt - audioStartedAt,
+                            )
+                        audioQueue.put(decodeWavChunk(message))
                 else:
                     msg = json.loads(message)
                     msgType = msg.get("type")
@@ -80,18 +113,33 @@ async def main() -> None:
                     elif msgType == "assistant":
                         print(f"\nIxa: {msg.get('content', '')}\n")
                     elif msgType == "audioStart":
-                        audioBuffer = bytearray()
                         collectingAudio = True
+                        isSpeaking = True
+                        chunkCount = 0
+                        firstChunkAt = None
+                        audioStartedAt = time.monotonic()
+                        audioQueue = queue.Queue()
+                        playbackThread = threading.Thread(
+                            target=playbackWorker, args=(audioQueue,), daemon=True
+                        )
+                        playbackThread.start()
                     elif msgType == "audioOutputEnd":
                         collectingAudio = False
-                        if audioBuffer:
-                            isSpeaking = True
+                        if audioQueue is not None and playbackThread is not None:
+                            audioQueue.put(None)
                             try:
-                                await playWav(bytes(audioBuffer), loop)
+                                await loop.run_in_executor(None, playbackThread.join)
                             finally:
                                 isSpeaking = False
                                 # clear VAD context/state so playback tail can't bleed into the next utterance
                                 vad.reset()
+                            logger.debug(
+                                "Playback done: %d chunk(s), last arrived %.3fs after audioStart",
+                                chunkCount,
+                                time.monotonic() - audioStartedAt,
+                            )
+                        audioQueue = None
+                        playbackThread = None
                     elif msgType == "confirm":
                         answer = input(f"\nConfirm: {msg.get('content')} (yes/no): ")
                         await ws.send(json.dumps({

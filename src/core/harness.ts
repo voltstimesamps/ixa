@@ -19,7 +19,7 @@ export async function runHarness(): Promise<void> {
     }
 
     try {
-      await session.send(trimmed)
+      await session.send(trimmed, "text")
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.error(`\nError: ${msg}\n`)

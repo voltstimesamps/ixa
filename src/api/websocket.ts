@@ -1,13 +1,15 @@
 import { WebSocketServer } from "ws"
-import { Session } from "../core/session"
+import { Session, type MessageOrigin } from "../core/session"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
-import { speak } from "../voice/tts"
+import { speakStreaming } from "../voice/tts"
 import { transcribe, pcmToWav } from "../voice/stt"
 import type { WsMessage } from "./types"
 
 export function createWsServer(port: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const wss = new WebSocketServer({ port })
+    // 20MB backstop against a single oversized frame; real scaling comes from
+    // streaming TTS output as multiple smaller chunks (see speakStreaming).
+    const wss = new WebSocketServer({ port, maxPayload: 20 * 1024 * 1024 })
 
     wss.once("listening", () => {
       wss.off("error", reject)
@@ -24,17 +26,24 @@ export function createWsServer(port: number): Promise<void> {
 
       send({ type: "sessionStart" })
 
-      const handleUserMessage = async (text: string) => {
+      const handleUserMessage = async (text: string, origin: MessageOrigin) => {
         try {
-          const result = await session.send(text)
+          const result = await session.send(text, origin)
           send({ type: "assistant", content: result })
 
           if (result.trim()) {
             try {
-              const audio = await speak(result)
-              send({ type: "audioStart" })
-              ws.send(audio)
-              send({ type: "audioOutputEnd" })
+              let started = false
+              await speakStreaming(result, (chunk) => {
+                if (!started) {
+                  started = true
+                  send({ type: "audioStart" })
+                }
+                ws.send(chunk)
+              })
+              if (started) {
+                send({ type: "audioOutputEnd" })
+              }
             } catch (err) {
               console.error("TTS error:", err instanceof Error ? err.message : String(err))
             }
@@ -57,7 +66,7 @@ export function createWsServer(port: number): Promise<void> {
           const msg: WsMessage = JSON.parse(data.toString()) as WsMessage
 
           if (msg.type === "user") {
-            await handleUserMessage(msg.content ?? "")
+            await handleUserMessage(msg.content ?? "", "text")
           } else if (msg.type === "audioStart") {
             session.startAudioInput()
           } else if (msg.type === "audioInputEnd") {
@@ -66,7 +75,7 @@ export function createWsServer(port: number): Promise<void> {
               try {
                 const { text } = await transcribe(pcmToWav(pcm))
                 if (text.trim()) {
-                  await handleUserMessage(text)
+                  await handleUserMessage(text, "voice")
                 } else {
                   console.log("STT: empty transcript, discarding")
                 }
