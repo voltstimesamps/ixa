@@ -14,8 +14,10 @@ import sounddevice as sd
 import websockets
 
 from audio_framing import FrameBuffer
-from recorder import VoiceActivityRecorder
+from conversation import ConversationGate, SessionState
+from recorder import SPEECH_PROB_THRESHOLD, VoiceActivityRecorder
 from vad import SileroVAD
+from wakeword import WakeWordDetector
 
 logging.basicConfig(level=os.environ.get("IXA_LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("ixa.client")
@@ -33,6 +35,15 @@ MIC_SAMPLE_RATE = SileroVAD.SAMPLE_RATE  # 16000 — required by Silero VAD and 
 # the existing chat input, so this is a toggle sharing the one input stream.
 RECORD_MODE = os.environ.get("IXA_RECORD_MODE", "vad")
 
+WAKE_THRESHOLD = float(os.environ.get("IXA_WAKE_THRESHOLD", "0.5"))
+# Bypasses the wake word gate entirely (straight to VAD-triggered recording,
+# same behavior as before wake word existed) — useful while tuning VAD or
+# before you have a trained "hey_ixa.onnx" model.
+SKIP_WAKE_WORD = os.environ.get("IXA_SKIP_WAKE_WORD", "").lower() in ("1", "true", "yes")
+
+WAKE_CHIME_HZ = 880.0
+WAKE_CHIME_MS = 120.0
+
 
 def decodeWavChunk(wavBytes: bytes) -> np.ndarray:
     # Each binary frame from the harness is its own independently-valid WAV
@@ -42,6 +53,14 @@ def decodeWavChunk(wavBytes: bytes) -> np.ndarray:
     with wave.open(buf, "rb") as wf:
         frames = wf.readframes(wf.getnframes())
     return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767
+
+
+def playChime(freqHz: float, durationMs: float) -> None:
+    # Local-only auditory confirmation that wake word fired — no server
+    # round trip, so it plays instantly regardless of network latency.
+    t = np.arange(int(MIC_SAMPLE_RATE * durationMs / 1000)) / MIC_SAMPLE_RATE
+    tone = 0.2 * np.sin(2 * np.pi * freqHz * t).astype(np.float32)
+    sd.play(tone, samplerate=MIC_SAMPLE_RATE)
 
 
 def playbackWorker(audioQueue: "queue.Queue") -> None:
@@ -90,6 +109,24 @@ async def main() -> None:
             await ws.send(json.dumps({"type": "audioInputEnd"}))
 
         recorder = VoiceActivityRecorder(onSpeechStart, onFrame, onSpeechEnd)
+
+        wakeword = None
+        if RECORD_MODE == "vad" and not SKIP_WAKE_WORD:
+            wakeword = WakeWordDetector()
+        wakeFrameBuffer = FrameBuffer(window_samples=WakeWordDetector.CHUNK_SAMPLES)
+
+        async def onWake() -> None:
+            print("\n[Ixa is listening]")
+            playChime(WAKE_CHIME_HZ, WAKE_CHIME_MS)
+
+        async def onSleep() -> None:
+            print("[Ixa is asleep — say the wake word]")
+            vad.reset()
+            frameBuffer.reset()
+
+        gate = ConversationGate(onWake, onSleep)
+        if wakeword is None:
+            gate.state = SessionState.AWAKE  # wake word disabled: behave as if already woken
 
         async def receiver() -> None:
             nonlocal audioQueue, playbackThread, collectingAudio, isSpeaking
@@ -149,6 +186,10 @@ async def main() -> None:
                         }))
                     elif msgType == "error":
                         print(f"Error: {msg.get('content')}")
+                    elif msgType == "sessionEnd":
+                        # Server detected a spoken dismiss phrase in the transcript
+                        # and already reset its own conversation state.
+                        await gate.sleep()
 
         async def pttRecordSession(stopEvent: asyncio.Event) -> None:
             frameQueue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -215,9 +256,19 @@ async def main() -> None:
                     chunk = await frameQueue.get()
                     if isSpeaking:
                         continue  # drop mic input while the assistant is talking
+
+                    if wakeword is not None and gate.state is SessionState.ASLEEP:
+                        for window in wakeFrameBuffer.push(chunk):
+                            samples = np.frombuffer(window, dtype=np.int16)
+                            score = wakeword.process(samples)
+                            await gate.handle_wake_frame(score, WAKE_THRESHOLD)
+                        continue
+
                     for window in frameBuffer.push(chunk):
                         samples = np.frombuffer(window, dtype=np.int16).astype(np.float32) / 32768.0
                         score = vad.process(samples)
+                        if wakeword is not None:
+                            await gate.note_vad_frame(score >= SPEECH_PROB_THRESHOLD)
                         await recorder.handle_frame(window, score)
 
         tasks = [receiver(), sender()]

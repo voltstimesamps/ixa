@@ -52,6 +52,14 @@ export class Session {
     return this.runToolLoop(origin)
   }
 
+  // Called when a wake-word conversation ends (dismiss phrase or timeout) so
+  // the next wake-up starts a clean conversation instead of accumulating
+  // history across unrelated sessions on the same connection.
+  reset(): void {
+    this.messages.length = 0
+    this.messages.push({ role: "system", content: SYSTEM_PROMPT })
+  }
+
   startAudioInput(): void {
     this.audioChunks = []
   }

@@ -3,6 +3,7 @@ import { Session, type MessageOrigin } from "../core/session"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
 import { speakStreaming } from "../voice/tts"
 import { transcribe, pcmToWav } from "../voice/stt"
+import { isDismissPhrase, DISMISS_ACKNOWLEDGMENT } from "../voice/dismiss"
 import type { WsMessage } from "./types"
 
 export function createWsServer(port: number): Promise<void> {
@@ -26,27 +27,30 @@ export function createWsServer(port: number): Promise<void> {
 
       send({ type: "sessionStart" })
 
+      const speak = async (text: string) => {
+        try {
+          let started = false
+          await speakStreaming(text, (chunk) => {
+            if (!started) {
+              started = true
+              send({ type: "audioStart" })
+            }
+            ws.send(chunk)
+          })
+          if (started) {
+            send({ type: "audioOutputEnd" })
+          }
+        } catch (err) {
+          console.error("TTS error:", err instanceof Error ? err.message : String(err))
+        }
+      }
+
       const handleUserMessage = async (text: string, origin: MessageOrigin) => {
         try {
           const result = await session.send(text, origin)
           send({ type: "assistant", content: result })
-
           if (result.trim()) {
-            try {
-              let started = false
-              await speakStreaming(result, (chunk) => {
-                if (!started) {
-                  started = true
-                  send({ type: "audioStart" })
-                }
-                ws.send(chunk)
-              })
-              if (started) {
-                send({ type: "audioOutputEnd" })
-              }
-            } catch (err) {
-              console.error("TTS error:", err instanceof Error ? err.message : String(err))
-            }
+            await speak(result)
           }
         } catch (err) {
           const content = err instanceof Error ? err.message : String(err)
@@ -74,10 +78,15 @@ export function createWsServer(port: number): Promise<void> {
             if (pcm && pcm.length > 0) {
               try {
                 const { text } = await transcribe(pcmToWav(pcm))
-                if (text.trim()) {
-                  await handleUserMessage(text, "voice")
-                } else {
+                if (!text.trim()) {
                   console.log("STT: empty transcript, discarding")
+                } else if (isDismissPhrase(text)) {
+                  console.log("Dismiss phrase detected, ending conversation")
+                  await speak(DISMISS_ACKNOWLEDGMENT)
+                  session.reset()
+                  send({ type: "sessionEnd" })
+                } else {
+                  await handleUserMessage(text, "voice")
                 }
               } catch (err) {
                 console.error("STT error:", err instanceof Error ? err.message : String(err))
