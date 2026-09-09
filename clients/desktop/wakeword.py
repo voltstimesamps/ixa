@@ -35,6 +35,14 @@ class WakeWordDetector:
                 "Set IXA_SKIP_WAKE_WORD=1 to bypass wake word and go straight "
                 "to VAD-triggered recording while you don't have a model yet."
             )
+        # vad_threshold intentionally left unset: openWakeWord's built-in Silero
+        # VAD gate would suppress wake-word scoring during non-speech audio, but
+        # ConversationGate/VoiceActivityRecorder already run a separate, tuned
+        # SileroVAD instance for the post-wake utterance boundary. Stacking a
+        # second, differently-tuned VAD gate in front of wake-word detection
+        # itself would just add a second threshold to fight with during tuning
+        # for no real benefit — the external state machine is the single
+        # source of truth for "is someone talking".
         self._model = Model(wakeword_models=[model_path], inference_framework="onnx")
         self._name = os.path.splitext(os.path.basename(model_path))[0]
 
