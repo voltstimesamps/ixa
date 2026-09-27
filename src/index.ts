@@ -3,6 +3,7 @@ import { config } from "./config"
 import { runHarness } from "./core/harness"
 import { createRestServer } from "./api/rest"
 import { createWsServer } from "./api/websocket"
+import { startSidecars } from "./core/sidecars"
 import { startScheduler } from "./proactive/scheduler"
 
 async function main() {
@@ -13,10 +14,12 @@ async function main() {
     process.exit(1)
   }
 
-  await Promise.all([
-    createRestServer(config.server.port),
-    createWsServer(config.server.wsPort),
-  ])
+  // REST first, so /health and the /test page answer while the sidecar models
+  // load. Sidecars next — a WebSocket client that connects before they are up
+  // can neither transcribe nor speak, so WS only opens once they are ready.
+  await createRestServer(config.server.port)
+  await startSidecars()
+  await createWsServer(config.server.wsPort)
 
   startScheduler()
 

@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server"
 import { config } from "../config"
 import { Session } from "../core/session"
 import type { Confirmer } from "../core/confirmation"
+import { renderTestClient } from "./test-client"
 
 const noopConfirmer: Confirmer = async () => {
   console.warn("Confirmation required but REST has no confirmation channel — action blocked.")
@@ -27,6 +28,12 @@ export function createRestServer(port: number): Promise<void> {
   app.post("/reset", (c) => {
     session = new Session(noopConfirmer)
     return c.json({ ok: true })
+  })
+
+  // Minimal push-to-talk page for testing the voice loop from a phone over
+  // Tailscale. Self-contained; see src/api/test-client.ts.
+  app.get("/test", (c) => {
+    return c.html(renderTestClient(config.server.wsPort))
   })
 
   app.get("/health", (c) => {

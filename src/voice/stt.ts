@@ -36,7 +36,8 @@ export async function transcribe(wav: Buffer): Promise<TranscriptionResult> {
   const res = await fetch(`${config.voice.sttUrl}/transcribe`, {
     method: "POST",
     headers: { "Content-Type": "audio/wav" },
-    body: wav,
+    // Copied into a plain view: fetch's BodyInit doesn't accept Node's Buffer.
+    body: new Uint8Array(wav),
   })
 
   if (!res.ok) {

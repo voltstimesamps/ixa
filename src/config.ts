@@ -45,4 +45,11 @@ export const config = {
     port: parseInt(process.env.PORT ?? "3000"),
     wsPort: parseInt(process.env.WS_PORT ?? "3001"),
   },
+  sidecars: {
+    // The harness spawns sidecars/{stt,tts}/main.py itself. Set false to run
+    // them by hand (or on a platform where they can't run at all).
+    autostart: process.env.SIDECAR_AUTOSTART !== "false",
+    // Generous by default: first run downloads the whisper/Kokoro weights.
+    timeoutMs: parseInt(process.env.SIDECAR_TIMEOUT_MS ?? "300000"),
+  },
 } as const
