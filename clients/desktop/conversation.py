@@ -11,6 +11,18 @@ logger = logging.getLogger("ixa.client.conversation")
 CONVERSATION_TIMEOUT_MS = 20_000.0
 VAD_FRAME_MS = 32.0  # SileroVAD.CHUNK_SAMPLES (512) at 16kHz
 
+# Consecutive 80ms wake word frames that must score >= threshold before
+# waking. In the 2026-09-30 measurements, every false wake on room tone was a
+# single frame (peaks up to 0.845), while the real phrase always held for 6-7
+# frames at every chunk phase. 2 rejects those at the cost of 80ms latency.
+# PROVISIONAL: all of that false-wake data came from a fake mic playing
+# recorded room tone, not a real mic in a real room — revisit after the
+# Framework 13 live test. Counted here rather than via openwakeword's own
+# `patience` argument, which is broken in 0.6.0: it stores suppressed frames
+# as 0.0 and then checks that same buffer, so it never fires at all.
+# Keep in sync with WAKE_CONSECUTIVE_FRAMES in src/api/test-client.ts.
+WAKE_CONSECUTIVE_FRAMES = 2
+
 
 class SessionState(Enum):
     ASLEEP = auto()  # only the wake word model sees audio
@@ -42,15 +54,26 @@ class ConversationGate:
     ):
         self.state = SessionState.ASLEEP
         self._silence_ms = 0.0
+        self._wake_run = 0  # consecutive frames >= threshold so far
         self._on_wake = on_wake
         self._on_sleep = on_sleep
 
     async def handle_wake_frame(self, score: float, threshold: float) -> None:
-        if self.state is SessionState.ASLEEP and score >= threshold:
-            logger.info("Wake word detected (score=%.3f)", score)
-            self.state = SessionState.AWAKE
-            self._silence_ms = 0.0
-            await self._on_wake()
+        """Call once per wake word frame, in order, while Asleep."""
+        if self.state is not SessionState.ASLEEP:
+            return
+        if score < threshold:
+            self._wake_run = 0
+            return
+        self._wake_run += 1
+        if self._wake_run < WAKE_CONSECUTIVE_FRAMES:
+            logger.debug("Wake frame %d/%d (score=%.3f)", self._wake_run, WAKE_CONSECUTIVE_FRAMES, score)
+            return
+        logger.info("Wake word detected (score=%.3f, %d consecutive frames)", score, self._wake_run)
+        self.state = SessionState.AWAKE
+        self._silence_ms = 0.0
+        self._wake_run = 0
+        await self._on_wake()
 
     async def note_vad_frame(self, is_speech: bool) -> None:
         """Call once per VAD frame while Awake to drive the conversation
@@ -68,4 +91,5 @@ class ConversationGate:
         if self.state is SessionState.AWAKE:
             self.state = SessionState.ASLEEP
             self._silence_ms = 0.0
+            self._wake_run = 0
             await self._on_sleep()

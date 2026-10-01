@@ -263,6 +263,9 @@ export function renderTestClient(wsPort: number): string {
 
   // Mirrored from the desktop client — tune there first, then copy here.
   var WAKE_THRESHOLD = 0.5;             // client.py IXA_WAKE_THRESHOLD default
+  // PROVISIONAL, pending the Framework 13 live test: see the rationale on
+  // WAKE_CONSECUTIVE_FRAMES in clients/desktop/conversation.py.
+  var WAKE_CONSECUTIVE_FRAMES = 2;      // clients/desktop/conversation.py
   var CONVERSATION_TIMEOUT_MS = 20000;  // clients/desktop/conversation.py
   var WAKE_CHIME_HZ = 880;              // client.py
   var WAKE_CHIME_MS = 120;
@@ -526,6 +529,7 @@ export function renderTestClient(wsPort: number): string {
   var wakeChunk = new Int16Array(IxaWake.CHUNK_SAMPLES);
   var wakeFill = 0;
   var wakeGeneration = 0;  // bumped on every reset, so stale in-flight scores are ignored
+  var wakeRun = 0;         // consecutive frames >= WAKE_THRESHOLD in this generation
 
   function pushWakeSamples(pcm) {
     for (var i = 0; i < pcm.length; i++) {
@@ -546,8 +550,11 @@ export function renderTestClient(wsPort: number): string {
       if (generation !== wakeGeneration || mode !== "asleep" || speaking) return;
       meterFillEl.style.width = Math.min(100, score * 100) + "%";
       wakeTextEl.textContent = "wake " + score.toFixed(3) + " · " + detector.lastMs.toFixed(1) + "ms";
-      // Single frame over threshold, no debounce — ConversationGate.handle_wake_frame.
-      if (score >= WAKE_THRESHOLD) wake(score);
+      // WAKE_CONSECUTIVE_FRAMES in a row over threshold, like
+      // ConversationGate.handle_wake_frame. Scores arrive strictly in chunk
+      // order (the detector's queue), so a plain counter is enough.
+      wakeRun = score >= WAKE_THRESHOLD ? wakeRun + 1 : 0;
+      if (wakeRun >= WAKE_CONSECUTIVE_FRAMES) wake(score);
     }, function (err) {
       log("err", "wake word inference failed: " + err.message);
     });
@@ -560,6 +567,7 @@ export function renderTestClient(wsPort: number): string {
   function resumeWakeListening() {
     wakeGeneration++;
     wakeFill = 0;
+    wakeRun = 0;
     meterFillEl.style.width = "0";
     detector.reset();  // queued ahead of any chunk pushed after this
   }
