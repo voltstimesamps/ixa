@@ -50,3 +50,16 @@ class WakeWordDetector:
         """chunk: int16 PCM array of CHUNK_SAMPLES samples. Returns wake word score."""
         scores = self._model.predict(chunk)
         return float(scores[self._name])
+
+    def reset(self) -> None:
+        """Clear openWakeWord's audio/feature history. Call before resuming
+        detection after a gap in the audio this detector has seen.
+
+        The classifier scores the last 16 embeddings (~1.28s) it was fed, and
+        those don't age out on their own — they only shift when new audio
+        arrives. Without a reset, the window still holds the wake phrase that
+        last woke us, so the first chunk fed after sleeping scores ~0.999 and
+        re-wakes immediately. Model.reset() restores the just-loaded state
+        (and re-zeroes the first 5 scores while the buffers refill).
+        """
+        self._model.reset()

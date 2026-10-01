@@ -123,6 +123,11 @@ async def main() -> None:
             print("[Ixa is asleep — say the wake word]")
             vad.reset()
             frameBuffer.reset()
+            # The wake detector saw no audio while awake, so its history still
+            # ends on the phrase that woke us — see WakeWordDetector.reset().
+            if wakeword is not None:
+                wakeword.reset()
+            wakeFrameBuffer.reset()
 
         gate = ConversationGate(onWake, onSleep)
         if wakeword is None:
