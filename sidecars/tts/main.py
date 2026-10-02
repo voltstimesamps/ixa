@@ -17,6 +17,19 @@ sampleRate = 24000
 defaultVoice = 'af_nova'
 port = 5001
 
+# Kokoro re.split()s the text on this pattern and synthesizes each piece as
+# its own chunk. Its default, newlines only, left voice replies (plain
+# sentences, no line breaks) as one chunk, so no audio went out until the
+# whole reply was synthesized. This splits on whitespace after . ! or ?,
+# optionally followed by one closing quote or bracket (e.g. ." .) ?'), and
+# still on newlines. The two lookbehinds are separate because Python
+# lookbehinds must be fixed-width. Groups are non-capturing, or re.split
+# would return the delimiters as extra pieces. No abbreviation list: an early
+# split after "Dr." or "e.g." is acceptable. Empty pieces cannot reach
+# synthesis: the text is stripped before splitting and Kokoro skips
+# whitespace-only pieces.
+splitPattern = r'''(?:(?<=[.!?])|(?<=[.!?]["'”’)\]]))\s+|\s*\n\s*'''
+
 
 def audioToWav(audioTensor) -> bytes:
     audioNp = audioTensor.numpy()
@@ -72,7 +85,7 @@ class TtsHandler(BaseHTTPRequestHandler):
         chunkCount = 0
 
         try:
-            for _, _, audio in pipeline(text, voice=voice):
+            for _, _, audio in pipeline(text, voice=voice, split_pattern=splitPattern):
                 if audio is None:
                     continue
                 wavBytes = audioToWav(audio)
