@@ -45,6 +45,16 @@ export const config = {
     port: parseInt(process.env.PORT ?? "3000"),
     wsPort: parseInt(process.env.WS_PORT ?? "3001"),
   },
+  session: {
+    // Sessions outlive client connections; they end only on an idle timeout or
+    // an explicit reset. The clock runs from the last completed turn, not from
+    // the last connection, so an unattended session still expires.
+    idleTimeoutMs: parseInt(process.env.IXA_SESSION_IDLE_TIMEOUT_MS ?? "1800000"),
+    // Context window budget for what is SENT to the LLM. Stored history is
+    // never trimmed. Both limits apply; whichever is hit first stops the walk.
+    contextMaxMessages: parseInt(process.env.IXA_CONTEXT_MAX_MESSAGES ?? "40"),
+    contextBudgetChars: parseInt(process.env.IXA_CONTEXT_BUDGET_CHARS ?? "24000"),
+  },
   sidecars: {
     // The harness spawns sidecars/{stt,tts}/main.py itself. Set false to run
     // them by hand (or on a platform where they can't run at all).
