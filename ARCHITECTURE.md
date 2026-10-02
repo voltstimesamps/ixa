@@ -5,6 +5,8 @@
 > **What this doc is authoritative for:** vision, principles, design decisions, status, and what was evaluated and rejected.
 > **What it is NOT authoritative for:** exact file paths, env var names, function signatures. The code, `.env.example`, and `package.json` win on specifics. Where this doc says **(verify)**, reconcile it against the repo and update the doc.
 >
+> **Status markers:** ✅ built and verified · 🔜 planned / designed, not built. If you find a 🔜 item described as if it exists, the doc is wrong. Report it.
+>
 > Project name: **Ixa** (pronounced "eh-chs-uh"), wake phrase **"Hey Ixa"**. Internal code name: `jarvis` (appears in older notes and some identifiers).
 > Repo: `voltstimesamps/ixa`. Canonical checkout: `/home/wyatt/Projects/ixa` (native WSL2 filesystem on the gaming PC).
 
@@ -20,10 +22,10 @@ North star: it should feel like a capable person who is always available, knows 
 
 ## Core Philosophy
 
-- **Backend-first intelligence.** All reasoning, tool execution, memory, and speech synthesis/recognition live on the backend. Clients stay thin and stateless.
-  - **Deliberate exception:** wake-word detection and voice activity detection run **on the client**. This keeps the mic stream local until the user actually addresses Ixa, avoids streaming continuous room audio over the network, and removes a network round-trip from the latency-critical "is someone talking?" decision. Clients still hold no conversation state.
+- **Backend-first intelligence.** All reasoning, tool execution, memory, and speech synthesis/recognition live on the backend. Clients stay thin and hold no conversation state.
+  - **Deliberate exception:** wake-word detection and voice activity detection run **on the client**. This keeps the mic stream local until the user actually addresses Ixa, avoids streaming continuous room audio over the network, and removes a network round-trip from the latency-critical "is someone talking?" decision.
 - **Always-on (target).** The harness is designed to run as a daemon that fires scheduled tasks, receives webhooks, and sends alerts with no client connected. During development it runs via `npm run dev`.
-- **Swappable backends.** The LLM is reached through one `LLM_BASE_URL` + `LLM_API_KEY` (+ `LLM_MODEL`) env var set using the `openai` npm package. Moving from Groq to a homelab Ollama/llama.cpp instance is a `.env` change, not a code change.
+- **Swappable backends.** The LLM is reached through `LLM_BASE_URL` + `LLM_API_KEY` (+ `LLM_MODEL`) using the `openai` npm package. Moving from Groq to a homelab Ollama/llama.cpp instance is a `.env` change, not a code change.
 - **Confirmation gate.** Read operations run freely. Write or act operations with real-world consequences require explicit confirmation. This is **encoded per tool at definition time, never reasoned at runtime**, and the rule applies equally to tools imported over MCP (see below).
 - **Open source and self-hosted wherever practical.** Self-hosted beats SaaS, and open-weight models beat proprietary ones where quality allows. Cloud services are interim choices with a planned exit.
 - **No unreviewed third-party code.** Ixa does not install tools, skills, or plugins from marketplaces without reading them. Every integration is chosen deliberately. (See *OpenClaw* under Evaluated and Not Adopted for why this matters.)
@@ -42,9 +44,8 @@ Cloud
 
 Tailscale mesh
 ├── Gaming PC (Windows 11 + WSL2 Ubuntu) — BACKEND + dev environment
-│   ├── Ryzen 5 5600G, RX 6600 XT
-│   ├── Harness (Node/TS), STT + TTS Python sidecars
-│   └── Qdrant (Docker), nomic-embed-text via Ollama   (verify host details)
+│   ├── Ryzen 5 5600G (6C/12T), RX 6600 XT (AMD — no CUDA; TTS runs on CPU)
+│   └── Harness (Node/TS), STT + TTS Python sidecars
 ├── Framework 13 (AMD 7040, Fedora 44, 32GB) — primary voice client (Python desktop client)
 ├── iPhone (Safari)       — browser test client at /test over Tailscale HTTPS
 └── Surface Pro 7s (×3)   — thin client terminals (optional)
@@ -52,18 +53,21 @@ Tailscale mesh
 
 **Networking gotcha:** Tailscale inside WSL2 is a **separate node** from any Windows-side Tailscale, with its own IP (shown as e.g. `desktop-1 (wsl)`). Always confirm the backend address with `tailscale status` **inside WSL2** after any networking change. Never reuse an IP from earlier in a session.
 
+**Compute gotcha:** WSL2 currently exposes only 4 vCPUs (`nproc` = 4), most likely because of a `processors=` limit in Windows-side `%UserProfile%\.wslconfig`. Torch defaults to one thread per visible physical core, so 2 threads. Measured: 4 threads synthesize ~29% faster than 2.
+
 ### Future (homelab online)
 
 ```
 Tailscale mesh
-├── Homelab (24GB-class GPU, e.g. RTX 3090) — local inference (Ollama/llama.cpp), embeddings, possibly Qdrant
+├── Homelab (24GB-class NVIDIA GPU, e.g. RTX 3090) — local LLM inference (Ollama/llama.cpp),
+│     embeddings, GPU TTS, possibly Qdrant
 ├── SFF desktop (Optiplex / EliteDesk / ThinkCentre, 8th–10th gen) — always-on services node:
 │     harness daemon, sidecars, self-hosted Ntfy, webhooks, cron
 ├── Framework 13 — primary client
 └── Phone / Surfaces / other clients
 ```
 
-Migration is configuration only: `LLM_BASE_URL`, `QDRANT_URL`, and Ollama URL change, with no client code changes. Target local models once 24GB of VRAM is available: gpt-oss-20b or Qwen3-Coder-30B-A3B fully in VRAM. The RX 6600 XT limits local inference to roughly 7B models, which is why Groq is the interim backend.
+Migration is configuration only: `LLM_BASE_URL` and the service URLs change, with no client code changes. Target local models once 24GB of VRAM is available: gpt-oss-20b or Qwen3-Coder-30B-A3B fully in VRAM. The RX 6600 XT limits local inference to roughly 7B models, which is why Groq is the interim backend. **Do not attempt GPU acceleration on the RX 6600 XT under WSL2.** CUDA cannot work on AMD, and ROCm-on-WSL support for this card is not expected.
 
 ---
 
@@ -101,8 +105,8 @@ Migration is configuration only: `LLM_BASE_URL`, `QDRANT_URL`, and Ollama URL ch
 
 - **Read freely:** email, calendar, HA state, files, web search, read-only shell.
 - **Confirm first:** send email, push code, trigger physical automations, place orders, write/delete outside the sandbox, modify system state.
-- Encoded as `requiresConfirmation: boolean` on every tool. The gate is **transport-agnostic**: a `Confirmer` is injected, so the same gate works over voice (TTS readback + spoken yes/no) and text clients.
-- **Imported (MCP) tools follow the same rule** via an Ixa-side policy table. **Unknown tools default to confirm.**
+- Encoded as `requiresConfirmation: boolean` on every tool. The gate is **transport-agnostic**: a `Confirmer` is injected, so the same gate works over voice (TTS readback + spoken yes/no) and text clients. ✅ (`shell_write` confirms today.)
+- **Imported (MCP) tools follow the same rule** via an Ixa-side policy table. **Unknown tools default to confirm.** 🔜
 
 ---
 
@@ -112,35 +116,38 @@ Migration is configuration only: `LLM_BASE_URL`, `QDRANT_URL`, and Ollama URL ch
 - **TypeScript** for the harness, API, tools, memory, and proactive layer. Naming: PascalCase for classes/types/interfaces, camelCase for variables/functions.
 - **Python** only where the ecosystem requires it: speech sidecars and the desktop voice client. Each sidecar has its own venv (TTS uses Python 3.11).
 
-### Current stack by layer
+### Built ✅
 
 | Layer | Choice | Notes |
 |---|---|---|
 | LLM | Groq, `openai/gpt-oss-20b` | Via `openai` npm package; swappable by env |
 | API | Hono (REST) + WebSocket | `WsMessage` protocol including audio message types |
 | STT | faster-whisper (Python sidecar) | `vad_filter=True` |
-| TTS | Kokoro, voice `af_nova` (Python sidecar) | Streaming: chunked HTTP transfer encoding, per-chunk WAV blobs, 20MB frame ceiling on both sides |
-| Wake word | openWakeWord, custom `hey_ixa.onnx` (~772KB) | Client-side. See Voice Pipeline decisions |
-| VAD | Silero VAD as pure `onnxruntime` + `numpy` reimplementation | Client-side; no torch (avoids ~5GB dependency); bit-identical to official wrapper |
+| TTS | Kokoro 0.9.4, voice `af_nova` (Python sidecar) | Streaming: chunked HTTP transfer encoding, per-chunk WAV blobs (mono, 16-bit, 24kHz), 20MB frame ceiling. **Sentence-level chunking** (see Voice pipeline). CPU-only. |
+| Wake word | openWakeWord, custom `hey_ixa.onnx` (~772KB) | Client-side. See Voice pipeline decisions |
+| VAD | Silero VAD as pure `onnxruntime` + `numpy` reimplementation | Desktop client; no torch (avoids ~5GB dependency); bit-identical to official wrapper |
 | Browser-side inference | onnxruntime-web | Wake word ported and validated in browser |
-| Web search | Tavily | Replaced Brave from the original plan |
-| Shell | `shell_read` / `shell_write` | Cross-platform command translation; session-scoped working directory |
-| Vector DB | Qdrant (Docker) | Episodic memory |
-| Embeddings | nomic-embed-text via Ollama | 768-dim |
-| Preferences | SQLite via better-sqlite3 | |
-| Scheduling | node-cron | Morning debrief skeleton exists |
-| Notifications | Ntfy | ntfy.sh public server in dev; self-host planned |
+| Web search | Tavily | Requires `TAVILY_API_KEY`. `SEARXNG_URL` exists in `.env.example`; see Open items |
+| Shell | `shell_read` (free) / `shell_write` (confirm) | Cross-platform command translation; session-scoped working directory |
+| Notifications | Ntfy (`notify` tool) | ntfy.sh public server in dev; self-host planned |
+| Scheduling | node-cron | Morning debrief skeleton only (verify) |
 | Networking | Tailscale | All clients reach the backend over the tailnet |
-| Notes (planned) | Obsidian + Syncthing + chokidar | Not yet built |
-| OAuth tokens (planned) | keytar | **Open question:** keytar needs a running Secret Service (libsecret), which headless WSL2/server installs usually lack. Decide before Gmail work. |
 
-### Adopted from 2026-10 integration research (planned, not yet built)
+**Registered tools today** (`src/tools/register.ts`): `get_time`, `get_date`, `echo`, `web_search`, `shell_read`, `shell_write`, `notify`. All are passed to the LLM for both voice and text turns.
+
+### Planned 🔜
 
 | Component | Choice | Why |
 |---|---|---|
+| Session ownership | Long-lived session manager on the backend | Today a new `Session` is created per WebSocket connection, per REST reset, and per REPL, so a client reconnect loses context. This breaks the "reconnects resume seamlessly" principle. (Phase 3) |
+| Vector DB | Qdrant (Docker) | Episodic + semantic memory (Phase 3) |
+| Embeddings | nomic-embed-text via Ollama (768-dim) | Local, private (Phase 3) |
+| Preferences | SQLite via better-sqlite3 | Structured preference store (Phase 3) |
+| Notes | Obsidian + Syncthing + chokidar | Vault → embeddings pipeline (Phase 3) |
 | Turn detection | **Smart Turn v3** (Pipecat), ONNX | Decides end-of-turn from intonation, not a fixed silence timer. ~8M params, 8MB int8 ONNX, Whisper-Tiny encoder + linear head. BSD 2-Clause (not tied to Pipecat). Layers **on top of** Silero, which must use a ~0.2s stop threshold to match training. |
 | Integration protocol | **MCP client in the harness** | One generic adapter instead of a bespoke wrapper per service. First consumer: Home Assistant's native MCP server (Streamable HTTP). |
-| Browser layer (Phase 7) | **Stagehand** (TS, MIT) | Playwright-compatible; deterministic Playwright calls and AI actions can be mixed in one script. Use deterministic paths for routine flows; AI actions are less reliable than plain selectors. |
+| Browser layer | **Stagehand** (TS, MIT) | Playwright-compatible; deterministic Playwright calls and AI actions can be mixed in one script. Use deterministic paths for routine flows; AI actions are less reliable than plain selectors. |
+| OAuth tokens | keytar | **Open question:** keytar needs a running Secret Service (libsecret), which headless WSL2/server installs usually lack. Decide before Gmail work. |
 
 ---
 
@@ -149,70 +156,81 @@ Migration is configuration only: `LLM_BASE_URL`, `QDRANT_URL`, and Ollama URL ch
 ### System Layers
 
 ```
-Cloud APIs (Groq, Tavily, ntfy.sh)          MCP servers (HA first; others later)
+Cloud APIs (Groq, Tavily, ntfy.sh)          🔜 MCP servers (HA first)
         │ HTTPS                                      │ Streamable HTTP over tailnet
         ▼                                            ▼
 ┌───────────────────────────────────────────────────────────┐
 │                    Backend (gaming PC, WSL2)              │
 │                                                           │
 │  Core Harness                                             │
-│    SessionManager · tool loop · confirmation gate · LLM   │
+│    Session (per connection today) · tool loop ·           │
+│    confirmation gate · LLM                                │
+│    🔜 long-lived session manager                          │
 │                                                           │
-│  Tool layer                    Memory                     │
-│    native tools (shell,          Qdrant episodic          │
-│    search, time/date, …)         SQLite preferences       │
-│    MCP client + policy table     (vault pipeline planned) │
+│  Tool layer                    🔜 Memory                  │
+│    native tools (time, date,     Qdrant episodic          │
+│    echo, search, shell,          SQLite preferences       │
+│    notify)                       vault pipeline           │
+│    🔜 MCP client + policy table                           │
 │                                                           │
 │  Proactive                     API layer                  │
 │    node-cron · Ntfy              WebSocket (voice)        │
-│    (webhooks planned)            Hono REST (text, /test)  │
+│    🔜 webhooks                   Hono REST (text, /test)  │
 │                                                           │
 │  Python sidecars (own venvs, spawned by npm run dev)      │
-│    STT: faster-whisper    TTS: Kokoro (streaming)         │
+│    STT: faster-whisper    TTS: Kokoro (sentence streaming)│
 └───────────────────────────────────────────────────────────┘
         │ Tailscale
         ▼
-Clients (stateless; wake word + VAD run locally)
+Clients (no conversation state; wake word + VAD run locally)
   Framework 13 desktop client (Python) · iPhone /test (browser) · Surfaces
 ```
 
 ### Key Data Flows
 
-**Voice turn:**
+**Voice turn ✅:**
 ```
 [client] mic → wake word ("Hey Ixa", 2-frame rule) → conversation opens
 [client] end of utterance:
-         desktop: Silero VAD (SPEECH_PROB_THRESHOLD / TRAILING_SILENCE_MS)
+         desktop: Silero VAD (SPEECH_PROB_THRESHOLD=0.5 / TRAILING_SILENCE_MS=600, validated live)
          browser: tap-to-end-turn (VAD deferred)
-         planned: Silero + Smart Turn v3 on both
+         🔜 Silero + Smart Turn v3 on both
 → audio over WebSocket → [backend] STT sidecar → LLM + tool loop
 → confirmation gate (if tool requires it) → tool execute → LLM response
-→ TTS sidecar streams chunks → [client] plays first chunk while later chunks synthesize
+→ TTS sidecar splits reply into sentences → streams one WAV chunk per sentence
+→ [client] plays first chunk while later chunks synthesize
 → loop until dismiss phrase or 20s conversation timeout
 → [client] reset wake model (Model.reset()) before listening again
 ```
 
-**Session and memory:**
-```
-SessionManager (singleton) tracks a session across turns
-→ semantic session boundaries: topic drift detected via cosine similarity
-→ at boundary: summarize session → embed (nomic-embed-text, 768-dim) → upsert to Qdrant
-→ at session start: retrieve relevant episodes + preferences → inject into context
-```
-
-**Tool execution with confirmation:**
+**Tool execution with confirmation ✅ (MCP part 🔜):**
 ```
 LLM calls a tool
 → harness looks up requiresConfirmation
     native tool: from its definition
-    MCP tool: from the Ixa policy table (unknown → confirm)
+    🔜 MCP tool: from the Ixa policy table (unknown → confirm)
 → if true: Confirmer prompts via the active transport
     voice: TTS readback "I'm about to … Confirm?" → spoken yes/no
 → yes: execute, append result, resume loop
 → no:  append cancellation, ask what to do instead
 ```
 
-**Proactive interrupt (target):**
+**Session and memory 🔜 (Phase 3 design):**
+```
+Long-lived session manager owns sessions independent of client connections
+→ client reconnect re-attaches to its session instead of starting fresh
+→ semantic session boundaries: topic drift detected via cosine similarity
+→ at boundary: summarize session → embed (nomic-embed-text, 768-dim) → upsert to Qdrant
+→ at session start: retrieve relevant episodes + preferences → inject into context
+```
+
+**Memory pipeline for notes 🔜:**
+```
+note saved in Obsidian (any device) → Syncthing → backend vault copy
+→ chokidar detects change → chunk → nomic-embed → upsert to Qdrant (filename, date, tags)
+```
+
+**Proactive interrupt 🔜:**
 ```
 cron fires OR webhook received (HA / OctoPrint)
 → check HA presence
@@ -220,12 +238,6 @@ cron fires OR webhook received (HA / OctoPrint)
 → always: Ntfy push
 → desktop: notification popup
 → DND 11pm–7am: queue unless critical
-```
-
-**Memory pipeline for notes (planned):**
-```
-note saved in Obsidian (any device) → Syncthing → backend vault copy
-→ chokidar detects change → chunk → nomic-embed → upsert to Qdrant (filename, date, tags)
 ```
 
 ---
@@ -237,14 +249,16 @@ note saved in Obsidian (any device) → Syncthing → backend vault copy
 2. **Trigger rule: 2 consecutive frames ≥ 0.5.** `hey_ixa.onnx` can spike on room tone for a single frame (observed up to 0.84). openWakeWord's own `patience` parameter is broken in v0.6.0 (it suppresses real triggers too), so the custom rule is implemented **identically** on desktop and browser. Validated live on Framework 13.
 3. **Always reset the wake model on sleep** (`Model.reset()`) after timeout or dismiss. Without it, residual state causes an immediate false re-wake.
 4. **Frame buffer is separate from the VAD state machine** (`audio_framing.py`), so wake word, VAD, and future turn detection attach to the same frames without rework.
-5. **Turn detection direction:** Silero decides "is there speech"; Smart Turn v3 (planned) decides "is the speaker finished." Port it with the same pattern as the wake word: baseline script → fixture comparison against the reference implementation → wire in only once validated.
-6. **Voice-origin responses are shaped differently.** A `MessageOrigin` type threads through `send()` / `runToolLoop()`. Voice turns get a short plain-sentence system prompt addition. `messagesForCall()` builds a fresh message array per call and never mutates session state.
-7. **Sidecar readiness must mean ready to infer fast**, not just port open. `npm run dev` spawns both sidecars from their own venvs and waits on a readiness probe. A TCP probe alone can pass before models are warm, so a warmup synthesis/transcription before reporting ready is the intended fix (verify current behavior).
-8. **Push-to-talk** exists as a toggle (`:rec`) for debugging and noisy environments.
+5. **TTS chunking never depends on LLM output formatting.** Kokoro's pipeline splits only on newlines by default (or past 510 phonemes). Voice replies are plain sentences with no newlines, so without intervention every reply became one chunk and first audio waited for the whole reply (~14s for ~480 chars). The sidecar passes an explicit `split_pattern` that splits at sentence boundaries (`. ! ?`, optionally followed by one closing quote or bracket) **and** at newlines. Result: first audio at ~1.7s warm. Known, accepted quirks: "Dr." and "e.g." split early; a sentence ending in two closers (e.g. `.")`) joins the next one; per-piece padding makes total audio ~17% longer. The pattern uses only non-capturing groups, because Kokoro applies it with `re.split`.
+6. **Turn detection direction:** Silero decides "is there speech"; Smart Turn v3 (🔜) decides "is the speaker finished." Port it with the same pattern as the wake word: baseline script → fixture comparison against the reference implementation → wire in only once validated.
+7. **Voice-origin responses are shaped differently.** A `MessageOrigin` type threads through `send()` / `runToolLoop()`. Voice turns get a short plain-sentence system prompt addition. `messagesForCall()` builds a fresh message array per call and never mutates session state.
+8. **Sidecar readiness** is currently a TCP port probe (`src/core/sidecars.ts`); models load before the port opens. Measured cold-start cost is small (~0.4s), but on the first request after a restart chunk 2 can arrive ~0.17s after chunk 1 finishes playing. A warmup synthesis before reporting ready (🔜) removes that gap.
+9. **TTS throughput is CPU-bound.** Real-time factor ≈ 0.54 at 2 torch threads, 0.38 at 4 (seconds of synthesis per second of speech). Warm steady-state margin between chunks is thin (~0.16s) at 2 threads, so raising the WSL vCPU limit matters.
+10. **Push-to-talk** exists as a toggle (`:rec`) for debugging and noisy environments.
 
-### LLM abstraction
-- All environment-specific values are read in **one config module** (`src/config.ts`, verify). No other file reads `process.env`.
-- The canonical list of variables lives in **`.env.example`**, not in this doc.
+### LLM abstraction and configuration
+- Application config values are read through **one config module** (`src/config.ts`). Exceptions: some files read `HOME`, and the shell tools and `src/core/sidecars.ts` pass the process environment through to child processes. Don't add new direct `process.env` reads for config.
+- The canonical list of variables lives in **`.env.example`**, not in this doc. Several (e.g. `STT_URL`, `TTS_URL`, `STT_MODEL`) have working defaults in `config.ts`.
 
 ### Confirmation gate
 ```typescript
@@ -258,7 +272,13 @@ interface Tool {
 ```
 (Illustrative. The real definition in the tool registry is authoritative.)
 
-### MCP integration layer (decided, not built)
+Tool **descriptions** are read by the LLM when it chooses tools, so they must stay accurate. For example, `web_search` must describe Tavily, not a previous provider.
+
+### Session ownership (🔜 Phase 3 — decided direction)
+- Sessions must outlive client connections. A long-lived manager on the backend owns them, and clients re-attach on reconnect.
+- This is a prerequisite for episodic memory (session boundaries are where summaries are written) and for true multi-device use.
+
+### MCP integration layer (🔜 decided, not built)
 - **The harness is an MCP client.** Imported MCP tools are adapted into the same `Tool` shape as native tools and enter the same registry and tool loop.
 - **Policy table.** An Ixa-owned mapping from `server + tool name → requiresConfirmation` (plus an optional enable/disable flag). MCP tools carry no Ixa confirmation semantics, so the policy table is the only source of that bit.
   - **Default for any tool not in the table: confirm.** A newly exposed tool on a server can never silently gain free execution.
@@ -268,23 +288,23 @@ interface Tool {
 - **First consumer: Home Assistant** via HA's built-in Model Context Protocol Server integration (Streamable HTTP), which exposes control through HA's Assist API. The HA auth method is to be settled in the design pass.
 - Gmail/Sheets may also arrive as MCP servers rather than native googleapis wrappers. Evaluate when Phase 5 starts.
 
-### Browser / computer use
+### Browser / computer use (🔜)
 1. Browser session is a **persistent first-class object**: open once, run many tool calls against it, close when done. Never one-shot per call. This holds whether the layer is raw Playwright or Stagehand.
 2. `screenshot()` is first-class alongside `navigate`, `click`, `type`, `scroll` from day one.
 3. **Stagehand** is the planned SDK. Routine/repeatable flows use deterministic Playwright calls; AI actions are reserved for unfamiliar or changing pages.
 4. The vision loop (Phase 8) sits on top of the same primitives: `screenshot → vision model → structured action → repeat`. No rewrite if session persistence is built correctly now.
 
-### Memory architecture
-- **Working memory:** LLM context window.
+### Memory architecture (🔜 Phase 3)
+- **Working memory:** LLM context window. ✅
 - **Episodic memory:** session summaries in Qdrant, with semantic session boundaries and topic-drift detection.
-- **Semantic memory (planned):** Obsidian vault → chokidar → nomic-embed → Qdrant.
+- **Semantic memory:** Obsidian vault → chokidar → nomic-embed → Qdrant.
 - **Preference memory:** SQLite (better-sqlite3).
 - Obsidian is the human write interface. The agent never writes to the vault; it queries Qdrant. The vault is Wyatt's; the vector store is Ixa's view of it.
 - **Idea noted for later:** temporal facts (Graphiti-style). Record *when* a preference became true so "drinks tea now, previously coffee" is data, not an overwrite. Not adopted now because it needs a graph database.
 
 ### Client architecture
-- Clients are stateless with respect to conversation; the harness holds all session state, so reconnects resume seamlessly.
-- Clients do own their local audio state: wake model, VAD, and frame buffer.
+- Clients hold no conversation state. They do own their local audio state: wake model, VAD, and frame buffer.
+- **Current limitation:** because sessions are per-connection, a reconnect starts a fresh session. Fixed by the Phase 3 session manager.
 - The desktop client reads the backend address from the **`IXA_HOST` env var** (defaults to localhost). It must be set for remote testing, e.g. `IXA_HOST=<tailscale-ip> python client.py`.
 
 ---
@@ -298,19 +318,23 @@ ixa/
 ├── ARCHITECTURE.md
 ├── .env / .env.example          ← canonical env var list lives in .env.example
 ├── src/
-│   ├── config.ts                ← only place env vars are read (verify)
+│   ├── config.ts                ← config values read here
 │   ├── core/
-│   │   ├── harness.ts           ← main loop, runToolLoop
-│   │   └── session.ts           ← SessionManager, session lifecycle
+│   │   ├── harness.ts           ← main loop, runToolLoop (verify path)
+│   │   ├── session.ts           ← Session (per connection today) (verify path)
+│   │   └── sidecars.ts          ← spawns STT/TTS sidecars, TCP readiness probe
 │   ├── voice/
 │   │   └── tts.ts               ← speakStreaming (streaming TTS client)
-│   ├── tools/                   ← tool registry + native tools (verify names)
-│   ├── memory/                  ← Qdrant episodic, SQLite prefs (verify names)
-│   ├── proactive/               ← node-cron, Ntfy (verify names)
-│   └── api/                     ← WebSocket + Hono REST, /test client route (verify)
+│   ├── tools/
+│   │   ├── register.ts          ← registers the 7 current tools
+│   │   └── search.ts            ← Tavily web_search
+│   ├── memory/                  ← empty placeholder (.gitkeep) until Phase 3
+│   ├── proactive/               ← node-cron, Ntfy (verify)
+│   └── api/
+│       └── websocket.ts         ← WebSocket server; speak() helper → speakStreaming
 ├── sidecars/
 │   ├── stt/                     ← faster-whisper (own venv)
-│   └── tts/main.py              ← Kokoro streaming (own venv, Python 3.11)
+│   └── tts/main.py              ← Kokoro streaming + sentence split_pattern (own venv, Python 3.11)
 └── clients/
     └── desktop/
         ├── client.py            ← reads IXA_HOST
@@ -327,66 +351,77 @@ ixa/
 - **Division of labor:** architecture and design happen in Claude.ai chat. Implementation prompts are written there and run by Claude Code in a **WSL2 terminal on the gaming PC**.
 - **Every command must state:** which machine (gaming PC backend vs Framework 13 client), WSL2 vs Windows (PowerShell), and inside vs outside which venv.
 - **Only checkout:** `/home/wyatt/Projects/ixa` (native WSL2 filesystem). A stale pre-migration checkout under `/mnt/c/Users/.../Projects/ixa` caused hours of phantom bugs and has been removed. If one ever reappears, do not use it. (If Windows file locks block deletion: `wsl --shutdown`, then delete from PowerShell.)
+- **Secrets:** Claude Code does not read, modify, or print `.env`. Keys are added by hand.
 
 ### Recurring pitfalls
 - **Commit and push before cross-device testing.** Uncommitted work on the gaming PC means the Framework 13 tests stale code.
-- **Restart `npm run dev` after changes.** Stale processes silently serve old code.
+- **Restart `npm run dev` after changes.** Stale processes silently serve old code. This includes dev servers started by a Claude Code session: stop those before running your own.
 - **esbuild platform mismatch:** Windows npm contaminating WSL2 `node_modules`. Fix with `rm -rf node_modules && npm install` inside WSL2.
 - **WSL2 localhost is not reachable from Windows.** Use `curl.exe` or the Tailscale IP.
 - **Windows Firewall** may block dev ports. Add rules with `New-NetFirewallRule`.
 - **WSL2 Tailscale is its own node.** Confirm the IP with `tailscale status` inside WSL2.
 - **Env vars do not migrate themselves.** After any checkout/machine change, diff `.env` against `.env.example`.
+- **Copy files into WSL with `cp` from the Linux side**, not Explorer drag-and-drop into `\\wsl$`. The latter creates stray `:Zone.Identifier` files.
 
 ---
 
 ## Deployment Phases
 
 ### Phase 1 — Voice loop + basic chat — ✅ DONE
-WebSocket/REST layer (Hono), `WsMessage` audio protocol, session refactor, STT sidecar, client-side Silero VAD, push-to-talk toggle, Kokoro streaming TTS, placeholder tools.
-**Wake word — ✅ DONE:** "Hey Ixa" validated live on Framework 13 (sensitivity, false-positive resistance, VAD cutoff, 20s timeout). Browser `/test` client with client-side wake word validated on iPhone.
+WebSocket/REST layer (Hono), `WsMessage` audio protocol, STT sidecar, client-side Silero VAD, push-to-talk toggle, Kokoro streaming TTS (now sentence-chunked), placeholder tools, sidecar auto-start.
+**Wake word ✅:** "Hey Ixa" validated live on Framework 13 (sensitivity, false-positive resistance, VAD cutoff, 20s timeout). Browser `/test` client with client-side wake word validated on iPhone.
 
 ### Phase 2 — Tool calling — ✅ DONE
-Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/`shell_write`, Ntfy, node-cron morning debrief skeleton.
+Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/`shell_write`, Ntfy `notify`, node-cron morning debrief skeleton.
 (Home Assistant moved to Phase 4 and will be built via MCP.)
 
-### Phase 3 — Memory — ✅ MOSTLY DONE
-Done: Qdrant episodic memory, SQLite preference store, SessionManager with semantic boundaries and topic-drift detection, episode/preference injection at session start.
-Remaining: Obsidian vault pipeline (chokidar → embed → Qdrant) and Syncthing sync.
+### Current open items
+- **Add `TAVILY_API_KEY` to `.env`.** `web_search` is registered but returns "not configured" without it. Remove the stale empty `BRAVE_API_KEY` line.
+- **Raise the WSL vCPU limit** (`.wslconfig` `processors=`) and re-benchmark TTS.
+- **Sidecar warmup** before readiness (removes the small cold-start inter-chunk gap).
+- **SearXNG:** `SEARXNG_URL` is in `.env.example`. Determine whether `search.ts` has a SearXNG path. A self-hosted, keyless search backend fits the project better than Tavily long-term.
+- **Next phase not yet chosen** between Phase 3 and Phase 4. Phase 3 is recommended first: the session manager fixes the reconnect-loses-context gap, and MCP tools shouldn't be built on a session model that's about to change. Phase 4's voice items are independent of sessions and could go first if momentum favors them.
 
-### Current open items (fix before Phase 4)
-- **TTS chunking regression (unconfirmed).** A live log showed `1 chunk(s)` with the first chunk at 5.4s. Hypotheses: timer scope, sidecar cold start, sidecar buffering, or a TS call path regressed in a merge.
-- **Tool registry check.** Confirm that Tavily search and the shell tools are registered and firing. HA/Gmail/Sheets/OctoPrint were never built, so their absence is expected, not a regression.
+### Phase 3 — Memory + session ownership — 🔜 NOT STARTED
+- Long-lived session manager; clients re-attach on reconnect.
+- Qdrant (Docker) + nomic-embed-text via Ollama.
+- Episodic memory: semantic session boundaries, topic-drift detection, summarize → embed → store, retrieve at session start.
+- SQLite preference store (better-sqlite3) with injection at session start.
+- Obsidian vault pipeline (chokidar → chunk → embed → Qdrant) + Syncthing.
+- Memory query tools exposed to the LLM.
 
-### Phase 4 — Voice polish + integration layer — NEXT
+Done when: a client can drop and reconnect without losing the conversation, Ixa recalls context from a week ago without being told, and it can answer questions from your Obsidian notes.
+
+### Phase 4 — Voice polish + integration layer — 🔜
 - Smart Turn v3 on top of Silero (desktop), validated against the reference implementation.
 - Browser VAD: port Silero + Smart Turn to onnxruntime-web, replacing tap-to-end-turn.
-- Sidecar warmup before readiness.
 - MCP client in the harness + Ixa policy table (default confirm).
 - Home Assistant via HA's MCP server: read state freely, physical actions confirmed.
+- Optional: overlap LLM token streaming with TTS (send each completed sentence to TTS while the LLM is still generating).
 
 Done when: turn-ending feels natural on both clients, and Ixa can query and (with confirmation) control HA devices through MCP.
 
-### Phase 5 — Code execution + Google
+### Phase 5 — Code execution + Google — 🔜
 - Sandboxed shell with file read/write; isolated execution (subprocess or Docker sandbox).
 - Voice-driven coding flow (transcribed chat log).
 - Gmail + Sheets (native googleapis vs MCP server: decide at phase start; resolve keytar-on-headless first).
 
 Done when: you can voice-drive a coding session and Ixa executes the code to verify it.
 
-### Phase 6 — Research pipeline + proactive
+### Phase 6 — Research pipeline + proactive — 🔜
 - Multi-step research loop (search → fetch → summarize → repeat), Readability.js extraction.
 - OctoPrint webhooks (Hono receiver), full morning debrief (weather, calendar, tasks).
 - Self-hosted Ntfy.
 
 Done when: you ask for research and get a sourced, synthesized answer without touching a browser.
 
-### Phase 7 — Browser / alongside mode
+### Phase 7 — Browser / alongside mode — 🔜
 - Persistent Stagehand/Playwright session; full `navigate`/`click`/`type`/`scroll`/`screenshot` set.
 - Alongside mode (visible window) + supervision interface (approve/interrupt).
 
 Done when: you can watch Ixa complete a multi-step website task.
 
-### Phase 8 — Vision loop / computer use (future)
+### Phase 8 — Vision loop / computer use (future) — 🔜
 - Vision-capable model (Claude API or local multimodal such as Qwen-VL), structured action output, state tracking across act → screenshot → reason cycles.
 - Needs the homelab for local vision models.
 - Built on Phase 7 primitives with no rewrite.
@@ -401,12 +436,13 @@ Done when: you can watch Ixa complete a multi-step website task.
 | **Leon** (Node personal assistant) | Study only | Architecturally closest, but mid-rewrite with its 2.0 core in developer preview. Possibly useful for skill-structure ideas. |
 | **Pipecat / LiveKit Agents** (voice frameworks) | Not adopted | Would replace an already-built, tuned pipeline. Pipecat is Python-only; LiveKit's turn detector is license-bound to LiveKit. *Exception:* Pipecat's **Smart Turn** model is adopted standalone. |
 | **Speaches** (OpenAI-compatible STT/TTS server) | Not adopted now | Would replace working sidecars for modest gain. Borrow its model-preload-before-healthy pattern. Revisit when consolidating sidecars on the homelab. |
-| **Mem0 / Letta / Graphiti** (agent memory) | Not adopted | Phase 3 already covers Mem0's role; Letta is a full runtime that would replace the harness; Graphiti needs a graph DB. Temporal-fact idea noted. |
+| **Mem0 / Letta / Graphiti** (agent memory) | Not adopted | Phase 3 builds its own memory to fit the harness. Mem0 is Python and duplicates that role; Letta is a full runtime that would replace the harness; Graphiti needs a graph DB. Temporal-fact idea noted. |
 | **browser-use** | Not adopted | Python-only. Stagehand covers the need in TS. |
 | **WebRTC transport** | Not adopted | One-to-one client↔backend voice works over WebSocket when VAD runs client-side. WebRTC earns its complexity only for telephony, video, or multi-party. |
+| **GPU TTS on RX 6600 XT** | Not pursued | AMD card: CUDA impossible, ROCm-on-WSL unsupported for this card. GPU synthesis waits for the homelab's NVIDIA GPU. A CPU-only torch wheel would shed the unused CUDA libraries (cleanup, not urgent). |
 | **ElevenLabs** | Ruled out | Cloud dependency, latency, privacy, and recurring cost conflict with the self-hosted design. Kokoro is the production TTS. |
 | **Disk-streaming LLM inference** (AirLLM, mmap offload) | Ruled out | MoE random expert access compounds latency across multiple LLM calls per turn, which is incompatible with the sub-2s voice target. |
-| **Brave Search** | Replaced | Tavily is the search provider. |
+| **Brave Search** | Replaced | Tavily is the search provider (SearXNG under consideration). |
 | **Hetzner CX32 (~$8/mo)** | Fallback only | Cloud fallback if self-hosting is temporarily impractical. |
 
 ---
@@ -416,8 +452,8 @@ Done when: you can watch Ixa complete a multi-step website task.
 - Not a framework. The tool loop is small, readable TypeScript.
 - Not a cloud service. Cloud pieces (Groq, Tavily, ntfy.sh) are interim with a planned exit.
 - Not a single-device app. Clients are thin; the backend is the product.
-- Not finished. This document describes the target and marks what is done.
+- Not finished. This document describes the target and marks what is built (✅) versus planned (🔜).
 
 ---
 
-*Last updated: 2026-10-01. Rewritten to reflect actual implementation state (Phases 1–3), the gaming-PC/WSL2 backend, client-side wake word/VAD, and decisions from the 2026-10 integration research (MCP client, Smart Turn v3, Stagehand). Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
+*Last updated: 2026-10-01. Corrected Phase 3 status (not started; earlier revision wrongly marked it done), added sentence-level TTS chunking, CPU/vCPU findings, the current tool registry, and the per-connection session limitation. Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
