@@ -764,9 +764,10 @@ export function renderTestClient(wsPort: number): string {
 
     ws.onclose = function () {
       setState("disconnected — retrying", false);
-      // A reconnect gets a fresh server-side Session, so the conversation is
-      // over either way; and an audioOutputEnd that will never arrive must
-      // not leave the mic dropped forever.
+      // The server-side session survives this and a reconnect re-attaches to
+      // it, so context is kept. The LISTENING window still closes: an
+      // audioOutputEnd that will never arrive must not leave the mic dropped
+      // forever, so go back to the wake word and let the user start again.
       sleep("disconnected");
       if (speaking) whenPlaybackDone(onReplyDone);
       render();

@@ -1,7 +1,16 @@
-import { Session } from "./session"
 import { createStdinConfirmer, stdinLineGenerator } from "./confirmation"
-export async function runHarness(): Promise<void> {
-  const session = new Session(createStdinConfirmer())
+import type { SessionManager } from "./session-manager"
+import type { Connection } from "./connection"
+
+export async function runHarness(sessions: SessionManager): Promise<void> {
+  // The REPL is just another connection onto the shared primary session.
+  const connection: Connection = {
+    id: "repl",
+    confirmer: createStdinConfirmer(),
+    isOpen: true,
+    send: () => {},
+    sendBinary: () => {},
+  }
 
   process.on("SIGINT", () => {
     console.log("\nGoodbye.")
@@ -19,7 +28,7 @@ export async function runHarness(): Promise<void> {
     }
 
     try {
-      await session.send(trimmed, "text")
+      await sessions.submitTurn(trimmed, connection, "text")
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.error(`\nError: ${msg}\n`)

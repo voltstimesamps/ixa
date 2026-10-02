@@ -1,7 +1,8 @@
 import { Hono } from "hono"
 import { serve } from "@hono/node-server"
 import { config } from "../config"
-import { Session } from "../core/session"
+import type { SessionManager } from "../core/session-manager"
+import type { Connection } from "../core/connection"
 import type { Confirmer } from "../core/confirmation"
 import { listWakeFixtures, serveAsset, servedModels, servedOrt } from "./static-assets"
 import { renderTestClient } from "./test-client"
@@ -9,17 +10,27 @@ import { renderWakeCheck } from "./wake-check"
 
 const noopConfirmer: Confirmer = async () => {
   console.warn("Confirmation required but REST has no confirmation channel — action blocked.")
-  return false
+  return "declined"
 }
 
-export function createRestServer(port: number): Promise<void> {
+// REST has no socket to go away, so one long-lived connection stands in for
+// every request. Replies travel back in the HTTP response, not through send().
+const restConnection: Connection = {
+  id: "rest",
+  confirmer: noopConfirmer,
+  isOpen: true,
+  send: () => {},
+  sendBinary: () => {},
+}
+
+export function createRestServer(port: number, sessions: SessionManager): Promise<void> {
   const app = new Hono()
-  let session = new Session(noopConfirmer)
 
   app.post("/chat", async (c) => {
     try {
       const body = await c.req.json<{ message: string }>()
-      const response = await session.send(body.message, "text")
+      // Same shared primary session the WebSocket clients and the REPL use.
+      const response = await sessions.submitTurn(body.message, restConnection, "text")
       return c.json({ response })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -27,9 +38,12 @@ export function createRestServer(port: number): Promise<void> {
     }
   })
 
+  // Explicit reset: ends the shared primary session (firing onSessionEnd) and
+  // starts a fresh one. Attached clients need do nothing — their next turn
+  // resolves the new primary by itself.
   app.post("/reset", (c) => {
-    session = new Session(noopConfirmer)
-    return c.json({ ok: true })
+    const session = sessions.resetPrimary()
+    return c.json({ ok: true, sessionId: session.id })
   })
 
   // Minimal push-to-talk page for testing the voice loop from a phone over

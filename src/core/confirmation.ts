@@ -72,17 +72,23 @@ export async function* stdinLineGenerator(): AsyncGenerator<string> {
 
 // --- Confirmer ---
 
-export type Confirmer = (description: string) => Promise<boolean>
+// Three outcomes, not a boolean: "declined" is the user saying no, while
+// "cancelled" is the request going unanswered because the client that was
+// asked went away. Both block execution, but they are recorded differently in
+// history so the LLM can tell a refusal from an interruption.
+export type ConfirmationOutcome = "confirmed" | "declined" | "cancelled"
+
+export type Confirmer = (description: string) => Promise<ConfirmationOutcome>
 
 export async function requestConfirmation(
   confirmer: Confirmer,
   description: string
-): Promise<boolean> {
+): Promise<ConfirmationOutcome> {
   return confirmer(description)
 }
 
 export function createStdinConfirmer(timeoutMs = 30_000): Confirmer {
-  return async (description: string): Promise<boolean> => {
+  return async (description: string): Promise<ConfirmationOutcome> => {
     process.stdout.write(`\n${description}\nConfirm? (yes/no): `)
 
     let pendingCancel: (() => void) | null = null
@@ -100,11 +106,11 @@ export function createStdinConfirmer(timeoutMs = 30_000): Confirmer {
         const result = await promise
         pendingCancel = null
 
-        if (result.kind !== "line") return false
+        if (result.kind !== "line") return "declined"
 
         const normalized = result.value.trim().toLowerCase()
-        if (normalized === "yes" || normalized === "y") return true
-        if (normalized === "no" || normalized === "n") return false
+        if (normalized === "yes" || normalized === "y") return "confirmed"
+        if (normalized === "no" || normalized === "n") return "declined"
         process.stdout.write("Please type yes or no.\nConfirm? (yes/no): ")
       }
     } finally {
@@ -115,43 +121,76 @@ export function createStdinConfirmer(timeoutMs = 30_000): Confirmer {
 
 // --- WebSocket confirmer ---
 
-const pendingConfirmations = new Map<string, (answer: string) => void>()
+interface PendingConfirmation {
+  // The connection that was asked. Recorded so one client cannot answer
+  // another client's prompt, and so a disconnect can cancel exactly the
+  // prompts that belong to the socket that closed.
+  connectionId: string
+  settle: (outcome: ConfirmationOutcome) => void
+}
+
+const pendingConfirmations = new Map<string, PendingConfirmation>()
 
 export function createWsConfirmer(
+  connectionId: string,
   send: (msg: WsMessage) => void,
   timeoutMs = 30_000
 ): Confirmer {
-  return (description: string): Promise<boolean> =>
-    new Promise<boolean>((resolve) => {
+  return (description: string): Promise<ConfirmationOutcome> =>
+    new Promise<ConfirmationOutcome>((resolve) => {
       const requestId = randomUUID()
       let settled = false
 
-      const settle = (value: boolean) => {
+      const settle = (outcome: ConfirmationOutcome) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         pendingConfirmations.delete(requestId)
-        resolve(value)
+        resolve(outcome)
       }
 
       const timer = setTimeout(() => {
         console.log("Confirmation timed out, treating as no.")
-        settle(false)
+        settle("declined")
       }, timeoutMs)
 
-      pendingConfirmations.set(requestId, (answer: string) => {
-        settle(answer === "yes")
-      })
+      pendingConfirmations.set(requestId, { connectionId, settle })
 
       send({ type: "confirm", content: description, requestId })
     })
 }
 
-export function resolveConfirmation(requestId: string, answer: string): void {
-  const resolver = pendingConfirmations.get(requestId)
-  if (!resolver) {
+export function resolveConfirmation(
+  requestId: string,
+  answer: string,
+  connectionId: string
+): void {
+  const pending = pendingConfirmations.get(requestId)
+  if (!pending) {
     console.warn(`resolveConfirmation: no pending request for id "${requestId}"`)
     return
   }
-  resolver(answer)
+  if (pending.connectionId !== connectionId) {
+    console.warn(
+      `resolveConfirmation: connection "${connectionId}" tried to answer a prompt owned by "${pending.connectionId}" — ignored`
+    )
+    return
+  }
+  pending.settle(answer === "yes" ? "confirmed" : "declined")
+}
+
+// Called when a connection goes away. Everything it was asked resolves as
+// cancelled, so the tool loop stops waiting immediately instead of burning the
+// full confirmation timeout against a socket that will never answer.
+export function cancelConfirmationsFor(connectionId: string): void {
+  for (const [requestId, pending] of pendingConfirmations) {
+    if (pending.connectionId !== connectionId) continue
+    pendingConfirmations.delete(requestId)
+    pending.settle("cancelled")
+  }
+}
+
+// Test seam: asserts no confirmation outlives the connection that owns it.
+export function pendingConfirmationCount(): number {
+  return pendingConfirmations.size
 }

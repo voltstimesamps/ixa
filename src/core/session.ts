@@ -1,8 +1,11 @@
 import os from "os"
 import path from "path"
-import { chat, type LLMResponse, Message } from "./llm"
+import { randomUUID } from "crypto"
+import { chat as defaultChat, type LLMResponse, Message } from "./llm"
 import { registry } from "../tools/registry"
-import { type Confirmer, requestConfirmation } from "./confirmation"
+import { requestConfirmation } from "./confirmation"
+import { buildWindow, type ContextWindowLimits } from "./context-window"
+import type { Connection } from "./connection"
 
 const SYSTEM_PROMPT =
   "You are Ixa, a personal AI operating system. You are direct, concise, and capable. " +
@@ -37,47 +40,78 @@ const VOICE_RESPONSE_PROMPT =
 
 export type MessageOrigin = "voice" | "text"
 
+// The LLM call, injectable so tests can drive the tool loop without a network
+// round trip. Production always gets the real one.
+export type ChatFn = typeof defaultChat
+
+export interface SessionOptions {
+  limits: ContextWindowLimits
+  chat?: ChatFn
+}
+
 export class Session {
+  readonly id: string = randomUUID()
+  readonly createdAt: number = Date.now()
+  lastTurnAt: number = Date.now()
+  endedAt: number | null = null
+
+  // Clients currently attached. A session is perfectly valid with none — that
+  // is the whole point of Phase 3a.
+  readonly attachedConnections = new Map<string, Connection>()
+
+  // Turns submitted but not yet finished, including queued ones. The manager
+  // reads this to keep the idle timer disarmed while work is outstanding.
+  pendingTurns = 0
+
   private readonly messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }]
-  private readonly confirmer: Confirmer
   private workingDirectory: string = process.env.HOME ?? os.homedir()
-  private audioChunks: Buffer[] | null = null
+  private readonly limits: ContextWindowLimits
+  private readonly chat: ChatFn
 
-  constructor(confirmer: Confirmer) {
-    this.confirmer = confirmer
+  // Turn serialization. Every turn chains onto the previous one, so only one
+  // tool loop at a time ever appends to `messages`. Two concurrent loops would
+  // interleave their assistant/tool messages and produce a history where a
+  // tool result no longer follows its call — which the API rejects outright.
+  private turnChain: Promise<unknown> = Promise.resolve()
+
+  constructor(options: SessionOptions) {
+    this.limits = options.limits
+    this.chat = options.chat ?? defaultChat
   }
 
-  async send(userInput: string, origin: MessageOrigin = "text"): Promise<string> {
-    this.messages.push({ role: "user", content: userInput })
-    return this.runToolLoop(origin)
+  // Queues a turn behind any turn already running on this session, whichever
+  // connection it came from. The returned promise settles with THIS turn's
+  // outcome; a turn that throws is isolated to its own caller and does not
+  // break the queue for the turns behind it.
+  send(
+    userInput: string,
+    connection: Connection,
+    origin: MessageOrigin = "text"
+  ): Promise<string> {
+    const run = async (): Promise<string> => {
+      this.messages.push({ role: "user", content: userInput })
+      return this.runToolLoop(origin, connection)
+    }
+
+    const result = this.turnChain.then(run, run)
+    this.turnChain = result.catch(() => {})
+    return result
   }
 
-  // Called when a wake-word conversation ends (dismiss phrase or timeout) so
-  // the next wake-up starts a clean conversation instead of accumulating
-  // history across unrelated sessions on the same connection.
-  reset(): void {
-    this.messages.length = 0
-    this.messages.push({ role: "system", content: SYSTEM_PROMPT })
-  }
-
-  startAudioInput(): void {
-    this.audioChunks = []
-  }
-
-  appendAudioChunk(chunk: Buffer): void {
-    this.audioChunks?.push(chunk)
-  }
-
-  endAudioInput(): Buffer | null {
-    if (!this.audioChunks) return null
-    const combined = Buffer.concat(this.audioChunks)
-    this.audioChunks = null
-    return combined
+  // A read-only view of stored history, for the manager, tests, and the
+  // Phase 3c summarizer. Stored history itself is never handed out.
+  history(): readonly Message[] {
+    return [...this.messages]
   }
 
   private async generateDescription(toolName: string, args: string): Promise<string> {
     try {
-      const context = this.messages.slice(-6)
+      // A blind slice can start in the middle of a tool-call group and send a
+      // tool result with no matching call, which the API rejects. Window it.
+      const context = buildWindow(this.messages, {
+        maxMessages: Math.min(6, this.limits.maxMessages),
+        budgetChars: this.limits.budgetChars,
+      }).filter((msg) => msg.role !== "system")
       const describeMessages: Message[] = [
         { role: "system", content: DESCRIBE_ACTION_PROMPT },
         ...context,
@@ -86,7 +120,7 @@ export class Session {
           content: `Tool: ${toolName}\nArguments: ${args}\nDescribe what this action will do.`,
         },
       ]
-      const response = await chat(describeMessages, [], { silent: true })
+      const response = await this.chat(describeMessages, [], { silent: true })
       if (response.type === "text" && response.content) {
         return response.content
       }
@@ -96,12 +130,19 @@ export class Session {
     return `Run tool '${toolName}' with arguments: ${args}`
   }
 
+  // Builds the message array for one LLM call. Always a new array: stored
+  // history is the record and is never trimmed or mutated here.
+  //
+  // The voice constraint is appended AFTER windowing on purpose — it is an
+  // instruction about this reply, not history, so the budget must never be
+  // able to drop it.
   private messagesForCall(origin: MessageOrigin): Message[] {
-    if (origin !== "voice") return this.messages
-    return [...this.messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+    const windowed = buildWindow(this.messages, this.limits)
+    if (origin !== "voice") return windowed
+    return [...windowed, { role: "system", content: VOICE_RESPONSE_PROMPT }]
   }
 
-  private async runToolLoop(origin: MessageOrigin): Promise<string> {
+  private async runToolLoop(origin: MessageOrigin, connection: Connection): Promise<string> {
     const tools = registry.toOpenAI()
     let retrying = false
 
@@ -109,7 +150,7 @@ export class Session {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
       let response: LLMResponse
       try {
-        response = await chat(this.messagesForCall(origin), retrying ? [] : tools)
+        response = await this.chat(this.messagesForCall(origin), retrying ? [] : tools)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (!retrying && (
@@ -177,8 +218,15 @@ export class Session {
           result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
         } else if (tool.requiresConfirmation) {
           const description = await this.generateDescription(tc.name, tc.arguments)
-          const confirmed = await requestConfirmation(this.confirmer, description)
-          if (!confirmed) {
+          const outcome = await requestConfirmation(connection.confirmer, description)
+          if (outcome === "cancelled") {
+            // Recorded distinctly from a decline so the LLM knows the action
+            // did not happen because the asking client vanished, not because
+            // the user refused. Nothing executed either way.
+            result =
+              "Action cancelled: the client that requested it disconnected before confirming. " +
+              "Nothing was executed."
+          } else if (outcome === "declined") {
             result = "Action declined by user."
           } else {
             try {
