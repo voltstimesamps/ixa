@@ -26,7 +26,7 @@ function isSearchInput(value: unknown): value is SearchInput {
 export const searchTool: Tool = {
   name: "web_search",
   description:
-    "Search the web using Brave Search. Use this when the user asks about current events, real-time information, specific facts you are uncertain about, or anything that may have changed recently. Returns a list of results with titles, URLs, and descriptions.",
+    "Search the web using Tavily. Use this when the user asks about current events, real-time information, specific facts you are uncertain about, or anything that may have changed recently. Returns a list of results with titles, URLs, and descriptions.",
   inputSchema: {
     type: "object",
     properties: {
