@@ -84,6 +84,9 @@ const MIGRATIONS: Migration[] = [
   },
 ]
 
+// The version a freshly opened database ends up at.
+export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version
+
 function migrate(db: Db): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (

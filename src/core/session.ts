@@ -53,6 +53,11 @@ export interface SessionOptions {
   // preference saved mid-turn applies to the very next one. Injected rather
   // than imported so Session stays unaware of SQLite and tests can stub it.
   preferenceBlock?: () => string | null
+  // Looks up episodes related to the user's message. Called ONCE per user
+  // turn, before the first LLM call — not per call, because it costs a network
+  // round trip and the question does not change inside a turn. Returns null
+  // for "nothing to add", including on failure or timeout.
+  recall?: (userInput: string) => Promise<string | null>
   // Rebuilds a session persisted by a previous process. Absent for a new one.
   restore?: PersistedSession
 }
@@ -87,6 +92,11 @@ export class Session {
   private readonly limits: ContextWindowLimits
   private readonly chat: ChatFn
   private readonly preferenceBlock?: () => string | null
+  private readonly recall?: (userInput: string) => Promise<string | null>
+
+  // This turn's recalled episodes. Safe as a single field because turns are
+  // serialized on turnChain: only one turn is ever in flight.
+  private recalled: string | null = null
 
   // Turn serialization. Every turn chains onto the previous one, so only one
   // tool loop at a time ever appends to `messages`. Two concurrent loops would
@@ -107,6 +117,7 @@ export class Session {
     this.limits = options.limits
     this.chat = options.chat ?? defaultChat
     this.preferenceBlock = options.preferenceBlock
+    this.recall = options.recall
   }
 
   // Queues a turn behind any turn already running on this session, whichever
@@ -120,7 +131,14 @@ export class Session {
   ): Promise<string> {
     const run = async (): Promise<string> => {
       this.messages.push({ role: "user", content: userInput })
-      return this.runToolLoop(origin, connection)
+      // Once per turn, before the first LLM call. Already inside the turn
+      // chain, so it cannot interleave with another turn's recall.
+      this.recalled = this.recall ? await this.recall(userInput) : null
+      try {
+        return await this.runToolLoop(origin, connection)
+      } finally {
+        this.recalled = null
+      }
     }
 
     const result = this.turnChain.then(run, run)
@@ -169,7 +187,8 @@ export class Session {
   // Builds the message array for one LLM call. Always a new array: stored
   // history is the record and is never trimmed or mutated here.
   //
-  // Order: system prompt, preferences, windowed history, voice constraint.
+  // Order: system prompt, preferences, recalled episodes, windowed history,
+  // voice constraint.
   //
   // Neither the preference block nor the voice constraint is ever written to
   // history. Both are statements about THIS call, not things that were said:
@@ -179,17 +198,19 @@ export class Session {
   private messagesForCall(origin: MessageOrigin): Message[] {
     const windowed = buildWindow(this.messages, this.limits)
 
+    // Both blocks go after the leading system prompt(s) and before any
+    // history, preferences first: a standing instruction outranks a note about
+    // something that happened once.
+    const injected: Message[] = []
     const preferences = this.preferenceBlock?.()
+    if (preferences) injected.push({ role: "system", content: preferences })
+    if (this.recalled) injected.push({ role: "system", content: this.recalled })
+
     let messages = windowed
-    if (preferences) {
-      // After the leading system prompt(s), before any history.
+    if (injected.length > 0) {
       let lead = 0
       while (lead < messages.length && messages[lead]!.role === "system") lead++
-      messages = [
-        ...messages.slice(0, lead),
-        { role: "system", content: preferences },
-        ...messages.slice(lead),
-      ]
+      messages = [...messages.slice(0, lead), ...injected, ...messages.slice(lead)]
     }
 
     if (origin !== "voice") return messages

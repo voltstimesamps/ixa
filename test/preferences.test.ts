@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { openDatabase, schemaVersion } from "../src/memory/db"
+import { LATEST_SCHEMA_VERSION, openDatabase, schemaVersion } from "../src/memory/db"
 import { PreferenceStore } from "../src/memory/preferences"
 
 const LIMITS = { maxInjected: 40, maxChars: 2000 }
@@ -11,7 +11,7 @@ function makeStore(limits = LIMITS): PreferenceStore {
 
 test("a fresh database is migrated to the current schema", () => {
   const db = openDatabase(":memory:")
-  assert.equal(schemaVersion(db), 1)
+  assert.equal(schemaVersion(db), LATEST_SCHEMA_VERSION)
 
   const tables = (
     db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
@@ -21,6 +21,7 @@ test("a fresh database is migrated to the current schema", () => {
   assert.ok(tables.includes("preferences"))
   assert.ok(tables.includes("sessions"))
   assert.ok(tables.includes("schema_version"))
+  assert.ok(tables.includes("episodes"))
 })
 
 test("an update supersedes the old row instead of overwriting it", () => {

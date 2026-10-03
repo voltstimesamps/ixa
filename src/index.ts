@@ -8,6 +8,10 @@ import { startScheduler } from "./proactive/scheduler"
 import { SessionManager } from "./core/session-manager"
 import { getPreferenceStore } from "./memory/preferences"
 import { getDatabase } from "./memory/db"
+import { getEpisodeStore } from "./memory/episodes"
+import { OllamaEmbedder } from "./memory/embeddings"
+import { QdrantIndex } from "./memory/qdrant"
+import { EpisodicMemory, setEpisodicMemory } from "./memory/episodic-memory"
 import { SqliteSessionStore } from "./core/sqlite-session-store"
 
 async function main() {
@@ -19,6 +23,15 @@ async function main() {
   const preferences = getPreferenceStore()
   console.log(`Preferences: ${preferences.listActive().length} active`)
 
+  // Episodic memory. Qdrant and Ollama are optional at runtime: if either is
+  // missing, Ixa logs one warning and runs without recall.
+  const memory = new EpisodicMemory({
+    store: getEpisodeStore(),
+    embedder: new OllamaEmbedder(),
+    index: new QdrantIndex(),
+  })
+  setEpisodicMemory(memory)
+
   // One manager owns every session. Sessions outlive the connections attached
   // to them, so a client can drop and reconnect without losing context.
   const sessions = new SessionManager({
@@ -28,6 +41,7 @@ async function main() {
       budgetChars: config.session.contextBudgetChars,
     },
     preferenceBlock: () => preferences.injectionBlock(),
+    recall: (userInput) => memory.recall(userInput),
     // Sessions now survive a backend restart. InMemorySessionStore stays the
     // default inside the manager, which is what the tests use.
     store: new SqliteSessionStore(db),
@@ -37,12 +51,16 @@ async function main() {
     console.log(
       `Session ${session.id} ended (${reason}): ${session.history().length} messages`
     )
-    // Phase 3c writes episodic summaries here: summarize session.history(),
-    // embed it with nomic-embed-text, and upsert it to Qdrant.
+    // Summarize, store and index. Returns immediately; the work is detached.
+    memory.handleSessionEnd(session, reason)
   })
 
+  // Probe Qdrant/Ollama, warm the embedding model and drain any episodes that
+  // were saved while they were down. Never fatal.
+  await memory.start()
+
   // After the handlers are registered, so a session that expired while the
-  // backend was down still fires onSessionEnd.
+  // backend was down still fires onSessionEnd (and gets summarized).
   if (!sessions.restorePrimary()) {
     console.log("No live session to restore; starting fresh.")
   }

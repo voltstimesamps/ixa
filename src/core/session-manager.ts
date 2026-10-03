@@ -16,6 +16,8 @@ export interface SessionManagerOptions {
   // Passed to every session it creates: the active-preference block, rebuilt
   // per LLM call. See Session.messagesForCall.
   preferenceBlock?: () => string | null
+  // Per-turn episodic recall, passed through to every session it creates.
+  recall?: (userInput: string) => Promise<string | null>
 }
 
 // Owns sessions independently of client connections.
@@ -29,6 +31,7 @@ export class SessionManager {
   private readonly limits: ContextWindowLimits
   private readonly chat?: ChatFn
   private readonly preferenceBlock?: () => string | null
+  private readonly recall?: (userInput: string) => Promise<string | null>
   private readonly endHandlers: SessionEndHandler[] = []
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
   private primaryId: string | null = null
@@ -39,6 +42,7 @@ export class SessionManager {
     this.limits = options.limits
     this.chat = options.chat
     this.preferenceBlock = options.preferenceBlock
+    this.recall = options.recall
   }
 
   // The current primary session, created on demand. A session that has ended
@@ -54,6 +58,7 @@ export class SessionManager {
       limits: this.limits,
       chat: this.chat,
       preferenceBlock: this.preferenceBlock,
+      recall: this.recall,
     })
     this.store.save(session)
     this.primaryId = session.id
@@ -116,6 +121,7 @@ export class SessionManager {
       limits: this.limits,
       chat: this.chat,
       preferenceBlock: this.preferenceBlock,
+      recall: this.recall,
       restore: record,
     })
   }
