@@ -240,8 +240,10 @@ async def main() -> None:
                         print(f"Error: {msg.get('content')}")
                         # A non-fatal error (e.g. "Transcription failed") owes
                         # no reply; the backend follows it with replyEnd, but
-                        # don't depend on that to get the mic back.
-                        await gate.note_reply_finished()
+                        # don't depend on that to get the mic back. Routed
+                        # through finishPlayback so an error that somehow lands
+                        # mid-reply still drains the audio it interrupted.
+                        await finishPlayback()
                     elif msgType == "sessionEnd":
                         # Server detected a spoken dismiss phrase in the transcript
                         # and already reset its own conversation state.
