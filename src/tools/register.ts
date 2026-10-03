@@ -12,6 +12,7 @@ import {
   listPreferencesTool,
 } from "./preferences"
 import { searchMemoryTool } from "./search-memory"
+import { startNewConversationTool } from "./conversation"
 
 registry.register(timeTool)
 registry.register(dateTool)
@@ -24,3 +25,4 @@ registry.register(rememberPreferenceTool)
 registry.register(forgetPreferenceTool)
 registry.register(listPreferencesTool)
 registry.register(searchMemoryTool)
+registry.register(startNewConversationTool)

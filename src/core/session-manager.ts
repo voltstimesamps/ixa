@@ -168,18 +168,34 @@ export class SessionManager {
       session.pendingTurns--
       if (session.pendingTurns === 0 && session.endedAt === null) {
         session.lastTurnAt = Date.now()
-        this.armIdleTimer(session)
       }
       // Written at the turn boundary, never mid-turn: history is only
       // guaranteed consistent (every tool call followed by its result) once
-      // the tool loop has returned.
+      // the tool loop has returned. Saved BEFORE any end is honoured, so the
+      // stored history includes the reply that asked for the reset.
       if (session.endedAt === null) this.store.save(session)
+
+      if (session.pendingTurns === 0 && session.endedAt === null) {
+        // A tool asked for a new conversation (start_new_conversation). Acted
+        // on only now the session is quiet: turns queued behind this one were
+        // submitted before the request and still belong to the old
+        // conversation, so they run first and the request is honoured after
+        // the last of them.
+        if (session.consumeEndRequest()) {
+          console.log(`Session ${session.id} ending: a new conversation was requested`)
+          this.resetPrimary()
+        } else {
+          this.armIdleTimer(session)
+        }
+      }
     }
   }
 
-  // The existing REST reset (and any other explicit reset): end the current
-  // primary session and start a fresh one. Attached connections need do
-  // nothing — their next turn resolves the new primary by itself.
+  // The one reset path. POST /reset, the REPL's "/reset" and the
+  // start_new_conversation tool all land here: end the current primary
+  // session (firing onSessionEnd, which summarizes it into episodic memory)
+  // and start a fresh one. Attached connections need do nothing — their next
+  // turn resolves the new primary by itself.
   resetPrimary(): Session {
     if (this.primaryId) this.endSession(this.primaryId, "reset")
     return this.startPrimarySession()

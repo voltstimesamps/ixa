@@ -5,6 +5,7 @@ import { chat as defaultChat, type LLMResponse, Message } from "./llm"
 import { registry } from "../tools/registry"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
+import { runWithSessionControl } from "./session-context"
 import type { Connection } from "./connection"
 import type { PersistedSession } from "./session-store"
 
@@ -98,6 +99,12 @@ export class Session {
   // serialized on turnChain: only one turn is ever in flight.
   private recalled: string | null = null
 
+  // Set when a tool asked for this conversation to end (start_new_conversation).
+  // Read and cleared by the manager at the turn boundary: ending the session
+  // mid-turn would pull the history out from under the tool loop that is still
+  // appending to it, and would leave the reply unrecorded in the episode.
+  private endRequested = false
+
   // Turn serialization. Every turn chains onto the previous one, so only one
   // tool loop at a time ever appends to `messages`. Two concurrent loops would
   // interleave their assistant/tool messages and produce a history where a
@@ -129,17 +136,23 @@ export class Session {
     connection: Connection,
     origin: MessageOrigin = "text"
   ): Promise<string> {
-    const run = async (): Promise<string> => {
-      this.messages.push({ role: "user", content: userInput })
-      // Once per turn, before the first LLM call. Already inside the turn
-      // chain, so it cannot interleave with another turn's recall.
-      this.recalled = this.recall ? await this.recall(userInput) : null
-      try {
-        return await this.runToolLoop(origin, connection)
-      } finally {
-        this.recalled = null
-      }
-    }
+    const run = (): Promise<string> =>
+      // Binds the session-control channel for the whole turn, so a tool that
+      // runs inside the loop can reach THIS session and no other.
+      runWithSessionControl(
+        { requestNewConversation: () => { this.endRequested = true } },
+        async (): Promise<string> => {
+          this.messages.push({ role: "user", content: userInput })
+          // Once per turn, before the first LLM call. Already inside the turn
+          // chain, so it cannot interleave with another turn's recall.
+          this.recalled = this.recall ? await this.recall(userInput) : null
+          try {
+            return await this.runToolLoop(origin, connection)
+          } finally {
+            this.recalled = null
+          }
+        }
+      )
 
     const result = this.turnChain.then(run, run)
     this.turnChain = result.catch(() => {})
@@ -150,6 +163,15 @@ export class Session {
   // Phase 3c summarizer. Stored history itself is never handed out.
   history(): readonly Message[] {
     return [...this.messages]
+  }
+
+  // True once, if a tool asked for a new conversation during the turn that
+  // just finished. The manager calls this at the turn boundary; clearing on
+  // read means one request ends one session and never the one after it.
+  consumeEndRequest(): boolean {
+    const requested = this.endRequested
+    this.endRequested = false
+    return requested
   }
 
   // Part of the persisted state: a restored session resumes in the directory
