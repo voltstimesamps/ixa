@@ -6,6 +6,11 @@ import { searchTool } from "./search"
 import { shellReadTool } from "./shell-read"
 import { shellWriteTool } from "./shell-write"
 import { notifyTool } from "./notify"
+import {
+  rememberPreferenceTool,
+  forgetPreferenceTool,
+  listPreferencesTool,
+} from "./preferences"
 
 registry.register(timeTool)
 registry.register(dateTool)
@@ -14,3 +19,6 @@ registry.register(searchTool)
 registry.register(shellReadTool)
 registry.register(shellWriteTool)
 registry.register(notifyTool)
+registry.register(rememberPreferenceTool)
+registry.register(forgetPreferenceTool)
+registry.register(listPreferencesTool)

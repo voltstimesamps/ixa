@@ -1,5 +1,5 @@
 import { config } from "../config"
-import type { Db } from "./db"
+import { getDatabase, type Db } from "./db"
 
 // The preference store.
 //
@@ -249,4 +249,18 @@ export class PreferenceStore {
   private renderLine(preference: Preference): string {
     return `- [${preference.category}] ${preference.topic}: ${preference.value}`
   }
+}
+
+// The process-wide store, resolved lazily so importing the preference tools
+// does not open the database as a side effect of module loading.
+let shared: PreferenceStore | null = null
+
+export function getPreferenceStore(): PreferenceStore {
+  if (!shared) shared = new PreferenceStore(getDatabase())
+  return shared
+}
+
+// Lets a test or a dev script point the tools at a temp database.
+export function setPreferenceStore(store: PreferenceStore | null): void {
+  shared = store
 }
