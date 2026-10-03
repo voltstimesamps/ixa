@@ -285,6 +285,7 @@ export class EpisodicMemory {
       if (episodes.length === 0) return null
 
       const block = this.renderRecallBlock(episodes)
+      if (!block) return null
       console.log(
         `memory: recalled ${episodes.length} episode(s) in ${Date.now() - startedAt}ms ` +
           `(top score ${hits[0]!.score.toFixed(3)})`
@@ -336,7 +337,13 @@ export class EpisodicMemory {
       chars += line.length + 1
     }
 
-    if (lines.length === 0) return ""
+    if (lines.length === 0) {
+      console.warn(
+        `memory: recall skipped — ${this.limits.recallMaxChars} char cap is too small for even ` +
+          `one episode summary`
+      )
+      return ""
+    }
     if (lines.length < episodes.length) {
       console.warn(
         `memory: recall block capped at ${this.limits.recallMaxChars} chars — ` +
