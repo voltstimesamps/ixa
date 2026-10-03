@@ -5,6 +5,7 @@ import type { SessionManager } from "../core/session-manager"
 import type { Connection } from "../core/connection"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
 import { speakStreaming } from "../voice/tts"
+import { sanitizeForSpeech } from "../voice/sanitize"
 import { transcribe, pcmToWav } from "../voice/stt"
 import { isDismissPhrase, DISMISS_ACKNOWLEDGMENT } from "../voice/dismiss"
 import type { WsMessage } from "./types"
@@ -55,13 +56,20 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
       sessions.attach(connection)
       send({ type: "sessionStart" })
 
+      // The one place text becomes audio, which is why the markdown stripping
+      // lives here: the "assistant" message and the stored history above keep
+      // the model's original text, and only what is spoken is sanitized.
+      // Nothing is truncated — see src/voice/sanitize.ts.
       const speak = async (text: string) => {
+        const spoken = sanitizeForSpeech(text)
+        if (!spoken) return
+
         const abort = new AbortController()
         speechAbort = abort
         try {
           let started = false
           await speakStreaming(
-            text,
+            spoken,
             (chunk) => {
               if (!connection.isOpen) return
               if (!started) {
