@@ -53,7 +53,7 @@ Tailscale mesh
 
 **Networking gotcha:** Tailscale inside WSL2 is a **separate node** from any Windows-side Tailscale, with its own IP (shown as e.g. `desktop-1 (wsl)`). Always confirm the backend address with `tailscale status` **inside WSL2** after any networking change. Never reuse an IP from earlier in a session.
 
-**Compute gotcha:** WSL2 currently exposes only 4 vCPUs (`nproc` = 4), most likely because of a `processors=` limit in Windows-side `%UserProfile%\.wslconfig`. Torch defaults to one thread per visible physical core, so 2 threads. Measured: 4 threads synthesize ~29% faster than 2.
+**Compute gotcha (resolved, not yet re-measured):** WSL2 now exposes **8 vCPUs** (`nproc` = 8); it previously exposed 4 because of a `processors=` limit in Windows-side `%UserProfile%\.wslconfig`. Torch defaults to one thread per visible physical core. **The TTS benchmark has not been re-run since the limit was raised** — the last measurements are still the 4-vCPU ones below (real-time factor ≈ 0.54 at 2 torch threads, 0.38 at 4; 4 threads ~29% faster than 2). Re-benchmark and replace those numbers.
 
 ### Future (homelab online)
 
@@ -86,7 +86,7 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 - **Shopping / logistics.** Research and comparison freely; ordering requires confirmation.
 
 ### Memory and Knowledge
-- **Episodic memory.** ✅ Each ended session is summarized and embedded; related episodes are recalled automatically on the turn that needs them, and `search_memory` answers direct questions about past conversations.
+- **Episodic memory.** ✅ Each ended session is summarized and embedded; related episodes are recalled automatically on the turn that needs them, and `search_memory` answers direct questions about past conversations — by meaning with a query, or by recency without one.
 - **Preference learning.** ✅ Structured store of preferences the user has stated, applied to every reply without being asked.
 - **Notes.** 🔜 Obsidian vault as the human write interface, embedded for semantic search.
 
@@ -107,6 +107,7 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 - **Confirm first:** send email, push code, trigger physical automations, place orders, write/delete outside the sandbox, modify system state.
 - Encoded as `requiresConfirmation: boolean` on every tool. The gate is **transport-agnostic**: a `Confirmer` is injected, so the same gate works over voice (TTS readback + spoken yes/no) and text clients. ✅ (`shell_write` confirms today.)
 - **Memory tools are deliberately ungated** (`remember_preference`, `forget_preference`, `list_preferences`, `search_memory`). They touch only Ixa's own database: nothing leaves the machine, a preference update supersedes rather than overwrites, and forgetting is a soft delete. Gating them would put a spoken yes/no in front of every "I prefer X", which is the friction the feature exists to remove. The reasoning is recorded in a comment at the top of each tool file so it is not quietly generalised to tools with outside consequences.
+- **`start_new_conversation` is ungated too**, on a narrower argument than "the session is summarized first, so nothing is lost". What was traced through the code: **session rows are never deleted** — ending one stamps `ended_at` and writes the full history back to SQLite, and nothing in Ixa removes a session row, so the raw conversation survives verbatim. The **episode** (the searchable summary) is best effort: skipped outright below `IXA_EPISODE_MIN_USER_TURNS`, and on a summarizer LLM failure logged and dropped **with no retry**, because the backlog sweep retries *indexing* of rows that exist, not summarization. So the honest claim is that the conversation is never lost but its summary may be — a recoverable loss, since the history is on disk and can be re-summarized. That is not what the confirmation gate is for.
 - **A cancelled confirmation is recorded differently from a refused one.** If the client that asked disconnects mid-prompt, the tool result says so explicitly, so the model knows the action did not happen because the asker vanished — not because the user said no. ✅
 - **Imported (MCP) tools follow the same rule** via an Ixa-side policy table. **Unknown tools default to confirm.** 🔜
 
@@ -139,7 +140,9 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 | Scheduling | node-cron | Morning debrief skeleton only: fires at 08:00 on weekdays and sends an Ntfy nudge |
 | Networking | Tailscale | All clients reach the backend over the tailnet |
 
-**Registered tools today** (`src/tools/register.ts`): `get_time`, `get_date`, `echo`, `web_search`, `shell_read`, `shell_write`, `notify`, `remember_preference`, `forget_preference`, `list_preferences`, `search_memory`. All are passed to the LLM for both voice and text turns. Only `echo` and `shell_write` require confirmation; the memory tools deliberately do not (see Autonomy Policy).
+**Registered tools today** (`src/tools/register.ts`): `get_time`, `get_date`, `echo`, `web_search`, `shell_read`, `shell_write`, `notify`, `remember_preference`, `forget_preference`, `list_preferences`, `search_memory`, `start_new_conversation`. All twelve are passed to the LLM for both voice and text turns. Only `echo` and `shell_write` require confirmation; the memory tools and `start_new_conversation` deliberately do not (see Autonomy Policy).
+
+**The tool schemas are the single largest fixed cost in a request:** 8015 characters, ~1400 tokens, on *every* LLM call. That is roughly three times the system prompt. Trimming a verbose description is the cheapest way to buy headroom under Groq's free tier (see Current open items).
 
 ### Planned 🔜
 
@@ -286,6 +289,39 @@ cron fires OR webhook received (HA / OctoPrint)
 10. **Push-to-talk** exists as a toggle (`:rec`) for debugging and noisy environments.
 11. **The client is an explicit four-state machine** (`clients/desktop/conversation.py`): `SLEEPING` (only the wake model sees audio, no timer), `LISTENING` (conversation open, the user's move, conversation timer runs), `WAITING` (utterance sent, reply not started, response timer runs), `SPEAKING` (reply audio playing, no timer, mic dropped). **The conversation timeout runs in LISTENING and nowhere else** — that is the point of the split: a turn that takes 30s to think and 20s to speak must not burn down the window the user has to reply. `WAITING` has its own long safety-net timer for a reply that never comes. The backend sends exactly one terminator per accepted turn (`replyEnd`, or `sessionEnd` on a dismiss) so the client always knows a turn is over, including for empty or failed replies.
 
+### Conversation lifecycle ✅ (behaviour fixes)
+Live voice testing found there was **no real way to end a conversation**. Typing `/reset` at the REPL was sent to the LLM as a message, and the model answered "Conversation reset. All previous context cleared" with nothing having happened — a believable lie, which is worse than an error.
+
+Three entry points now reach **one** reset, `SessionManager.resetPrimary()`:
+1. **`start_new_conversation`**, a tool, so voice can ask for it.
+2. **The REPL's `/reset`**, handled locally in `handleLocalCommand` and never sent on. Anything that is not a known command is left alone and reaches the LLM as typed, so this cannot silently swallow a real message.
+3. **`POST /reset`**, unchanged.
+
+- **The end is deferred to the turn boundary, never applied mid-turn.** Ending the session inside the tool loop would pull the history out from under the loop still appending to it, and would leave the reply that announced the reset out of the episode. The manager honours the request in `submitTurn`'s `finally`, after history is persisted.
+- **It waits for queued turns.** Turns already chained behind the resetting one were submitted *before* the request, so they belong to the old conversation: the request is honoured once `pendingTurns` reaches zero, not at the first opportunity.
+- **A tool cannot reach the session directly, by design.** `Tool.execute` receives only its own input; a tool able to reach the `Session` or the `SessionManager` could do anything to the conversation at any point in the loop. So the tool records a *request* through `SessionControl` (`src/core/session-context.ts`), an `AsyncLocalStorage` bound around each turn, and the manager decides what to do with it. AsyncLocalStorage rather than a module-level flag: the request belongs to one session's turn, a bare flag would leak into whatever turn ran next if a `Session` were ever driven outside `submitTurn`, and this keeps working unchanged if the one-shared-primary-session policy ends.
+- **No `WsMessage` change.** A session ending is not the same as the client's listening window closing, so there is nothing new to tell the client: the window stays open and the next thing the user says lands in the fresh session.
+- **The model is told never to claim an action it did not take.** `SYSTEM_PROMPT` now forbids saying anything was reset, cleared, saved, remembered, updated or forgotten unless the tool that does it was actually called and reported success. The tool itself, called outside a turn, returns a failure string rather than throwing, so the model says something true instead of inventing a reset.
+
+### Voice response shaping ✅ (behaviour fixes)
+One live voice reply produced **87 seconds of speech**, with numbered lists and bold. Kokoro phonemizes whatever it is handed, so `**Best value:**` is read out with the asterisks and `1.` becomes the spoken word "one".
+
+- **The prompt is the mechanism; the sanitizer is the backstop.** `VOICE_RESPONSE_PROMPT` asks for one to three short sentences, forbids formatting outright, and for a multi-item answer wants the best one or two plus an offer of the rest. Its previous version had an escape hatch — "unless the user is explicitly asking for something that requires more detail" — which the model took constantly, because almost any question reads as inviting detail.
+- **`sanitizeForSpeech` (`src/voice/sanitize.ts`) runs only at the TTS boundary**, in `speak()` in `src/api/websocket.ts`. It is downstream of the `assistant` message, so **stored history and text clients keep the model's original text** and only what is spoken is stripped. `src/voice/tts.ts` stays a dumb transport.
+- **Nothing is ever truncated.** A reply that is too long is a prompting problem; a sentence cut mid-word makes Ixa sound broken rather than verbose.
+- **Its output is punctuated prose joined by single spaces**, which is not cosmetic: the sidecar's `split_pattern` chunks on sentence endings and newlines, so turning an unpunctuated heading or list item into a sentence is what lets a list stream one chunk per item instead of one chunk for the whole reply.
+- **It works on the complete reply, which Phase 4 will change.** Overlapping LLM token streaming with TTS (listed under Phase 4) means handing TTS each sentence while the model is still generating. A sanitizer that sees only a partial sentence cannot tell an unclosed `**` from a literal asterisk, and cannot know whether a line is a list item before its marker arrives. It will need to become incremental — buffering until a block is provably complete — or run behind whatever boundary detector the streaming path uses. Do not assume the current whole-string version drops into that path.
+- Underscores inside identifiers (`search_memory`, `episodic_memory.ts`) and a literal `2 * 3` survive. **Markdown tables are deliberately out of scope**: a spoken table is unsalvageable whatever is done to the pipes, and the fix is the model not writing one.
+
+### What Ixa knows about her own memory ✅ (behaviour fixes)
+Asked to "pull your memory", Ixa said she had no stored memories — while `search_memory` and the three preference tools were registered and working. Nothing in the system prompt told her the memory existed; the injected preference and recall blocks describe *contents*, so with an empty recall she had no reason to think there was a capability at all.
+
+`SYSTEM_PROMPT` now describes it in three parts, matching what is actually built: saved preferences (always applied), summaries of past conversations (some recalled automatically, the rest searchable), and the current conversation persisting across reconnects and restarts. It also states the limits — no record of a conversation that never ended, no recall of a file she has not read — because an overstated memory produces a different lie from the one this fixed.
+
+**The hand-listed tool descriptions are gone** from `SYSTEM_PROMPT` (the open item flagged through 3b/3c). The registry descriptions are the contract the model reads when choosing a tool, and a duplicate list goes stale. What stays in the prompt is only what a tool description cannot carry: identity, memory, the honesty rule, the freshness rule, and guidance spanning every tool.
+
+**Anything that changes over time must be searched for.** Ixa stated prices and specific products from memory. The prompt now requires `web_search` before answering about prices, availability, versions, release dates or current events, and requires saying plainly that she is not sure when she cannot search. This **increases `web_search` traffic**, which matters under the free tier — see Current open items for the measured cost of a search turn.
+
 ### LLM abstraction and configuration
 - Application config values are read through **one config module** (`src/config.ts`). Exceptions: some files read `HOME`, and the shell tools and `src/core/sidecars.ts` pass the process environment through to child processes. Don't add new direct `process.env` reads for config.
 - The canonical list of variables lives in **`.env.example`**, not in this doc. Several (e.g. `STT_URL`, `TTS_URL`, `STT_MODEL`) have working defaults in `config.ts`.
@@ -356,6 +392,14 @@ Tool **descriptions** are read by the LLM when it chooses tools, so they must st
 
 **Degradation is silent by design.** ✅ If Qdrant or Ollama is unreachable, Ixa works normally without recall and logs **one** warning (and one line when it recovers), never one per turn. `search_memory` is the exception: asked a direct question, it says it cannot search rather than guessing.
 
+**Recency is a SQLite question, not a vector question.** ✅ (behaviour fixes) "What did we talk about last time?" could not be answered: automatic recall and `search_memory` both match on *meaning*, and a question with no subject in it embeds to a vector near nothing and falls under the score threshold. `search_memory`'s `query` is therefore **optional**, and with no query it returns the most recent episodes, newest first, straight from `EpisodeStore.recent()`.
+
+- Ordering by `ended_at` is something that table already has, so routing recency through Qdrant would add a dependency to get a worse answer. It is **the one memory question that needs no embedding**, and it works with Ollama and Qdrant both down.
+- Ordered by `ended_at`, **not** `id`, so a backlog retry or an index rebuild cannot reorder history.
+- A blank `query` string is treated as no query: the model sometimes sends `query: ""` rather than omitting the field, and embedding an empty string returns nothing — the opposite of what it meant.
+
+**Dates are local time throughout, and the model has no clock.** ✅ (behaviour fixes) `search_memory`'s `from`/`to` are parsed with the local-time `Date` constructor and rendered back with `toLocaleString`, both in the **backend's local timezone** — the user means their own Tuesday, not UTC's, and a UTC parse would put a day boundary up to a day off for anyone west of Greenwich. Episodes are stored as epoch ms, so bounds and rendered dates only have to be built in the same zone to agree. The model cannot know "now" by itself, so the tool description tells it to call `get_date` (also local) before building a relative range like "yesterday". Rendered episodes carry the **time of day as well as the date**: without it, two conversations on the same day render identically and the model cannot say which was the last one.
+
 **Episode summaries are written when a session ends**, except on shutdown ✅. A summary is an LLM call taking seconds, and shutdown offers under one. A session left live in SQLite by a Ctrl-C is restored on the next startup if it is still fresh, or expired and summarized then — so nothing is lost by refusing to rush it. Sessions with fewer than a configured number of user turns are skipped.
 
 ### Client architecture
@@ -385,7 +429,8 @@ ixa/
 │   │   ├── context-window.ts    ← buildWindow, atomic tool-call groups
 │   │   ├── confirmation.ts      ← Confirmer, cancel-on-disconnect
 │   │   ├── connection.ts        ← Connection interface (one attached client)
-│   │   ├── harness.ts           ← stdin REPL (text mode)
+│   │   ├── session-context.ts   ← SessionControl, the channel a tool uses to end its session
+│   │   ├── harness.ts           ← stdin REPL (text mode) + handleLocalCommand ("/reset")
 │   │   ├── llm.ts               ← OpenAI-compatible streaming chat
 │   │   └── sidecars.ts          ← spawns STT/TTS sidecars, TCP readiness probe
 │   ├── memory/
@@ -398,15 +443,17 @@ ixa/
 │   │   └── episodic-memory.ts   ← write path, recall, backlog, degradation
 │   ├── tools/
 │   │   ├── registry.ts          ← Tool interface + registry
-│   │   ├── register.ts          ← registers all 11 tools
+│   │   ├── register.ts          ← registers all 12 tools
 │   │   ├── time.ts · date.ts · echo.ts · notify.ts
 │   │   ├── search.ts            ← Tavily web_search
 │   │   ├── shell-read.ts · shell-write.ts
 │   │   ├── preferences.ts       ← remember / forget / list_preferences
-│   │   └── search-memory.ts     ← explicit episodic recall
+│   │   ├── search-memory.ts     ← explicit episodic recall (by meaning, or by recency)
+│   │   └── conversation.ts      ← start_new_conversation
 │   ├── voice/
 │   │   ├── tts.ts               ← speakStreaming (streaming TTS client)
 │   │   ├── stt.ts               ← transcribe
+│   │   ├── sanitize.ts          ← sanitizeForSpeech: strips markdown before TTS
 │   │   └── dismiss.ts           ← dismiss-phrase detection
 │   ├── proactive/
 │   │   ├── scheduler.ts         ← node-cron
@@ -418,7 +465,7 @@ ixa/
 │       ├── test-client.ts       ← the /test browser page
 │       ├── static-assets.ts     ← ONNX models + onnxruntime-web for /test
 │       └── wake-check.ts        ← browser-vs-Python wake fixture comparison
-├── test/                        ← node:test suites (84 cases)
+├── test/                        ← node:test suites (127 cases)
 ├── dev/scripts/                 ← throwaway verification clients, not shipped
 ├── tools/wakeword/              ← wake word training + fixtures
 ├── sidecars/
@@ -466,14 +513,26 @@ Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/
 (Home Assistant moved to Phase 4 and will be built via MCP.)
 
 ### Current open items
-- **Add `TAVILY_API_KEY` to `.env`.** `web_search` is registered but returns "not configured" without it. Remove the stale empty `BRAVE_API_KEY` line.
-- **Raise the WSL vCPU limit** (`.wslconfig` `processors=`) and re-benchmark TTS.
+- **Groq free tier is now the binding constraint.** Measured limits: **8000 tokens per minute** and **200000 tokens per day**, both enforced as 429s (`x-ratelimit-limit-tokens: 8000`). A single request larger than the per-minute allowance is rejected outright — the 413 seen on an 8123-token request. Measured sizes, which say where the budget actually goes:
+
+  | Piece | Size |
+  |---|---|
+  | Tool schemas (12 tools, every call) | 8015 chars / **~1400 tok** |
+  | `SYSTEM_PROMPT` | 2138 chars / **522 tok** |
+  | `VOICE_RESPONSE_PROMPT` (voice turns only) | 828 chars / **269 tok** |
+  | A `web_search` result | ~5300 chars |
+  | Full voice request, `IXA_CONTEXT_BUDGET_CHARS=24000` | **~4500 tok** |
+
+  Consequences: **the per-day cap is reached easily** — a day of development testing exhausted 200000 and the window then refills by trickle, costing ~6 minutes of waiting per 2000-token request, which blocks live verification entirely. **The freshness rule increases `web_search` traffic**, and a search turn is two LLM calls, the second carrying the ~5300-char result. And **the prompt trim did not save tokens**: removing the duplicated tool list saved less than the memory, honesty and freshness rules cost, so `SYSTEM_PROMPT` grew from 262 to 522 tokens. The real levers are the tool schemas (`remember_preference`'s description alone is ~1470 chars) and `IXA_CONTEXT_BUDGET_CHARS`. **Decide between a paid Groq tier and the local-LLM migration before the next phase that needs live verification.**
 - **Sidecar warmup** before readiness (removes the small cold-start inter-chunk gap).
 - **SearXNG:** `SEARXNG_URL` is in `.env.example`. Determine whether `search.ts` has a SearXNG path. A self-hosted, keyless search backend fits the project better than Tavily long-term.
-- **`SYSTEM_PROMPT` hand-lists some tools** (`web_search`, `get_time`, `get_date`, `echo`, shell guidance) that the registry already describes. The registry descriptions are the contract; the duplicate list can go stale. Left alone deliberately through 3b/3c because removing it changes prompt behavior — worth doing in a phase that can re-verify replies.
+- **Re-benchmark TTS** now that WSL exposes 8 vCPUs (see Compute gotcha). The recorded real-time factors are still the 4-vCPU ones.
+- **An episode lost to a summarizer failure is not retried.** The backlog sweep retries *indexing* of rows that exist; a session whose summarization LLM call failed never gets a row at all, and nothing goes back for it. The raw history is still in SQLite, so a re-summarization pass over ended sessions with no episode row is possible and cheap to add. Relevant now that `start_new_conversation` makes ending a session a routine, user-driven act.
+
+**Resolved since Phase 3c:** `TAVILY_API_KEY` is set and `web_search` works. The WSL vCPU limit is raised (4 → 8). The `SYSTEM_PROMPT` tool-list duplication is gone — see *What Ixa knows about her own memory*.
 - **Recall threshold is provisional.** 0.60 was set from a small sample. Against real episodes, genuinely related questions scored 0.58–0.81 and unrelated ones 0.46–0.57, so the margin is thin and one weak-but-real match (a topic mentioned in passing in a multi-topic summary) fell just under. Revisit once there are dozens of episodes; it is a config value (`IXA_RECALL_MIN_SCORE`).
 - **Multi-topic summaries compress the similarity separation.** One summary covering three subjects matches everything weakly. This is the argument for topic segmentation in 3d, not just for a different threshold.
-- **Next phase:** Phase 3d (Obsidian) or Phase 4 (voice polish + MCP). They are independent.
+- **Next phase:** the **post-3c behaviour fixes** come first — they are corrections to what 3a–3c already shipped, and both Phase 3d and Phase 4 build on the conversation and voice behaviour they fix. After that, Phase 3d (Obsidian) or Phase 4 (voice polish + MCP), which are independent of each other.
 
 ### Phase 3a — Session ownership — ✅ DONE
 `SessionManager` owning sessions independently of connections, one shared primary session, `SessionStore` interface, `Connection` abstraction, turn serialization, cancel-on-disconnect, idle timeout with the timer disarmed while turns are outstanding, and context windowing with atomic tool-call groups.
@@ -485,6 +544,16 @@ SQLite (better-sqlite3) with versioned migrations, the append-only preference st
 Episodes summarized when a session ends and written to SQLite first, embedded with nomic-embed-text via Ollama and indexed in Qdrant (localhost-only Docker, storage on a host volume), per-turn recall under a hard latency budget, `search_memory`, graceful degradation when either service is down with a retried backlog, and dev scripts to rebuild the index from SQLite or forget one episode.
 
 Measured: recall costs 41–104ms per turn (warm embed ~40ms); related questions score 0.58–0.81 against real episodes while unrelated ones top out at 0.57.
+
+### Post-3c behaviour fixes — ✅ built, live verification incomplete
+Five problems found in live voice testing, all of them behaviour rather than plumbing:
+1. **No way to end a conversation.** `start_new_conversation`, the REPL's local `/reset`, and a deferred end at the turn boundary. See *Conversation lifecycle*.
+2. **Ixa did not know she had memory.** A memory description in `SYSTEM_PROMPT`, and the duplicated tool list removed. See *What Ixa knows about her own memory*.
+3. **Voice replies far too long and formatted for text** (87 seconds of speech, with lists and bold). A stricter `VOICE_RESPONSE_PROMPT` plus `sanitizeForSpeech` at the TTS boundary. See *Voice response shaping*.
+4. **Prices and products stated without searching.** A freshness rule in `SYSTEM_PROMPT`.
+5. **"What did we talk about last time?" unanswerable.** `search_memory`'s query is optional; no query means recency, from SQLite. See *Memory architecture*.
+
+**Verification status.** The automated suite covers all five (127 cases, up from 84): the sanitizer, `/reset` handled locally with an LLM that fails the test if called, the deferred session end including the queued-turn case, and `search_memory` with and without a query. The **live** end-to-end run (a real voice-origin turn, a real reset, real memory questions) is **incomplete**: the Groq free tier's 200000-token daily cap was exhausted partway through, and the window refills too slowly to finish. Token sizes were measured before it ran out and are recorded under Current open items. Finish the live run when there is LLM budget.
 
 ### Phase 3d — Obsidian vault pipeline — 🔜
 - Obsidian + Syncthing + chokidar → chunk → nomic-embed → Qdrant (a second collection).
@@ -557,4 +626,4 @@ Done when: you can watch Ixa complete a multi-step website task.
 
 ---
 
-*Last updated: 2026-10-03. Phases 3a, 3b and 3c marked done and described (session ownership, context windowing, the preference store, session persistence, episodic memory); Phase 3d split out as the remaining 🔜 memory work. Fixed the contradictions reported during 3a/3b: preferences are injected on every LLM call rather than at session start, the tool registry now lists eleven tools, the session manager and reconnect behaviour are no longer described as planned, `src/memory/` is no longer a placeholder, and the Repository Layout was reconciled against the real tree. Added the client conversation state machine and the 3a–3c design decisions. Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
+*Last updated: 2026-10-03 (second entry: post-3c behaviour fixes). Added the Conversation lifecycle, Voice response shaping and memory self-knowledge decisions; recorded that recency is a SQLite question and that dates are local time throughout; noted that `sanitizeForSpeech` works on a complete reply and will need to become incremental if Phase 4 overlaps streaming with TTS; documented why `start_new_conversation` is ungated in terms of what was actually traced (session rows are never deleted; the episode summary is best effort and not retried). Refreshed stale open items: Groq's free-tier limits are now the binding constraint and carry measured numbers, `TAVILY_API_KEY` is set, WSL exposes 8 vCPUs (TTS not yet re-benchmarked), and the `SYSTEM_PROMPT` tool-list duplication is resolved. Tool count 11 → 12, test count 84 → 127. Earlier entry: phases 3a, 3b and 3c marked done and described; the contradictions reported during 3a/3b fixed; the client conversation state machine added. Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
