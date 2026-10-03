@@ -5,7 +5,7 @@ export const config = {
   llm: {
     baseURL: process.env.LLM_BASE_URL ?? "https://api.groq.com/openai/v1",
     apiKey: process.env.LLM_API_KEY ?? "",
-    model: process.env.LLM_MODEL ?? "llama-3.3-70b-versatile",
+    model: process.env.LLM_MODEL ?? "openai/gpt-oss-20b",
   },
   voice: {
     enabled: process.env.VOICE_MODE === "true",
