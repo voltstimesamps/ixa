@@ -86,9 +86,9 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 - **Shopping / logistics.** Research and comparison freely; ordering requires confirmation.
 
 ### Memory and Knowledge
-- **Episodic memory.** Session summaries retrieved semantically at session start.
-- **Preference learning.** Structured store of learned preferences.
-- **Notes.** Obsidian vault as the human write interface, embedded for semantic search.
+- **Episodic memory.** ✅ Each ended session is summarized and embedded; related episodes are recalled automatically on the turn that needs them, and `search_memory` answers direct questions about past conversations.
+- **Preference learning.** ✅ Structured store of preferences the user has stated, applied to every reply without being asked.
+- **Notes.** 🔜 Obsidian vault as the human write interface, embedded for semantic search.
 
 ### Proactive Behavior
 - **Morning debrief.** Scheduled alarm or "good morning" phrase triggers weather, calendar, tasks, and context.
@@ -106,6 +106,8 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 - **Read freely:** email, calendar, HA state, files, web search, read-only shell.
 - **Confirm first:** send email, push code, trigger physical automations, place orders, write/delete outside the sandbox, modify system state.
 - Encoded as `requiresConfirmation: boolean` on every tool. The gate is **transport-agnostic**: a `Confirmer` is injected, so the same gate works over voice (TTS readback + spoken yes/no) and text clients. ✅ (`shell_write` confirms today.)
+- **Memory tools are deliberately ungated** (`remember_preference`, `forget_preference`, `list_preferences`, `search_memory`). They touch only Ixa's own database: nothing leaves the machine, a preference update supersedes rather than overwrites, and forgetting is a soft delete. Gating them would put a spoken yes/no in front of every "I prefer X", which is the friction the feature exists to remove. The reasoning is recorded in a comment at the top of each tool file so it is not quietly generalised to tools with outside consequences.
+- **A cancelled confirmation is recorded differently from a refused one.** If the client that asked disconnects mid-prompt, the tool result says so explicitly, so the model knows the action did not happen because the asker vanished — not because the user said no. ✅
 - **Imported (MCP) tools follow the same rule** via an Ixa-side policy table. **Unknown tools default to confirm.** 🔜
 
 ---
@@ -129,21 +131,21 @@ Migration is configuration only: `LLM_BASE_URL` and the service URLs change, wit
 | Browser-side inference | onnxruntime-web | Wake word ported and validated in browser |
 | Web search | Tavily | Requires `TAVILY_API_KEY`. `SEARXNG_URL` exists in `.env.example`; see Open items |
 | Shell | `shell_read` (free) / `shell_write` (confirm) | Cross-platform command translation; session-scoped working directory |
+| Sessions | Long-lived `SessionManager` + `SqliteSessionStore` | Sessions outlive connections and survive a backend restart |
+| Preferences | SQLite via better-sqlite3 | Append-only: updates supersede, forgetting soft-deletes. Injected on every LLM call |
+| Episodic memory | SQLite (source of truth) + Qdrant (index) | Session summaries, embedded and recalled per turn |
+| Embeddings | nomic-embed-text via Ollama (768-dim) | Local. `search_query:` / `search_document:` prefixes |
 | Notifications | Ntfy (`notify` tool) | ntfy.sh public server in dev; self-host planned |
-| Scheduling | node-cron | Morning debrief skeleton only (verify) |
+| Scheduling | node-cron | Morning debrief skeleton only: fires at 08:00 on weekdays and sends an Ntfy nudge |
 | Networking | Tailscale | All clients reach the backend over the tailnet |
 
-**Registered tools today** (`src/tools/register.ts`): `get_time`, `get_date`, `echo`, `web_search`, `shell_read`, `shell_write`, `notify`. All are passed to the LLM for both voice and text turns.
+**Registered tools today** (`src/tools/register.ts`): `get_time`, `get_date`, `echo`, `web_search`, `shell_read`, `shell_write`, `notify`, `remember_preference`, `forget_preference`, `list_preferences`, `search_memory`. All are passed to the LLM for both voice and text turns. Only `echo` and `shell_write` require confirmation; the memory tools deliberately do not (see Autonomy Policy).
 
 ### Planned 🔜
 
 | Component | Choice | Why |
 |---|---|---|
-| Session ownership | Long-lived session manager on the backend | Today a new `Session` is created per WebSocket connection, per REST reset, and per REPL, so a client reconnect loses context. This breaks the "reconnects resume seamlessly" principle. (Phase 3) |
-| Vector DB | Qdrant (Docker) | Episodic + semantic memory (Phase 3) |
-| Embeddings | nomic-embed-text via Ollama (768-dim) | Local, private (Phase 3) |
-| Preferences | SQLite via better-sqlite3 | Structured preference store (Phase 3) |
-| Notes | Obsidian + Syncthing + chokidar | Vault → embeddings pipeline (Phase 3) |
+| Notes | Obsidian + Syncthing + chokidar | Vault → embeddings pipeline (Phase 3d) |
 | Turn detection | **Smart Turn v3** (Pipecat), ONNX | Decides end-of-turn from intonation, not a fixed silence timer. ~8M params, 8MB int8 ONNX, Whisper-Tiny encoder + linear head. BSD 2-Clause (not tied to Pipecat). Layers **on top of** Silero, which must use a ~0.2s stop threshold to match training. |
 | Integration protocol | **MCP client in the harness** | One generic adapter instead of a bespoke wrapper per service. First consumer: Home Assistant's native MCP server (Streamable HTTP). |
 | Browser layer | **Stagehand** (TS, MIT) | Playwright-compatible; deterministic Playwright calls and AI actions can be mixed in one script. Use deterministic paths for routine flows; AI actions are less reliable than plain selectors. |
@@ -163,15 +165,15 @@ Cloud APIs (Groq, Tavily, ntfy.sh)          🔜 MCP servers (HA first)
 │                    Backend (gaming PC, WSL2)              │
 │                                                           │
 │  Core Harness                                             │
-│    Session (per connection today) · tool loop ·           │
-│    confirmation gate · LLM                                │
-│    🔜 long-lived session manager                          │
+│    SessionManager (owns sessions) · Session · tool loop ·  │
+│    context windowing · confirmation gate · LLM            │
 │                                                           │
-│  Tool layer                    🔜 Memory                  │
-│    native tools (time, date,     Qdrant episodic          │
-│    echo, search, shell,          SQLite preferences       │
-│    notify)                       vault pipeline           │
-│    🔜 MCP client + policy table                           │
+│  Tool layer                    Memory                     │
+│    time, date, echo, search,     SQLite: preferences,     │
+│    shell_read/write, notify,       episodes, sessions     │
+│    remember/forget/list_         Qdrant: episode vectors  │
+│    preference, search_memory     Ollama: embeddings       │
+│    🔜 MCP client + policy table  🔜 vault pipeline         │
 │                                                           │
 │  Proactive                     API layer                  │
 │    node-cron · Ntfy              WebSocket (voice)        │
@@ -180,6 +182,10 @@ Cloud APIs (Groq, Tavily, ntfy.sh)          🔜 MCP servers (HA first)
 │  Python sidecars (own venvs, spawned by npm run dev)      │
 │    STT: faster-whisper    TTS: Kokoro (sentence streaming)│
 └───────────────────────────────────────────────────────────┘
+        │ localhost only
+        ▼
+  Qdrant (Docker, 127.0.0.1:6333, storage on a host volume)
+  Ollama (systemd service, nomic-embed-text)
         │ Tailscale
         ▼
 Clients (no conversation state; wake word + VAD run locally)
@@ -215,13 +221,36 @@ LLM calls a tool
 → no:  append cancellation, ask what to do instead
 ```
 
-**Session and memory 🔜 (Phase 3 design):**
+**Session ownership ✅:**
 ```
-Long-lived session manager owns sessions independent of client connections
-→ client reconnect re-attaches to its session instead of starting fresh
-→ semantic session boundaries: topic drift detected via cosine similarity
-→ at boundary: summarize session → embed (nomic-embed-text, 768-dim) → upsert to Qdrant
-→ at session start: retrieve relevant episodes + preferences → inject into context
+SessionManager owns sessions independent of client connections
+→ every WebSocket connection, REST request and the REPL attaches to one shared
+  primary session; no session id crosses the wire
+→ a turn resolves the session through the manager EVERY time, never from a cache
+→ history is persisted to SQLite after each completed turn
+→ a session ends on idle timeout or explicit reset, firing onSessionEnd
+→ on startup the last live session is restored if it is still inside the idle
+  timeout (measured from its last turn), otherwise expired and summarized
+```
+
+**Writing an episode ✅:**
+```
+session ends (timeout | reset | expired-on-restart)
+→ fewer than IXA_EPISODE_MIN_USER_TURNS user turns? skip, and log it
+→ otherwise, detached from the session-end path:
+  summarize with the configured LLM (summary + topic tags)
+→ INSERT into SQLite            ← source of truth, happens first
+→ embed (search_document:) → upsert to Qdrant with {episodeId, timestamps, tags}
+→ mark indexed; on failure the row stays unindexed and the sweep retries it
+```
+
+**Recalling episodes ✅ (once per user turn, before the first LLM call):**
+```
+user turn arrives → embed the message (search_query:)
+→ Qdrant top-K above the score threshold
+→ resolve hits to SQLite rows (a hit with no row is dropped and its vector deleted)
+→ render a dated block, capped by characters, injected fresh into the system context
+→ the whole step runs under one timeout; over budget, the turn proceeds without it
 ```
 
 **Memory pipeline for notes 🔜:**
@@ -255,6 +284,7 @@ cron fires OR webhook received (HA / OctoPrint)
 8. **Sidecar readiness** is currently a TCP port probe (`src/core/sidecars.ts`); models load before the port opens. Measured cold-start cost is small (~0.4s), but on the first request after a restart chunk 2 can arrive ~0.17s after chunk 1 finishes playing. A warmup synthesis before reporting ready (🔜) removes that gap.
 9. **TTS throughput is CPU-bound.** Real-time factor ≈ 0.54 at 2 torch threads, 0.38 at 4 (seconds of synthesis per second of speech). Warm steady-state margin between chunks is thin (~0.16s) at 2 threads, so raising the WSL vCPU limit matters.
 10. **Push-to-talk** exists as a toggle (`:rec`) for debugging and noisy environments.
+11. **The client is an explicit four-state machine** (`clients/desktop/conversation.py`): `SLEEPING` (only the wake model sees audio, no timer), `LISTENING` (conversation open, the user's move, conversation timer runs), `WAITING` (utterance sent, reply not started, response timer runs), `SPEAKING` (reply audio playing, no timer, mic dropped). **The conversation timeout runs in LISTENING and nowhere else** — that is the point of the split: a turn that takes 30s to think and 20s to speak must not burn down the window the user has to reply. `WAITING` has its own long safety-net timer for a reply that never comes. The backend sends exactly one terminator per accepted turn (`replyEnd`, or `sessionEnd` on a dismiss) so the client always knows a turn is over, including for empty or failed replies.
 
 ### LLM abstraction and configuration
 - Application config values are read through **one config module** (`src/config.ts`). Exceptions: some files read `HOME`, and the shell tools and `src/core/sidecars.ts` pass the process environment through to child processes. Don't add new direct `process.env` reads for config.
@@ -274,9 +304,20 @@ interface Tool {
 
 Tool **descriptions** are read by the LLM when it chooses tools, so they must stay accurate. For example, `web_search` must describe Tavily, not a previous provider.
 
-### Session ownership (🔜 Phase 3 — decided direction)
-- Sessions must outlive client connections. A long-lived manager on the backend owns them, and clients re-attach on reconnect.
-- This is a prerequisite for episodic memory (session boundaries are where summaries are written) and for true multi-device use.
+### Session ownership ✅ (Phase 3a)
+- Sessions outlive client connections. `SessionManager` owns them; clients re-attach on reconnect and lose nothing.
+- **Policy is one shared primary session.** The data model is multi-session, but every connection, REST request and the REPL attaches to the same primary. No session id crosses the wire, so no client had to change. Per-device sessions remain possible later without a redesign.
+- **A transport must never cache a `Session`.** Every turn resolves it through the manager, so a connection that stayed attached across an idle timeout lands on the new session rather than writing into an ended one.
+- **Turns are serialized per session.** Each turn chains onto the previous one, because two concurrent tool loops appending to the same history would interleave and produce a sequence where a tool result no longer follows its call — which the API rejects outright.
+- **A dismiss ends the listening window, not the session.** With one shared session, a dismiss on one device would otherwise wipe context for every device.
+- **Disconnecting cancels only what belongs to that connection**: its pending confirmations resolve as cancelled and its in-flight TTS is abandoned, while a turn already in the tool loop runs to completion and records its result. The session itself survives.
+- **The idle timer is disarmed while work is outstanding**, so an in-flight or queued turn can never be timed out underneath itself.
+
+### Context windowing ✅ (Phase 3a)
+- Stored history grows without bound and is **never trimmed** — it is the record, and episodes are summarized from it. What each *request* carries is capped instead (`maxMessages` and a character budget; whichever is hit first stops the walk).
+- The budget is a **character count, not a token count**: a tokenizer would be a dependency and a per-turn cost for an approximation that is good enough to bound a request.
+- **Tool-call groups are atomic.** An assistant message carrying `tool_calls` and the tool messages answering it are taken whole or not at all.
+- Leading system messages are always kept regardless of budget.
 
 ### MCP integration layer (🔜 decided, not built)
 - **The harness is an MCP client.** Imported MCP tools are adapted into the same `Tool` shape as native tools and enter the same registry and tool loop.
@@ -294,53 +335,102 @@ Tool **descriptions** are read by the LLM when it chooses tools, so they must st
 3. **Stagehand** is the planned SDK. Routine/repeatable flows use deterministic Playwright calls; AI actions are reserved for unfamiliar or changing pages.
 4. The vision loop (Phase 8) sits on top of the same primitives: `screenshot → vision model → structured action → repeat`. No rewrite if session persistence is built correctly now.
 
-### Memory architecture (🔜 Phase 3)
+### Memory architecture
 - **Working memory:** LLM context window. ✅
-- **Episodic memory:** session summaries in Qdrant, with semantic session boundaries and topic-drift detection.
-- **Semantic memory:** Obsidian vault → chokidar → nomic-embed → Qdrant.
-- **Preference memory:** SQLite (better-sqlite3).
+- **Preference memory:** SQLite. ✅ (Phase 3b)
+- **Episodic memory:** session summaries in SQLite, embedded into Qdrant. ✅ (Phase 3c)
+- **Semantic memory:** Obsidian vault → chokidar → nomic-embed → Qdrant. 🔜 (Phase 3d)
 - Obsidian is the human write interface. The agent never writes to the vault; it queries Qdrant. The vault is Wyatt's; the vector store is Ixa's view of it.
-- **Idea noted for later:** temporal facts (Graphiti-style). Record *when* a preference became true so "drinks tea now, previously coffee" is data, not an overwrite. Not adopted now because it needs a graph database.
+
+**Preferences are append-only.** ✅ An update never overwrites: the old row is stamped superseded (with a pointer to its replacement) and a new row is inserted. Forgetting is a soft delete. Active means neither superseded nor removed, and there is at most one active row per topic, matched case-insensitively so "Coffee" updates "coffee" instead of forking a near-duplicate. This is the temporal-facts idea in its cheapest form: *when* a preference became true is data, not a lost overwrite, without needing a graph database.
+
+**Preferences are injected on EVERY LLM call** ✅, built fresh in `messagesForCall` and never written to history. Injecting once at session start would mean an update did not apply until the next session, and would let the context budget drop it. The block is capped by row count and characters, and a truncating cap logs a warning.
+
+**SQLite is the source of truth; Qdrant is a rebuildable index.** ✅ This is the central episodic-memory decision and everything else follows from it:
+- The episode row is written **before** any embedding is attempted, so an Ollama or Qdrant outage costs an index entry, never a memory. Unindexed rows are a backlog, retried at startup and on a timer.
+- Qdrant point ids **are** the SQLite episode ids, so there is no mapping to keep in sync, and payloads carry only what filtering needs. Summaries are read back from SQLite, so the two cannot disagree about text.
+- A deleted episode stays deleted: recall resolves hits to rows, drops any hit whose row is gone and deletes the stale vector, and a rebuild reads rows. Neither path can resurrect it.
+- `dev/scripts/rebuild-episode-index.ts` recreates the collection from SQLite, which is what makes changing the embedding model a one-command operation.
+
+**Recall happens once per user turn, not once per LLM call** ✅, before the first call, inside the turn chain. The question does not change inside a turn, and a tool loop can make several calls. It runs under **one hard latency budget** covering embedding and search together: over budget, the turn proceeds with no recall. Memory is never allowed to make a voice reply slow.
+
+**Degradation is silent by design.** ✅ If Qdrant or Ollama is unreachable, Ixa works normally without recall and logs **one** warning (and one line when it recovers), never one per turn. `search_memory` is the exception: asked a direct question, it says it cannot search rather than guessing.
+
+**Episode summaries are written when a session ends**, except on shutdown ✅. A summary is an LLM call taking seconds, and shutdown offers under one. A session left live in SQLite by a Ctrl-C is restored on the next startup if it is still fresh, or expired and summarized then — so nothing is lost by refusing to rush it. Sessions with fewer than a configured number of user turns are skipped.
 
 ### Client architecture
-- Clients hold no conversation state. They do own their local audio state: wake model, VAD, and frame buffer.
-- **Current limitation:** because sessions are per-connection, a reconnect starts a fresh session. Fixed by the Phase 3 session manager.
+- Clients hold no conversation state. They do own their local audio state: wake model, VAD, frame buffer, and their own conversation state machine (see Voice pipeline).
+- **Reconnects resume seamlessly** ✅: sessions live on the backend and outlive connections, so dropping and reconnecting keeps the conversation. A backend restart keeps it too, as long as the session has not passed its idle timeout.
 - The desktop client reads the backend address from the **`IXA_HOST` env var** (defaults to localhost). It must be set for remote testing, e.g. `IXA_HOST=<tailscale-ip> python client.py`.
 
 ---
 
-## Repository Layout (verify)
+## Repository Layout
 
-Known files and their roles. Reconcile against the actual tree and expand this section.
+Reconciled against the tree on 2026-10-03.
 
 ```
 ixa/
 ├── ARCHITECTURE.md
 ├── .env / .env.example          ← canonical env var list lives in .env.example
+├── data/                        ← gitignored runtime state: ixa.db (SQLite)
 ├── src/
-│   ├── config.ts                ← config values read here
+│   ├── index.ts                 ← startup: db, memory, sessions, REST, sidecars, WS
+│   ├── config.ts                ← every config value is read here
 │   ├── core/
-│   │   ├── harness.ts           ← main loop, runToolLoop (verify path)
-│   │   ├── session.ts           ← Session (per connection today) (verify path)
+│   │   ├── session.ts           ← Session, messagesForCall, runToolLoop
+│   │   ├── session-manager.ts   ← owns sessions, idle timers, restore-on-startup
+│   │   ├── session-store.ts     ← SessionStore interface + InMemorySessionStore
+│   │   ├── sqlite-session-store.ts ← durable sessions (write-through cache)
+│   │   ├── context-window.ts    ← buildWindow, atomic tool-call groups
+│   │   ├── confirmation.ts      ← Confirmer, cancel-on-disconnect
+│   │   ├── connection.ts        ← Connection interface (one attached client)
+│   │   ├── harness.ts           ← stdin REPL (text mode)
+│   │   ├── llm.ts               ← OpenAI-compatible streaming chat
 │   │   └── sidecars.ts          ← spawns STT/TTS sidecars, TCP readiness probe
-│   ├── voice/
-│   │   └── tts.ts               ← speakStreaming (streaming TTS client)
+│   ├── memory/
+│   │   ├── db.ts                ← SQLite handle + versioned migrations
+│   │   ├── preferences.ts       ← PreferenceStore (supersede / soft delete)
+│   │   ├── episodes.ts          ← EpisodeStore (source of truth for episodes)
+│   │   ├── summarizer.ts        ← session → {summary, tags}
+│   │   ├── embeddings.ts        ← Ollama embedder (nomic task prefixes)
+│   │   ├── qdrant.ts            ← Qdrant REST client (the rebuildable index)
+│   │   └── episodic-memory.ts   ← write path, recall, backlog, degradation
 │   ├── tools/
-│   │   ├── register.ts          ← registers the 7 current tools
-│   │   └── search.ts            ← Tavily web_search
-│   ├── memory/                  ← empty placeholder (.gitkeep) until Phase 3
-│   ├── proactive/               ← node-cron, Ntfy (verify)
+│   │   ├── registry.ts          ← Tool interface + registry
+│   │   ├── register.ts          ← registers all 11 tools
+│   │   ├── time.ts · date.ts · echo.ts · notify.ts
+│   │   ├── search.ts            ← Tavily web_search
+│   │   ├── shell-read.ts · shell-write.ts
+│   │   ├── preferences.ts       ← remember / forget / list_preferences
+│   │   └── search-memory.ts     ← explicit episodic recall
+│   ├── voice/
+│   │   ├── tts.ts               ← speakStreaming (streaming TTS client)
+│   │   ├── stt.ts               ← transcribe
+│   │   └── dismiss.ts           ← dismiss-phrase detection
+│   ├── proactive/
+│   │   ├── scheduler.ts         ← node-cron
+│   │   └── notifier.ts          ← Ntfy
 │   └── api/
-│       └── websocket.ts         ← WebSocket server; speak() helper → speakStreaming
+│       ├── rest.ts              ← Hono: /chat, /reset, /health, /test
+│       ├── websocket.ts         ← WS server, audio protocol, speak()
+│       ├── types.ts             ← WsMessage
+│       ├── test-client.ts       ← the /test browser page
+│       ├── static-assets.ts     ← ONNX models + onnxruntime-web for /test
+│       └── wake-check.ts        ← browser-vs-Python wake fixture comparison
+├── test/                        ← node:test suites (84 cases)
+├── dev/scripts/                 ← throwaway verification clients, not shipped
+├── tools/wakeword/              ← wake word training + fixtures
 ├── sidecars/
-│   ├── stt/                     ← faster-whisper (own venv)
-│   └── tts/main.py              ← Kokoro streaming + sentence split_pattern (own venv, Python 3.11)
+│   ├── stt/main.py              ← faster-whisper (own venv)
+│   └── tts/main.py              ← Kokoro streaming + sentence split_pattern
 └── clients/
     └── desktop/
         ├── client.py            ← reads IXA_HOST
+        ├── conversation.py      ← ConversationState machine + 2-frame wake rule
         ├── wakeword.py          ← openWakeWord wrapper, Model.reset() on sleep
-        ├── conversation.py      ← 2-consecutive-frame trigger rule
         ├── recorder.py          ← Silero VAD constants
+        ├── vad.py               ← Silero reimplementation (onnxruntime + numpy)
         └── audio_framing.py     ← FrameBuffer
 ```
 
@@ -380,17 +470,28 @@ Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/
 - **Raise the WSL vCPU limit** (`.wslconfig` `processors=`) and re-benchmark TTS.
 - **Sidecar warmup** before readiness (removes the small cold-start inter-chunk gap).
 - **SearXNG:** `SEARXNG_URL` is in `.env.example`. Determine whether `search.ts` has a SearXNG path. A self-hosted, keyless search backend fits the project better than Tavily long-term.
-- **Next phase not yet chosen** between Phase 3 and Phase 4. Phase 3 is recommended first: the session manager fixes the reconnect-loses-context gap, and MCP tools shouldn't be built on a session model that's about to change. Phase 4's voice items are independent of sessions and could go first if momentum favors them.
+- **`SYSTEM_PROMPT` hand-lists some tools** (`web_search`, `get_time`, `get_date`, `echo`, shell guidance) that the registry already describes. The registry descriptions are the contract; the duplicate list can go stale. Left alone deliberately through 3b/3c because removing it changes prompt behavior — worth doing in a phase that can re-verify replies.
+- **Recall threshold is provisional.** 0.60 was set from a small sample. Against real episodes, genuinely related questions scored 0.58–0.81 and unrelated ones 0.46–0.57, so the margin is thin and one weak-but-real match (a topic mentioned in passing in a multi-topic summary) fell just under. Revisit once there are dozens of episodes; it is a config value (`IXA_RECALL_MIN_SCORE`).
+- **Multi-topic summaries compress the similarity separation.** One summary covering three subjects matches everything weakly. This is the argument for topic segmentation in 3d, not just for a different threshold.
+- **Next phase:** Phase 3d (Obsidian) or Phase 4 (voice polish + MCP). They are independent.
 
-### Phase 3 — Memory + session ownership — 🔜 NOT STARTED
-- Long-lived session manager; clients re-attach on reconnect.
-- Qdrant (Docker) + nomic-embed-text via Ollama.
-- Episodic memory: semantic session boundaries, topic-drift detection, summarize → embed → store, retrieve at session start.
-- SQLite preference store (better-sqlite3) with injection at session start.
-- Obsidian vault pipeline (chokidar → chunk → embed → Qdrant) + Syncthing.
-- Memory query tools exposed to the LLM.
+### Phase 3a — Session ownership — ✅ DONE
+`SessionManager` owning sessions independently of connections, one shared primary session, `SessionStore` interface, `Connection` abstraction, turn serialization, cancel-on-disconnect, idle timeout with the timer disarmed while turns are outstanding, and context windowing with atomic tool-call groups.
 
-Done when: a client can drop and reconnect without losing the conversation, Ixa recalls context from a week ago without being told, and it can answer questions from your Obsidian notes.
+### Phase 3b — Preferences + session persistence — ✅ DONE
+SQLite (better-sqlite3) with versioned migrations, the append-only preference store (supersede on update, soft delete on forget), `remember_preference` / `forget_preference` / `list_preferences`, preference injection on every LLM call, and `SqliteSessionStore` — sessions survive a backend restart, restored if still inside the idle timeout and otherwise expired and ended.
+
+### Phase 3c — Episodic memory — ✅ DONE
+Episodes summarized when a session ends and written to SQLite first, embedded with nomic-embed-text via Ollama and indexed in Qdrant (localhost-only Docker, storage on a host volume), per-turn recall under a hard latency budget, `search_memory`, graceful degradation when either service is down with a retried backlog, and dev scripts to rebuild the index from SQLite or forget one episode.
+
+Measured: recall costs 41–104ms per turn (warm embed ~40ms); related questions score 0.58–0.81 against real episodes while unrelated ones top out at 0.57.
+
+### Phase 3d — Obsidian vault pipeline — 🔜
+- Obsidian + Syncthing + chokidar → chunk → nomic-embed → Qdrant (a second collection).
+- A note-query tool alongside `search_memory`.
+- Semantic session boundaries / topic-drift detection, if conversations turn out to need finer episodes than "one session, one summary".
+
+Done when: Ixa can answer questions from your Obsidian notes.
 
 ### Phase 4 — Voice polish + integration layer — 🔜
 - Smart Turn v3 on top of Silero (desktop), validated against the reference implementation.
@@ -436,7 +537,7 @@ Done when: you can watch Ixa complete a multi-step website task.
 | **Leon** (Node personal assistant) | Study only | Architecturally closest, but mid-rewrite with its 2.0 core in developer preview. Possibly useful for skill-structure ideas. |
 | **Pipecat / LiveKit Agents** (voice frameworks) | Not adopted | Would replace an already-built, tuned pipeline. Pipecat is Python-only; LiveKit's turn detector is license-bound to LiveKit. *Exception:* Pipecat's **Smart Turn** model is adopted standalone. |
 | **Speaches** (OpenAI-compatible STT/TTS server) | Not adopted now | Would replace working sidecars for modest gain. Borrow its model-preload-before-healthy pattern. Revisit when consolidating sidecars on the homelab. |
-| **Mem0 / Letta / Graphiti** (agent memory) | Not adopted | Phase 3 builds its own memory to fit the harness. Mem0 is Python and duplicates that role; Letta is a full runtime that would replace the harness; Graphiti needs a graph DB. Temporal-fact idea noted. |
+| **Mem0 / Letta / Graphiti** (agent memory) | Not adopted | Phase 3 built its own memory to fit the harness. Mem0 is Python and duplicates that role; Letta is a full runtime that would replace the harness; Graphiti needs a graph DB. Temporal-fact idea noted. |
 | **browser-use** | Not adopted | Python-only. Stagehand covers the need in TS. |
 | **WebRTC transport** | Not adopted | One-to-one client↔backend voice works over WebSocket when VAD runs client-side. WebRTC earns its complexity only for telephony, video, or multi-party. |
 | **GPU TTS on RX 6600 XT** | Not pursued | AMD card: CUDA impossible, ROCm-on-WSL unsupported for this card. GPU synthesis waits for the homelab's NVIDIA GPU. A CPU-only torch wheel would shed the unused CUDA libraries (cleanup, not urgent). |
@@ -456,4 +557,4 @@ Done when: you can watch Ixa complete a multi-step website task.
 
 ---
 
-*Last updated: 2026-10-01. Corrected Phase 3 status (not started; earlier revision wrongly marked it done), added sentence-level TTS chunking, CPU/vCPU findings, the current tool registry, and the per-connection session limitation. Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
+*Last updated: 2026-10-03. Phases 3a, 3b and 3c marked done and described (session ownership, context windowing, the preference store, session persistence, episodic memory); Phase 3d split out as the remaining 🔜 memory work. Fixed the contradictions reported during 3a/3b: preferences are injected on every LLM call rather than at session start, the tool registry now lists eleven tools, the session manager and reconnect behaviour are no longer described as planned, `src/memory/` is no longer a placeholder, and the Repository Layout was reconciled against the real tree. Added the client conversation state machine and the 3a–3c design decisions. Update this document when a decision changes, not after the fact. When code and this doc disagree on specifics, the code wins. Fix the doc.*
