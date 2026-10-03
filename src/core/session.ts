@@ -6,6 +6,7 @@ import { registry } from "../tools/registry"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
 import type { Connection } from "./connection"
+import type { PersistedSession } from "./session-store"
 
 const SYSTEM_PROMPT =
   "You are Ixa, a personal AI operating system. You are direct, concise, and capable. " +
@@ -52,12 +53,25 @@ export interface SessionOptions {
   // preference saved mid-turn applies to the very next one. Injected rather
   // than imported so Session stays unaware of SQLite and tests can stub it.
   preferenceBlock?: () => string | null
+  // Rebuilds a session persisted by a previous process. Absent for a new one.
+  restore?: PersistedSession
+}
+
+// The system prompt is code, not conversation. A session restored after the
+// prompt was edited takes the CURRENT one; everything after it is the actual
+// history and is restored verbatim.
+function restoredMessages(messages: Message[]): Message[] {
+  const system: Message = { role: "system", content: SYSTEM_PROMPT }
+  if (messages.length === 0) return [system]
+  return messages[0]!.role === "system"
+    ? [system, ...messages.slice(1)]
+    : [system, ...messages]
 }
 
 export class Session {
-  readonly id: string = randomUUID()
-  readonly createdAt: number = Date.now()
-  lastTurnAt: number = Date.now()
+  readonly id: string
+  readonly createdAt: number
+  lastTurnAt: number
   endedAt: number | null = null
 
   // Clients currently attached. A session is perfectly valid with none — that
@@ -68,8 +82,8 @@ export class Session {
   // reads this to keep the idle timer disarmed while work is outstanding.
   pendingTurns = 0
 
-  private readonly messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }]
-  private workingDirectory: string = process.env.HOME ?? os.homedir()
+  private readonly messages: Message[]
+  private cwd: string
   private readonly limits: ContextWindowLimits
   private readonly chat: ChatFn
   private readonly preferenceBlock?: () => string | null
@@ -81,6 +95,15 @@ export class Session {
   private turnChain: Promise<unknown> = Promise.resolve()
 
   constructor(options: SessionOptions) {
+    const restored = options.restore
+    this.id = restored?.id ?? randomUUID()
+    this.createdAt = restored?.createdAt ?? Date.now()
+    this.lastTurnAt = restored?.lastTurnAt ?? Date.now()
+    this.cwd = restored?.workingDirectory || process.env.HOME || os.homedir()
+    this.messages = restored
+      ? restoredMessages(restored.messages)
+      : [{ role: "system", content: SYSTEM_PROMPT }]
+
     this.limits = options.limits
     this.chat = options.chat ?? defaultChat
     this.preferenceBlock = options.preferenceBlock
@@ -109,6 +132,12 @@ export class Session {
   // Phase 3c summarizer. Stored history itself is never handed out.
   history(): readonly Message[] {
     return [...this.messages]
+  }
+
+  // Part of the persisted state: a restored session resumes in the directory
+  // its history talks about, instead of silently snapping back to $HOME.
+  get workingDirectory(): string {
+    return this.cwd
   }
 
   private async generateDescription(toolName: string, args: string): Promise<string> {
@@ -233,7 +262,7 @@ export class Session {
         if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
           try {
             const parsed = JSON.parse(tc.arguments || "{}") as Record<string, unknown>
-            tc.arguments = JSON.stringify({ ...parsed, cwd: this.workingDirectory })
+            tc.arguments = JSON.stringify({ ...parsed, cwd: this.cwd })
           } catch {
             // leave arguments unchanged if they're unparseable
           }
@@ -276,7 +305,7 @@ export class Session {
           try {
             const parsed = JSON.parse(result) as { newCwd?: string; display?: string }
             if (parsed.newCwd) {
-              this.workingDirectory = path.resolve(parsed.newCwd)
+              this.cwd = path.resolve(parsed.newCwd)
               result = parsed.display ?? result
             }
           } catch {

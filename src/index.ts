@@ -7,12 +7,15 @@ import { startSidecars } from "./core/sidecars"
 import { startScheduler } from "./proactive/scheduler"
 import { SessionManager } from "./core/session-manager"
 import { getPreferenceStore } from "./memory/preferences"
+import { getDatabase } from "./memory/db"
+import { SqliteSessionStore } from "./core/sqlite-session-store"
 
 async function main() {
   console.log(`Ixa — ${config.llm.model} @ ${config.llm.baseURL}`)
 
   // Opens (and migrates) the database before anything serves traffic, so a
   // schema problem is a startup failure rather than a failed turn later.
+  const db = getDatabase()
   const preferences = getPreferenceStore()
   console.log(`Preferences: ${preferences.listActive().length} active`)
 
@@ -25,12 +28,21 @@ async function main() {
       budgetChars: config.session.contextBudgetChars,
     },
     preferenceBlock: () => preferences.injectionBlock(),
+    // Sessions now survive a backend restart. InMemorySessionStore stays the
+    // default inside the manager, which is what the tests use.
+    store: new SqliteSessionStore(db),
   })
 
   sessions.onSessionEnd((session, reason) => {
     // Phase 3c writes episodic summaries here: summarize session.history(),
     // embed it with nomic-embed-text, and upsert it to Qdrant.
   })
+
+  // After the handlers are registered, so a session that expired while the
+  // backend was down still fires onSessionEnd.
+  if (!sessions.restorePrimary()) {
+    console.log("No live session to restore; starting fresh.")
+  }
 
   if (!config.llm.apiKey) {
     console.error("ERROR: LLM_API_KEY is not set. Copy .env.example to .env and fill in your key.")

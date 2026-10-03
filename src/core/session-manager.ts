@@ -1,5 +1,5 @@
 import { Session, type ChatFn, type MessageOrigin } from "./session"
-import { InMemorySessionStore, type SessionStore } from "./session-store"
+import { InMemorySessionStore, type PersistedSession, type SessionStore } from "./session-store"
 import { cancelConfirmationsFor } from "./confirmation"
 import type { ContextWindowLimits } from "./context-window"
 import type { Connection } from "./connection"
@@ -61,6 +61,65 @@ export class SessionManager {
     return session
   }
 
+  // Startup restore. Adopts the most recent session a previous process left
+  // live, unless it has been idle past the timeout — the clock runs from its
+  // last completed turn, so a backend that was down for an hour does not hand
+  // back an hour-stale conversation. Returns the restored session, or null if
+  // there was nothing to restore.
+  //
+  // Call this AFTER registering onSessionEnd handlers: an expired session
+  // fires one, and Phase 3c's summarizer will want it.
+  restorePrimary(): Session | null {
+    const records = this.store.loadPersisted?.() ?? []
+    if (records.length === 0) return null
+
+    // loadPersisted returns newest first. Only the newest can be resumed; any
+    // others are leftovers from a crash and are closed out.
+    const [newest, ...stale] = records as [PersistedSession, ...PersistedSession[]]
+    const idleFor = Date.now() - newest.lastTurnAt
+    let restored: Session | null = null
+
+    if (idleFor < this.idleTimeoutMs) {
+      const session = this.sessionFrom(newest)
+      this.store.save(session)
+      this.primaryId = session.id
+      // Resume the existing clock rather than restarting it: time spent with
+      // the backend down still counts as idle.
+      this.armIdleTimer(session, this.idleTimeoutMs - idleFor)
+      console.log(
+        `Session ${session.id} restored: ${newest.messages.length} messages, ` +
+          `idle ${Math.round(idleFor / 1000)}s`
+      )
+      restored = session
+    } else {
+      this.expire(newest, idleFor)
+    }
+
+    for (const record of stale) {
+      this.expire(record, Date.now() - record.lastTurnAt)
+    }
+
+    return restored
+  }
+
+  private expire(record: PersistedSession, idleFor: number): void {
+    const session = this.sessionFrom(record)
+    this.store.save(session)
+    console.log(
+      `Session ${session.id} ended: idle ${Math.round(idleFor / 1000)}s across a restart`
+    )
+    this.endSession(session.id, "timeout")
+  }
+
+  private sessionFrom(record: PersistedSession): Session {
+    return new Session({
+      limits: this.limits,
+      chat: this.chat,
+      preferenceBlock: this.preferenceBlock,
+      restore: record,
+    })
+  }
+
   // Attaches a connection to the primary session and returns it. Transports
   // call this on connect for the side effect; they must NOT cache the result
   // (see submitTurn).
@@ -105,6 +164,10 @@ export class SessionManager {
         session.lastTurnAt = Date.now()
         this.armIdleTimer(session)
       }
+      // Written at the turn boundary, never mid-turn: history is only
+      // guaranteed consistent (every tool call followed by its result) once
+      // the tool loop has returned.
+      if (session.endedAt === null) this.store.save(session)
     }
   }
 
@@ -121,6 +184,7 @@ export class SessionManager {
     if (!session || session.endedAt !== null) return
 
     session.endedAt = Date.now()
+    this.store.save(session)
     this.clearIdleTimer(id)
     if (this.primaryId === id) this.primaryId = null
 
@@ -151,7 +215,7 @@ export class SessionManager {
     this.idleTimers.clear()
   }
 
-  private armIdleTimer(session: Session): void {
+  private armIdleTimer(session: Session, delayMs: number = this.idleTimeoutMs): void {
     this.clearIdleTimer(session.id)
     const timer = setTimeout(() => {
       // Guard: a turn may have started between the timer firing and this
@@ -162,7 +226,7 @@ export class SessionManager {
       }
       console.log(`Session ${session.id} ended: idle for ${this.idleTimeoutMs}ms`)
       this.endSession(session.id, "timeout")
-    }, this.idleTimeoutMs)
+    }, Math.max(0, delayMs))
 
     // An idle session must not be the reason the process stays alive.
     timer.unref?.()
