@@ -21,10 +21,16 @@
 // Tool calls are verified from the PERSISTED SESSION HISTORY in SQLite, not
 // from the reply text: a model saying "I searched my memory" is exactly the
 // claim under test, so the evidence has to be the recorded tool_calls.
-import { spawn } from "child_process"
+import { execFileSync, spawn } from "child_process"
 import Database from "better-sqlite3"
+import OpenAI from "openai"
 import { WebSocket } from "ws"
 import { config } from "../../src/config"
+import "../../src/tools/register"
+import { registry } from "../../src/tools/registry"
+import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
+import { buildWindow } from "../../src/core/context-window"
+import type { Message } from "../../src/core/llm"
 
 const WS_URL = process.env.IXA_WS_URL ?? "ws://localhost:3001"
 
@@ -135,24 +141,28 @@ async function connect(): Promise<Client> {
   } | null = null
 
   ws.on("message", (data, isBinary) => {
-    if (!pending) return
+    // Captured once: `pending` is cleared below, and narrowing a mutable
+    // closure variable does not survive that.
+    const turn = pending
+    if (!turn) return
+
     if (isBinary) {
-      pending.chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer))
+      turn.chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer))
       return
     }
+
     const msg = JSON.parse(data.toString()) as { type: string; content?: string }
-    if (msg.type === "assistant") pending.text = msg.content ?? ""
+    if (msg.type === "assistant") turn.text = msg.content ?? ""
     if (msg.type === "error") {
-      const p = pending
       pending = null
-      p.reject(new Error(msg.content ?? "ws error"))
+      turn.reject(new Error(msg.content ?? "ws error"))
+      return
     }
     // replyEnd is the one terminator per accepted turn: it arrives after the
     // last audio chunk, so waiting on it means no chunk is missed.
     if (msg.type === "replyEnd" || msg.type === "sessionEnd") {
-      const p = pending
       pending = null
-      p.resolve({ text: p.text, audioChunks: p.chunks, elapsedMs: Date.now() - p.startedAt })
+      turn.resolve({ text: turn.text, audioChunks: turn.chunks, elapsedMs: Date.now() - turn.startedAt })
     }
   })
 
@@ -580,7 +590,6 @@ async function verifyFreshness(): Promise<void> {
 // Pulls a string literal constant out of a revision of session.ts, so the
 // "before" prompts can be measured without checking the branch out.
 function promptFromRevision(revision: string, name: string): string {
-  const { execFileSync } = require("child_process") as typeof import("child_process")
   const source = execFileSync("git", ["show", `${revision}:src/core/session.ts`], { encoding: "utf8" })
   const match = new RegExp(`(?:export )?const ${name} =\\n?([\\s\\S]*?)\\n\\n`).exec(source)
   if (!match) throw new Error(`${name} not found in ${revision}`)
@@ -591,12 +600,6 @@ function promptFromRevision(revision: string, name: string): string {
 
 async function verifyTokens(): Promise<void> {
   section("g. request token sizes, before and after")
-
-  const { registry } = await import("../../src/tools/registry")
-  await import("../../src/tools/register")
-  const { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } = await import("../../src/core/session")
-  const { buildWindow } = await import("../../src/core/context-window")
-  const OpenAI = (await import("openai")).default
 
   const client = new OpenAI({ baseURL: config.llm.baseURL, apiKey: config.llm.apiKey })
 
@@ -655,7 +658,9 @@ async function verifyTokens(): Promise<void> {
 
   // Tool schemas: sent on every call, and the largest fixed cost in a request.
   const toolsAfter = registry.toOpenAI()
-  const toolsBefore = toolsAfter.filter((tool) => tool.function.name !== "start_new_conversation")
+  const toolsBefore = toolsAfter.filter(
+    (tool: (typeof toolsAfter)[number]) => tool.function.name !== "start_new_conversation"
+  )
   console.log("\n  Tool schemas (every request carries these):")
   for (const [label, tools] of [["before", toolsBefore], ["after", toolsAfter]] as const) {
     const tokens = await promptTokens([{ role: "user", content: "hi" }], tools as unknown[])
@@ -685,7 +690,7 @@ async function verifyTokens(): Promise<void> {
         content: `${filler}For turn ${i}, start with the sentence split pattern and re-measure.`,
       })
     }
-    return buildWindow([{ role: "system", content: "" }, ...history] as never, {
+    return buildWindow([{ role: "system", content: "" }, ...history] as Message[], {
       maxMessages: 40,
       budgetChars,
     }).slice(1) as Array<{ role: string; content: string }>
