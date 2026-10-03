@@ -53,6 +53,35 @@ const MIGRATIONS: Migration[] = [
       `)
     },
   },
+  {
+    version: 2,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE episodes (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id      TEXT    NOT NULL,
+          started_at      INTEGER NOT NULL,
+          ended_at        INTEGER NOT NULL,
+          summary         TEXT    NOT NULL,
+          tags            TEXT    NOT NULL DEFAULT '[]',
+          embedding_model TEXT,
+          indexed_at      INTEGER,
+          created_at      INTEGER NOT NULL
+        );
+
+        -- The backlog sweep runs on a timer and is almost always empty, so the
+        -- index that serves it is partial.
+        CREATE INDEX idx_episodes_backlog ON episodes(created_at)
+          WHERE indexed_at IS NULL;
+
+        CREATE INDEX idx_episodes_ended ON episodes(ended_at);
+
+        -- One episode per session. Makes the writer idempotent: a retry after a
+        -- crash mid-write replaces the row instead of adding a second one.
+        CREATE UNIQUE INDEX idx_episodes_session ON episodes(session_id);
+      `)
+    },
+  },
 ]
 
 function migrate(db: Db): void {

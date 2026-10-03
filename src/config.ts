@@ -21,9 +21,37 @@ export const config = {
   },
   qdrant: {
     url: process.env.QDRANT_URL ?? "http://localhost:6333",
+    // Separate collection names let a verification run index throwaway
+    // episodes without touching the real one.
+    collection: process.env.QDRANT_COLLECTION || "ixa_episodes",
   },
   ollama: {
     url: process.env.OLLAMA_URL ?? "http://localhost:11434",
+    embedModel: process.env.IXA_EMBED_MODEL || "nomic-embed-text",
+    // Ollama unloads a model after 5 minutes by default, and reloading
+    // nomic-embed-text costs ~0.5s — enough to blow the recall budget on the
+    // first turn after a quiet spell. Keeping it resident costs ~274MB.
+    embedKeepAlive: process.env.IXA_EMBED_KEEP_ALIVE || "1h",
+  },
+  memory: {
+    // Episodic memory. SQLite is the source of truth; Qdrant is a rebuildable
+    // index over it, so every one of these can change without data loss.
+    recallTopK: parseInt(process.env.IXA_RECALL_TOP_K ?? "3"),
+    // Cosine similarity floor. Measured with nomic-embed-text and its
+    // search_query/search_document prefixes: genuinely related questions score
+    // 0.65-0.74, unrelated ones top out at 0.54.
+    recallMinScore: parseFloat(process.env.IXA_RECALL_MIN_SCORE ?? "0.60"),
+    // Whole-budget cap on embed + search for one turn. Warm embedding measures
+    // ~40ms, so this is ~7x headroom; past it, the turn proceeds without
+    // recall rather than making the user wait.
+    recallTimeoutMs: parseInt(process.env.IXA_RECALL_TIMEOUT_MS ?? "300"),
+    recallMaxChars: parseInt(process.env.IXA_RECALL_MAX_CHARS ?? "1500"),
+    // A session with fewer than this many user turns is not worth a summary.
+    minUserTurns: parseInt(process.env.IXA_EPISODE_MIN_USER_TURNS ?? "2"),
+    summaryInputChars: parseInt(process.env.IXA_EPISODE_SUMMARY_INPUT_CHARS ?? "12000"),
+    // How often to retry episodes that are saved but not yet indexed.
+    indexRetryMs: parseInt(process.env.IXA_EPISODE_INDEX_RETRY_MS ?? "300000"),
+    searchLimit: parseInt(process.env.IXA_MEMORY_SEARCH_LIMIT ?? "5"),
   },
   obsidian: {
     vaultPath: process.env.OBSIDIAN_VAULT_PATH ?? "",
