@@ -82,6 +82,11 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
         }
       }
 
+      // Exactly one terminator per accepted turn: "replyEnd" normally, or
+      // "sessionEnd" on a dismiss. A voice client stops its own conversation
+      // timeout for the duration of a turn, so without a terminator it has no
+      // way to know a text-only, empty or failed reply is over and would sit
+      // waiting until its own safety-net timeout.
       const handleUserMessage = async (text: string, origin: MessageOrigin) => {
         try {
           // Resolved through the manager every turn — never a cached Session.
@@ -92,6 +97,7 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
           if (result.trim() && connection.isOpen) {
             await speak(result)
           }
+          send({ type: "replyEnd" })
         } catch (err) {
           const content = err instanceof Error ? err.message : String(err)
           send({ type: "error", content })
@@ -120,7 +126,10 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
               try {
                 const { text } = await transcribe(pcmToWav(pcm))
                 if (!text.trim()) {
+                  // Usually a false VAD trigger on noise. The client is
+                  // waiting on this turn, so it still needs its terminator.
                   console.log("STT: empty transcript, discarding")
+                  send({ type: "replyEnd" })
                 } else if (isDismissPhrase(text)) {
                   // A dismiss closes the CLIENT's listening window, like the
                   // client-side conversation timeout. It does not end the
@@ -135,6 +144,7 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
               } catch (err) {
                 console.error("STT error:", err instanceof Error ? err.message : String(err))
                 send({ type: "error", content: "Transcription failed" })
+                send({ type: "replyEnd" })
               }
             }
           } else if (msg.type === "confirmReply") {
