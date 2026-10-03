@@ -11,6 +11,7 @@ import {
   forgetPreferenceTool,
   listPreferencesTool,
 } from "./preferences"
+import { searchMemoryTool } from "./search-memory"
 
 registry.register(timeTool)
 registry.register(dateTool)
@@ -22,3 +23,4 @@ registry.register(notifyTool)
 registry.register(rememberPreferenceTool)
 registry.register(forgetPreferenceTool)
 registry.register(listPreferencesTool)
+registry.register(searchMemoryTool)
