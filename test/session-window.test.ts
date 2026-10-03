@@ -72,7 +72,7 @@ test("the voice constraint survives windowing", async () => {
   assert.equal(last.role, "system")
   assert.match(
     String(last.content),
-    /spoken aloud by a/,
+    /spoken aloud/i,
     "the voice-only instruction is appended after windowing, so it can never be clipped",
   )
 

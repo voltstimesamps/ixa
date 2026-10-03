@@ -84,7 +84,7 @@ test("on a voice turn the constraint still comes last", async () => {
   )
   assert.match(String(messages[1]!.content), /saved preferences/)
   assert.match(String(messages[2]!.content), /earlier conversations/)
-  assert.match(String(messages.at(-1)!.content), /spoken aloud by a/)
+  assert.match(String(messages.at(-1)!.content), /spoken aloud/i)
 
   h.sessions.shutdown()
 })

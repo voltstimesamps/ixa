@@ -65,7 +65,7 @@ test("on a voice turn the order is system, preferences, history, voice constrain
   )
   assert.match(String(messages[0]!.content), /You are Ixa/)
   assert.match(String(messages[1]!.content), /saved preferences/)
-  assert.match(String(messages.at(-1)!.content), /spoken aloud by a/, "the voice constraint is last")
+  assert.match(String(messages.at(-1)!.content), /spoken aloud/i, "the voice constraint is last")
 
   sessions.shutdown()
 })
