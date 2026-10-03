@@ -34,6 +34,9 @@ async function main() {
   })
 
   sessions.onSessionEnd((session, reason) => {
+    console.log(
+      `Session ${session.id} ended (${reason}): ${session.history().length} messages`
+    )
     // Phase 3c writes episodic summaries here: summarize session.history(),
     // embed it with nomic-embed-text, and upsert it to Qdrant.
   })
