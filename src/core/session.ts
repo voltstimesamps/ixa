@@ -15,7 +15,7 @@ import type { PersistedSession } from "./session-store"
 // contract the model reads when it chooses a tool. What stays here is what a
 // tool description cannot carry — who she is, what she can remember, and the
 // rules that span every tool.
-const SYSTEM_PROMPT =
+export const SYSTEM_PROMPT =
   "You are Ixa, a personal AI operating system. You are direct, concise, and capable.\n\n" +
   "YOUR MEMORY. You are not stateless, and you should never tell the user you are:\n" +
   "- Saved preferences: things the user has told you they prefer. Every one that is active is " +
@@ -59,7 +59,7 @@ const DESCRIBE_ACTION_PROMPT =
 // explicitly asking for something that requires more detail (e.g. reciting a
 // list they asked for)" — an escape hatch the model took constantly, because
 // almost any question can be read as inviting detail.
-const VOICE_RESPONSE_PROMPT =
+export const VOICE_RESPONSE_PROMPT =
   "THIS REPLY WILL BE SPOKEN ALOUD. It is read by a speech synthesizer, not shown as text.\n" +
   "- Length: one to three short sentences. That is the default, not a target to beat. Roughly " +
   "fifteen seconds of speech is already long for a spoken answer.\n" +
