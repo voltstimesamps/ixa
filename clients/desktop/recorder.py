@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import Enum, auto
 from typing import Awaitable, Callable
 
@@ -7,7 +8,16 @@ logger = logging.getLogger("ixa.client.vad")
 # Tunable against the actual mic/room — run with logging at DEBUG to watch scores
 # at each transition while tuning.
 SPEECH_PROB_THRESHOLD = 0.5
-TRAILING_SILENCE_MS = 600.0
+
+# How long the speaker may pause before the utterance is treated as finished.
+# 600ms was validated as a VAD cutoff but cut people off mid-thought in live
+# use: a natural pause while deciding what to ask next reads as end-of-turn to
+# a fixed silence timer. 1500ms is the trade — a slower turnaround in exchange
+# for not being interrupted. Env var because this is the one constant worth
+# retuning per room and per microphone. (Smart Turn v3 is the real fix: it
+# decides from intonation whether the speaker is done, and when it lands this
+# timer becomes a backstop rather than the decision.)
+TRAILING_SILENCE_MS = float(os.environ.get("IXA_TRAILING_SILENCE_MS", "1500"))
 FRAME_MS = 32.0  # SileroVAD.CHUNK_SAMPLES (512) at 16kHz
 
 
