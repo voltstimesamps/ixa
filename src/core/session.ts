@@ -47,6 +47,11 @@ export type ChatFn = typeof defaultChat
 export interface SessionOptions {
   limits: ContextWindowLimits
   chat?: ChatFn
+  // Returns the active-preference block to inject, or null when there is
+  // nothing to say. A function, not a string: it is called per LLM call so a
+  // preference saved mid-turn applies to the very next one. Injected rather
+  // than imported so Session stays unaware of SQLite and tests can stub it.
+  preferenceBlock?: () => string | null
 }
 
 export class Session {
@@ -67,6 +72,7 @@ export class Session {
   private workingDirectory: string = process.env.HOME ?? os.homedir()
   private readonly limits: ContextWindowLimits
   private readonly chat: ChatFn
+  private readonly preferenceBlock?: () => string | null
 
   // Turn serialization. Every turn chains onto the previous one, so only one
   // tool loop at a time ever appends to `messages`. Two concurrent loops would
@@ -77,6 +83,7 @@ export class Session {
   constructor(options: SessionOptions) {
     this.limits = options.limits
     this.chat = options.chat ?? defaultChat
+    this.preferenceBlock = options.preferenceBlock
   }
 
   // Queues a turn behind any turn already running on this session, whichever
@@ -133,13 +140,31 @@ export class Session {
   // Builds the message array for one LLM call. Always a new array: stored
   // history is the record and is never trimmed or mutated here.
   //
-  // The voice constraint is appended AFTER windowing on purpose — it is an
-  // instruction about this reply, not history, so the budget must never be
-  // able to drop it.
+  // Order: system prompt, preferences, windowed history, voice constraint.
+  //
+  // Neither the preference block nor the voice constraint is ever written to
+  // history. Both are statements about THIS call, not things that were said:
+  // building them fresh here means a preference saved a moment ago applies
+  // immediately, a forgotten one stops applying immediately, and no context
+  // budget can ever clip either one away.
   private messagesForCall(origin: MessageOrigin): Message[] {
     const windowed = buildWindow(this.messages, this.limits)
-    if (origin !== "voice") return windowed
-    return [...windowed, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+
+    const preferences = this.preferenceBlock?.()
+    let messages = windowed
+    if (preferences) {
+      // After the leading system prompt(s), before any history.
+      let lead = 0
+      while (lead < messages.length && messages[lead]!.role === "system") lead++
+      messages = [
+        ...messages.slice(0, lead),
+        { role: "system", content: preferences },
+        ...messages.slice(lead),
+      ]
+    }
+
+    if (origin !== "voice") return messages
+    return [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
   }
 
   private async runToolLoop(origin: MessageOrigin, connection: Connection): Promise<string> {

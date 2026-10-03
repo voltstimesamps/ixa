@@ -6,9 +6,15 @@ import { createWsServer } from "./api/websocket"
 import { startSidecars } from "./core/sidecars"
 import { startScheduler } from "./proactive/scheduler"
 import { SessionManager } from "./core/session-manager"
+import { getPreferenceStore } from "./memory/preferences"
 
 async function main() {
   console.log(`Ixa — ${config.llm.model} @ ${config.llm.baseURL}`)
+
+  // Opens (and migrates) the database before anything serves traffic, so a
+  // schema problem is a startup failure rather than a failed turn later.
+  const preferences = getPreferenceStore()
+  console.log(`Preferences: ${preferences.listActive().length} active`)
 
   // One manager owns every session. Sessions outlive the connections attached
   // to them, so a client can drop and reconnect without losing context.
@@ -18,6 +24,7 @@ async function main() {
       maxMessages: config.session.contextMaxMessages,
       budgetChars: config.session.contextBudgetChars,
     },
+    preferenceBlock: () => preferences.injectionBlock(),
   })
 
   sessions.onSessionEnd((session, reason) => {

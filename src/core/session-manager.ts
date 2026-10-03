@@ -13,6 +13,9 @@ export interface SessionManagerOptions {
   store?: SessionStore
   // Injectable LLM call, for tests. Production uses the real one.
   chat?: ChatFn
+  // Passed to every session it creates: the active-preference block, rebuilt
+  // per LLM call. See Session.messagesForCall.
+  preferenceBlock?: () => string | null
 }
 
 // Owns sessions independently of client connections.
@@ -25,6 +28,7 @@ export class SessionManager {
   private readonly idleTimeoutMs: number
   private readonly limits: ContextWindowLimits
   private readonly chat?: ChatFn
+  private readonly preferenceBlock?: () => string | null
   private readonly endHandlers: SessionEndHandler[] = []
   private readonly idleTimers = new Map<string, NodeJS.Timeout>()
   private primaryId: string | null = null
@@ -34,6 +38,7 @@ export class SessionManager {
     this.idleTimeoutMs = options.idleTimeoutMs
     this.limits = options.limits
     this.chat = options.chat
+    this.preferenceBlock = options.preferenceBlock
   }
 
   // The current primary session, created on demand. A session that has ended
@@ -45,7 +50,11 @@ export class SessionManager {
   }
 
   private startPrimarySession(): Session {
-    const session = new Session({ limits: this.limits, chat: this.chat })
+    const session = new Session({
+      limits: this.limits,
+      chat: this.chat,
+      preferenceBlock: this.preferenceBlock,
+    })
     this.store.save(session)
     this.primaryId = session.id
     this.armIdleTimer(session)
