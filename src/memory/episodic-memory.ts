@@ -359,6 +359,19 @@ export class EpisodicMemory {
     return [RECALL_HEADER, ...lines].join("\n")
   }
 
+  // The no-query half of search_memory: the N most recent episodes, newest
+  // first, within an optional date range.
+  //
+  // Always `available: true`. It reads SQLite, the source of truth, so a
+  // question about recent conversations is answerable with Qdrant and Ollama
+  // both down — the one memory question that never needs an embedding.
+  recent(range: SearchRange = {}): SearchResult {
+    return {
+      available: true,
+      episodes: this.store.recent(this.limits.searchLimit, range),
+    }
+  }
+
   // The search_memory tool. Unlike recall, this one reports its own failure:
   // the user asked a direct question and deserves a straight answer.
   async search(query: string, range: SearchRange = {}): Promise<SearchResult> {

@@ -148,6 +148,36 @@ export class EpisodeStore {
     return rows.map(toEpisode)
   }
 
+  // The most recently ENDED episodes, newest first. Backs search_memory when
+  // it is called with no query ("what did we talk about last time?").
+  //
+  // Deliberately SQLite-only: recency is an ordering this table already has,
+  // and routing it through the vector index would make a time-based question
+  // depend on Ollama and Qdrant being up — and fail anyway, because "last
+  // time" embeds to a vector near nothing and falls under the score
+  // threshold. Ordered by ended_at rather than id so an episode written late
+  // (a backlog retry, or a rebuild) still sorts by when it actually happened.
+  //
+  // `from`/`to` are inclusive epoch-ms bounds, matching VectorIndex.search.
+  recent(limit: number, range: { from?: number; to?: number } = {}): Episode[] {
+    const clauses: string[] = []
+    const params: number[] = []
+    if (range.from !== undefined) {
+      clauses.push("ended_at >= ?")
+      params.push(range.from)
+    }
+    if (range.to !== undefined) {
+      clauses.push("ended_at <= ?")
+      params.push(range.to)
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""
+
+    const rows = this.db
+      .prepare(`SELECT * FROM episodes ${where} ORDER BY ended_at DESC, id DESC LIMIT ?`)
+      .all(...params, limit) as EpisodeRow[]
+    return rows.map(toEpisode)
+  }
+
   all(): Episode[] {
     const rows = this.db
       .prepare("SELECT * FROM episodes ORDER BY id ASC")

@@ -12,18 +12,31 @@ const UNAVAILABLE =
   "at what was discussed."
 
 interface SearchInput {
-  query: string
+  // Optional: with no query this returns the most recent conversations
+  // instead of searching by meaning. See the tool description.
+  query?: string
   from?: string
   to?: string
 }
 
 function isSearchInput(value: unknown): value is SearchInput {
-  if (typeof value !== "object" || value === null) return false
-  return typeof (value as Record<string, unknown>).query === "string"
+  return typeof value === "object" && value !== null
 }
 
-// "YYYY-MM-DD" → epoch ms. `endOfDay` makes a `to` bound inclusive of the
-// whole day, which is what a person means by "up to the 5th".
+// "YYYY-MM-DD" → epoch ms, in the BACKEND'S LOCAL TIMEZONE.
+//
+// `new Date(y, m, d)` is the local-time constructor, deliberately: the user
+// means their own Tuesday, not UTC's. Episodes are stored as epoch ms, so the
+// bound only has to be built in the same zone the dates are rendered back in
+// (formatEpisode below, also local) for the two to agree. A UTC parse would
+// put the boundary up to a day off for anyone west of Greenwich.
+//
+// Note the model has no clock of its own: it learns today's date from get_date
+// (also local), which is why the description tells it to call that first
+// before building a relative range like "yesterday".
+//
+// `endOfDay` makes a `to` bound cover the whole day, which is what a person
+// means by "up to the 5th".
 function parseDate(value: string | undefined, endOfDay: boolean): number | undefined {
   if (!value) return undefined
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim())
@@ -35,32 +48,48 @@ function parseDate(value: string | undefined, endOfDay: boolean): number | undef
   return date.getTime()
 }
 
+// Local time, matching parseDate. The time of day is included, not just the
+// date: with no query the results are a recency list, and two conversations on
+// the same day would otherwise render identically and leave the model unable
+// to say which was the last one.
 function formatEpisode(episode: Episode): string {
-  const date = new Date(episode.endedAt).toLocaleDateString("en-GB", {
+  const when = new Date(episode.endedAt).toLocaleString("en-GB", {
     weekday: "short",
     day: "numeric",
     month: "short",
     year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
   })
   const tags = episode.tags.length > 0 ? ` [${episode.tags.join(", ")}]` : ""
-  return `- ${date}: ${episode.summary}${tags}`
+  return `- ${when}: ${episode.summary}${tags}`
 }
 
 export const searchMemoryTool: Tool = {
   name: "search_memory",
   description:
-    "Search your memory of past conversations with the user. Use this when the user asks what " +
-    "you talked about or decided before, or when you clearly need context from an earlier " +
-    "conversation that is not already in the notes provided to you. Optionally restrict the " +
-    "search to a date range with 'from' and 'to' (YYYY-MM-DD). Returns the date and summary of " +
-    "each matching past conversation. If memory search is unavailable, say so plainly rather " +
-    "than guessing at what was discussed.",
+    "Look up your memory of past conversations with the user. Two ways to call it:\n" +
+    "- WITH 'query': finds past conversations by meaning. Use this when the user asks whether " +
+    "you discussed a particular subject, or when you need context from an earlier conversation " +
+    "that is not already in the notes provided to you.\n" +
+    "- WITHOUT 'query': returns your most recent conversations, newest first. Use this for any " +
+    "question about recency rather than subject — \"what did we talk about last time?\", " +
+    "\"what have we been working on?\", \"what did I say yesterday?\". A search by meaning " +
+    "cannot answer those, because there is no subject in the question to match on.\n" +
+    "Either way you can narrow to a date range with 'from' and 'to' (YYYY-MM-DD, inclusive, in " +
+    "the user's local timezone). You do not know today's date — call get_date first if you need " +
+    "to work out a relative range such as yesterday or last week. Returns the date, time and " +
+    "summary of each conversation. If memory is unavailable, say so plainly rather than guessing " +
+    "at what was discussed.",
   inputSchema: {
     type: "object",
     properties: {
       query: {
         type: "string",
-        description: "What to look for, in natural language — a topic, decision, or question.",
+        description:
+          "Optional. What to look for, in natural language — a topic, decision, or question. " +
+          "OMIT IT ENTIRELY to get the most recent conversations instead, which is what a " +
+          "question about recency needs.",
       },
       from: {
         type: "string",
@@ -71,32 +100,42 @@ export const searchMemoryTool: Tool = {
         description: "Optional latest date to search, as YYYY-MM-DD.",
       },
     },
-    required: ["query"],
+    // Nothing is required: no argument at all is the valid "what did we talk
+    // about last time?" call.
+    required: [],
   },
   requiresConfirmation: false,
   execute: async (input: unknown): Promise<string> => {
     if (!isSearchInput(input)) {
-      return "Could not search memory: 'query' is required."
+      return "Could not search memory: the arguments were not understood."
     }
 
     const memory = getEpisodicMemory()
     if (!memory) return UNAVAILABLE
 
-    const result = await memory.search(input.query, {
+    const range = {
       from: parseDate(input.from, false),
       to: parseDate(input.to, true),
-    })
+    }
+    // A blank or whitespace query is treated as no query. The model sometimes
+    // sends `query: ""` rather than omitting the field, and embedding an empty
+    // string would return nothing at all — the opposite of what it meant.
+    const query = input.query?.trim()
 
+    const result = query ? await memory.search(query, range) : memory.recent(range)
     if (!result.available) return UNAVAILABLE
 
+    const dated = input.from || input.to ? " in that date range" : ""
     if (result.episodes.length === 0) {
-      const range = input.from || input.to ? " in that date range" : ""
-      return `No past conversations match that${range}.`
+      return query
+        ? `No past conversations match that${dated}.`
+        : `There are no saved conversations${dated} yet.`
     }
 
-    return (
-      `${result.episodes.length} past conversation${result.episodes.length === 1 ? "" : "s"}:\n` +
-      result.episodes.map(formatEpisode).join("\n")
-    )
+    const count = result.episodes.length
+    const header = query
+      ? `${count} past conversation${count === 1 ? "" : "s"} matching that:`
+      : `Your ${count} most recent conversation${count === 1 ? "" : "s"}, newest first:`
+    return `${header}\n${result.episodes.map(formatEpisode).join("\n")}`
   },
 }
