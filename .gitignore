@@ -28,6 +28,9 @@ Thumbs.db
 *.log
 logs/
 
+# Runtime state: the SQLite database (preferences, persisted sessions)
+data/
+
 # Qdrant local data (if running without Docker)
 qdrant_storage/
 ixa-test.txt

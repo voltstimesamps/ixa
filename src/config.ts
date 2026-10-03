@@ -1,5 +1,11 @@
+import path from "path"
 import * as dotenv from "dotenv"
 dotenv.config()
+
+// Resolved against this module, not the process CWD: src/config.ts and the
+// compiled dist/config.js both sit exactly one level under the repo root, so
+// the default data directory is the same whether Ixa runs via tsx or node.
+const repoRoot = path.resolve(__dirname, "..")
 
 export const config = {
   llm: {
@@ -54,6 +60,21 @@ export const config = {
     // never trimmed. Both limits apply; whichever is hit first stops the walk.
     contextMaxMessages: parseInt(process.env.IXA_CONTEXT_MAX_MESSAGES ?? "40"),
     contextBudgetChars: parseInt(process.env.IXA_CONTEXT_BUDGET_CHARS ?? "24000"),
+  },
+  data: {
+    // One SQLite file holds preferences and persisted sessions. The directory
+    // is gitignored — it is runtime state, not source.
+    // `||`, not `??`: a bare `IXA_DB_PATH=` line copied from .env.example is
+    // an empty string, which must fall back to the default rather than open a
+    // database at "".
+    dbPath: process.env.IXA_DB_PATH || path.join(repoRoot, "data", "ixa.db"),
+  },
+  preferences: {
+    // Active preferences are injected into every LLM call, so the block has to
+    // be bounded or a drifting store would crowd out conversation history.
+    // ~2000 chars is under a tenth of the default context budget.
+    maxInjected: parseInt(process.env.IXA_PREFS_MAX_INJECTED ?? "40"),
+    maxChars: parseInt(process.env.IXA_PREFS_MAX_CHARS ?? "2000"),
   },
   sidecars: {
     // The harness spawns sidecars/{stt,tts}/main.py itself. Set false to run
