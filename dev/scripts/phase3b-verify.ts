@@ -107,7 +107,7 @@ async function say(client: Client, text: string): Promise<string> {
   // The model writes "oat-milk" and "thirty-seven" with typographic dashes
   // (U+2010..U+2015, U+2212). Normalise them so assertions match what a reader
   // sees rather than the exact code point.
-  return reply.replace(/[\u2010-\u2015\u2212]/g, "-")
+  return reply.replace(/[\u2010-\u2015\u2212]/g, "-").replace(/[\u2018\u2019]/g, "'")
 }
 
 // a-d plus f.

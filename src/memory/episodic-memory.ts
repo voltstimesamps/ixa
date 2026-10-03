@@ -195,8 +195,14 @@ export class EpisodicMemory {
       this.markUp()
       return true
     } catch (err) {
+      // Only on the way down. During a sustained outage the sweep retries
+      // every few minutes, and one line per episode per retry would bury the
+      // single warning that actually matters.
+      const wasAvailable = this.available
       this.markDown(err instanceof Error ? err.message : String(err))
-      console.warn(`memory: episode #${episode.id} saved but not indexed; it is queued for retry`)
+      if (wasAvailable) {
+        console.warn(`memory: episode #${episode.id} saved but not indexed; queued for retry`)
+      }
       return false
     }
   }
