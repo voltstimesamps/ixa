@@ -299,6 +299,10 @@ function markdownIn(text: string): string[] {
 async function verifyRepl(): Promise<void> {
   section("a. the REPL handles /reset locally and the LLM never sees it")
 
+  // detached: "npx tsx" is a wrapper whose grandchild is the process that
+  // actually binds ports 3000/3001. Killing the wrapper alone orphans it, and
+  // the orphan then blocks every test that needs the real backend. Its own
+  // process group lets the whole tree be signalled below.
   const child = spawn("npx", ["tsx", "src/index.ts"], {
     cwd: process.cwd(),
     env: {
@@ -308,6 +312,7 @@ async function verifyRepl(): Promise<void> {
       SIDECAR_AUTOSTART: "false",
     },
     stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
   })
 
   let output = ""
@@ -364,9 +369,19 @@ async function verifyRepl(): Promise<void> {
     await waitFor(/Ixa: /, 90_000)
     child.stdin.end()
   } finally {
-    child.kill("SIGINT")
+    // Negative pid signals the whole process group, so the tsx grandchild
+    // goes with the wrapper.
+    const killGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal)
+      } catch {
+        // Already gone.
+      }
+    }
+    killGroup("SIGINT")
     await new Promise((resolve) => setTimeout(resolve, 1_500))
-    child.kill("SIGKILL")
+    killGroup("SIGKILL")
+    await new Promise((resolve) => setTimeout(resolve, 500))
   }
 
   const rows = sessionRows()
