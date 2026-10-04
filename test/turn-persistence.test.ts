@@ -7,7 +7,7 @@ import { SessionManager } from "../src/core/session-manager"
 import { SqliteSessionStore } from "../src/core/sqlite-session-store"
 import { openDatabase, type Db } from "../src/memory/db"
 import type { Message } from "../src/core/llm"
-import type { ChatFn } from "../src/core/session"
+import { TURN_FAILURE_APOLOGY, type ChatFn } from "../src/core/session"
 import { registry, type Tool } from "../src/tools/registry"
 import { makeConnection, TEST_LIMITS } from "./helpers"
 
@@ -225,4 +225,131 @@ test("the session keeps working after a failed turn", async (t) => {
   assert.ok(stored.some((m) => m.role === "user" && m.content === "first"))
   assert.ok(stored.some((m) => m.role === "user" && m.content === "second"))
   assertNoDanglingToolCalls(stored)
+})
+
+test("a failed turn is recorded as an apology, not as an unanswered question", async (t) => {
+  const db = tempDatabase(t)
+  const chat: ChatFn = async () => {
+    throw new Error("Connection error.")
+  }
+
+  const sessions = new SessionManager({
+    idleTimeoutMs: 60_000,
+    limits: TEST_LIMITS,
+    chat,
+    store: new SqliteSessionStore(db),
+  })
+  const sessionId = sessions.primarySession().id
+
+  await assert.rejects(sessions.submitTurn("what time is it", makeConnection(), "text"))
+
+  const stored = storedMessages(db, sessionId).filter((m) => m.role !== "system")
+  assert.equal(stored.length, 2, `expected user -> assistant, got ${JSON.stringify(stored)}`)
+  assert.equal(stored[0]!.role, "user")
+  assert.equal(stored[0]!.content, "what time is it")
+  assert.equal(stored[1]!.role, "assistant")
+
+  // The words the user actually heard, plus why, for the model.
+  const reply = String(stored[1]!.content)
+  assert.ok(
+    reply.startsWith(TURN_FAILURE_APOLOGY),
+    `history must repeat the spoken apology verbatim, got ${JSON.stringify(reply)}`
+  )
+  assert.equal(reply, `${TURN_FAILURE_APOLOGY} [turn failed: connection error]`)
+})
+
+test("after a failed turn, the next request carries no unanswered question", async (t) => {
+  const db = tempDatabase(t)
+
+  // The live failure this fixes: two turns failed, the backend restarted, the
+  // session was restored, and the model answered both stale questions plus
+  // the new one — because history said they had never been answered.
+  let turn = 0
+  const requests: Message[][] = []
+  const chat: ChatFn = async (messages) => {
+    requests.push([...messages])
+    turn++
+    if (turn <= 2) throw new Error("Connection error.")
+    return { type: "text", content: "it is four o'clock" }
+  }
+
+  const sessions = new SessionManager({
+    idleTimeoutMs: 60_000,
+    limits: TEST_LIMITS,
+    chat,
+    store: new SqliteSessionStore(db),
+  })
+  const connection = makeConnection()
+
+  await assert.rejects(sessions.submitTurn("what time is it", connection, "text"))
+  await assert.rejects(sessions.submitTurn("what time is it", connection, "text"))
+  const reply = await sessions.submitTurn("and now", connection, "text")
+  assert.equal(reply, "it is four o'clock")
+
+  // Every user message in the third request but the last one is answered.
+  const third = requests[2]!.filter((m) => m.role !== "system")
+  const userIndexes = third.flatMap((m, i) => (m.role === "user" ? [i] : []))
+  assert.equal(userIndexes.length, 3, `expected three questions, got ${JSON.stringify(third)}`)
+  for (const i of userIndexes.slice(0, -1)) {
+    const next = third[i + 1]
+    assert.ok(
+      next && next.role === "assistant",
+      `question at ${i} is unanswered: ${JSON.stringify(third)}`
+    )
+  }
+  // The last one is the question being asked right now, so it trails.
+  assert.equal(userIndexes.at(-1), third.length - 1)
+})
+
+test("a failure mid tool-group records the group first, then the apology", async (t) => {
+  const db = tempDatabase(t)
+
+  const tool: Tool = {
+    name: "test_group_then_apology",
+    description: "runs once",
+    inputSchema: { type: "object", properties: {} },
+    requiresConfirmation: true,
+    execute: async () => "DID THE THING",
+  }
+  registry.register(tool)
+
+  let asked = 0
+  const connection = makeConnection({
+    confirmer: async () => {
+      asked++
+      if (asked === 1) return "confirmed"
+      throw new Error("connection died mid-group")
+    },
+  })
+
+  const chat: ChatFn = async () => ({
+    type: "tool_calls",
+    calls: [
+      { id: "g-ran", name: "test_group_then_apology", arguments: "{}" },
+      { id: "g-never", name: "test_group_then_apology", arguments: "{}" },
+    ],
+  })
+
+  const sessions = new SessionManager({
+    idleTimeoutMs: 60_000,
+    limits: TEST_LIMITS,
+    chat,
+    store: new SqliteSessionStore(db),
+  })
+  const sessionId = sessions.primarySession().id
+
+  await assert.rejects(sessions.submitTurn("do both things", connection, "text"))
+
+  const stored = storedMessages(db, sessionId).filter((m) => m.role !== "system")
+  const roles = stored.map((m) => m.role)
+  assert.deepEqual(roles, ["user", "assistant", "tool", "tool", "assistant"], JSON.stringify(stored))
+
+  // The completed group comes first, so the sequence is still sendable...
+  assertNoDanglingToolCalls(stored)
+  assert.match(String(stored[2]!.content), /DID THE THING/)
+  assert.match(String(stored[3]!.content), /not executed/)
+
+  // ...and the apology is the last word, as the user heard it.
+  assert.ok(String(stored[4]!.content).startsWith(TURN_FAILURE_APOLOGY))
+  assert.match(String(stored[4]!.content), /\[turn failed: connection died mid-group\]/)
 })

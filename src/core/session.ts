@@ -73,6 +73,43 @@ export const VOICE_RESPONSE_PROMPT =
   "on, rather than speaking an essay.\n" +
   "Say the useful part first. The user can always ask for more."
 
+// Spoken when a turn fails, and recorded as the assistant's reply to the turn
+// that failed. Short, fixed, and free of any suggestion about what went wrong:
+// the user is mid-conversation and wants to know they can try again, not to
+// hear a stack trace read aloud.
+//
+// It lives here, not in the WebSocket transport that speaks it, so the words
+// the user HEARS and the words history SAYS they heard cannot drift apart.
+export const TURN_FAILURE_APOLOGY =
+  "Sorry, something went wrong on my end. Could you try that again?"
+
+// How much of the underlying error goes into the bracketed reason. Enough to
+// tell a timeout from a dead backend, not so much that a stack-shaped message
+// crowds out the conversation on every later turn.
+const FAILURE_REASON_MAX = 80
+
+// The assistant message recorded for a turn that failed.
+//
+// Without it, history said the user asked and was never answered — and the
+// model, restored into that history, dutifully answered every stale question
+// at once on the next turn. The user had already been told something went
+// wrong; the record has to say the same thing they heard.
+//
+// The bracketed reason is for the model, not the user: it is the difference
+// between "I could not reach my language model" and "that took too long",
+// which changes what Ixa should say if asked about it.
+export function turnFailureReply(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  let reason = raw.replace(/\s+/g, " ").trim().replace(/\.$/, "")
+  // Lower-case the opening word so it reads as a clause, unless it is an
+  // acronym ("LLM call aborted…") that lower-casing would mangle.
+  if (!/^[A-Z]{2}/.test(reason)) reason = reason.charAt(0).toLowerCase() + reason.slice(1)
+  if (reason.length > FAILURE_REASON_MAX) {
+    reason = `${reason.slice(0, FAILURE_REASON_MAX - 1).trimEnd()}…`
+  }
+  return `${TURN_FAILURE_APOLOGY} [turn failed: ${reason || "unknown error"}]`
+}
+
 // What a tool result says when the turn failed before that call ever ran.
 // Truthful on purpose: the model is told nothing happened, not handed a
 // vague error it might read as "the action may have gone through".
@@ -234,11 +271,18 @@ export class Session {
         async (): Promise<string> => {
           this.messages.push({ role: "user", content: userInput })
           onUserMessage?.()
-          // Once per turn, before the first LLM call. Already inside the turn
-          // chain, so it cannot interleave with another turn's recall.
-          this.recalled = this.recall ? await this.recall(userInput) : null
           try {
+            // Once per turn, before the first LLM call. Already inside the
+            // turn chain, so it cannot interleave with another turn's recall.
+            this.recalled = this.recall ? await this.recall(userInput) : null
             return await this.runToolLoop(origin, connection)
+          } catch (err) {
+            // Here rather than in a transport, so the WebSocket, REST and the
+            // REPL all record the same thing. runToolLoop has already closed
+            // any tool group it cut short, so this lands after the group's
+            // results and the ordering stays valid.
+            this.messages.push({ role: "assistant", content: turnFailureReply(err) })
+            throw err
           } finally {
             this.recalled = null
           }

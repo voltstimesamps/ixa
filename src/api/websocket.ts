@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto"
 import { config } from "../config"
 import { WebSocket, WebSocketServer } from "ws"
-import type { MessageOrigin } from "../core/session"
+import { TURN_FAILURE_APOLOGY, type MessageOrigin } from "../core/session"
 import type { SessionManager } from "../core/session-manager"
 import type { Connection } from "../core/connection"
 import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
@@ -10,13 +10,6 @@ import { sanitizeForSpeech } from "../voice/sanitize"
 import { transcribe, pcmToWav } from "../voice/stt"
 import { isDismissPhrase, DISMISS_ACKNOWLEDGMENT } from "../voice/dismiss"
 import type { WsMessage } from "./types"
-
-// Spoken when a turn fails. Short, fixed, and free of any suggestion about
-// what went wrong: the user is mid-conversation and wants to know they can
-// try again, not to hear a stack trace read aloud. The real error still goes
-// out as an "error" message and into the log.
-export const TURN_FAILURE_APOLOGY =
-  "Sorry, something went wrong on my end. Could you try that again?"
 
 // Resolves with the server once it is listening. index.ts ignores the handle;
 // tests use it to shut the server down, which is the only way a test file can
@@ -145,7 +138,10 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
           send({ type: "error", content })
           // A fixed string, never an LLM call: the thing that just failed is
           // quite likely the LLM, and asking it to apologise would hang or
-          // fail exactly as the turn did.
+          // fail exactly as the turn did. The same constant the session layer
+          // records as the assistant's reply, so what the user hears and what
+          // history says they heard cannot drift. Only the bracketed reason
+          // differs — that is for the model, not the speaker.
           if (connection.isOpen) await speak(TURN_FAILURE_APOLOGY)
         } finally {
           // In a finally, not at the end of each branch: if the TTS sidecar
