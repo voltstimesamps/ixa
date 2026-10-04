@@ -630,6 +630,14 @@ async function verifyTokens(): Promise<void> {
       while (spent.length > 0 && spent[0]!.at < cutoff) spent.shift()
       const used = spent.reduce((sum, entry) => sum + entry.tokens, 0)
       if (used + estimate <= TPM_LIMIT * 0.9) return
+      // Nothing left in the window to age out, yet still over budget: this
+      // ONE request is larger than the whole per-minute allowance. Waiting
+      // cannot help, so send it and let the API report the real limit —
+      // which is the 413 a single oversized request earns.
+      if (spent.length === 0) {
+        console.log(`    (one request alone is ~${estimate} tok, over the ${TPM_LIMIT} TPM allowance — sending it anyway)`)
+        return
+      }
       const waitMs = Math.max(1_000, spent[0]!.at + 60_000 - Date.now() + 500)
       console.log(`    (pacing: ${used} tok used this minute, waiting ${Math.ceil(waitMs / 1000)}s)`)
       await new Promise((resolve) => setTimeout(resolve, waitMs))
