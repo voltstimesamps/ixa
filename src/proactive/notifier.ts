@@ -19,6 +19,9 @@ export async function notify(
         "Content-Type": "text/plain",
       },
       body: message,
+      // An ntfy server that accepts the connection and then says nothing
+      // would otherwise hang the turn that called `notify`, forever.
+      signal: AbortSignal.timeout(config.tools.httpTimeoutMs),
     })
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`)

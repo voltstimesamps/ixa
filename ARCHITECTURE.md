@@ -322,6 +322,34 @@ Asked to "pull your memory", Ixa said she had no stored memories — while `sear
 
 **Anything that changes over time must be searched for.** Ixa stated prices and specific products from memory. The prompt now requires `web_search` before answering about prices, availability, versions, release dates or current events, and requires saying plainly that she is not sure when she cannot search. This **increases `web_search` traffic**, which matters under the free tier — see Current open items for the measured cost of a search turn.
 
+### Turn resilience ✅ (built, verified)
+
+How a turn fails. Found by diagnosing a live hang: there was no LLM timeout at all, and the SDK's own request timeout is **cleared the moment response headers arrive**, so a stream that stopped mid-reply hung forever. A hung turn also kept the idle timer disarmed, so the session could never expire either.
+
+- **Two deadlines on every LLM call**, both on one `AbortController`. A **stream-inactivity deadline** (`LLM_STREAM_IDLE_TIMEOUT_MS`, 15s) aborts if no chunk arrives for that long — this is the one that actually catches a stall. A **request ceiling** (`LLM_REQUEST_TIMEOUT_MS`, 120s) bounds the whole call, retries included. The ceiling is deliberately generous: it is a backstop, and a slower local model later must not be cut off mid-thought.
+- The chunk loop is driven by hand rather than with `for await`, because the inactivity deadline has to sit on each individual `next()`.
+- **Retries stay the SDK's.** `maxRetries` is explicit in config (2) rather than inherited silently, but the retry *policy* — which statuses, what backoff, how `retry-after` is honoured — is not reimplemented. Instead a **custom `fetch` wrapper** is passed to the client: every attempt, retries included, goes through it, and the SDK stamps `x-stainless-retry-count` on each one so an attempt can name itself. Rejected alternative: a hand-rolled retry loop, which buys the same log line at the cost of a second retry policy that would drift from the SDK's.
+- **A generic per-tool ceiling** (`IXA_TOOL_TIMEOUT_MS`, 45s) sits in the tool loop, above each tool's own limit. It exists for the tools that forget one — and for MCP tools in Phase 4, whose timeout behaviour is not Ixa's to set. **Time spent waiting on a confirmation is excluded**, because a user thinking is not a tool hanging.
+  - A tool's promise cannot be cancelled from outside, so the ceiling stops the *turn* waiting, not the work. Both the log line and the result handed to the model say exactly that: *abandoned, may still complete* — never "it did not run". A tool that is still running is not a tool that did nothing.
+  - Tools that own a network call bound it themselves (`IXA_TOOL_HTTP_TIMEOUT_MS`, 15s): `web_search` and the ntfy notifier had unbounded `fetch` calls and now do not. `shell_read` / `shell_write` were already bounded (10s / 30s `execFile`), and the preference tools are synchronous SQLite. **`search_memory` is not bounded from the inside** — `EpisodicMemory.search()` takes no signal, unlike `recall()`, which has `IXA_RECALL_TIMEOUT_MS`. It relies on the generic ceiling.
+- **TTS has an inactivity deadline too** (`TTS_IDLE_TIMEOUT_MS`, 20s). `speak()` already swallowed TTS *errors*, but a sidecar that accepted the request and then hung would hold a turn open forever — including the failure path, whose whole point is a prompt terminator.
+
+**Failing well.** A failed turn is still a *finished* turn, and each transport says so in its own idiom:
+
+- **WebSocket:** the error goes out as an `error` message, a short **fixed** apology is spoken (never an LLM call — the thing that just failed is quite likely the LLM), and `replyEnd` is sent **from a `finally`**, so the client gets its terminator even if speaking the apology fails too. **The socket stays open.** The conversation and the session both survive one bad turn, and the user's next sentence must land on them rather than on a reconnect. A malformed frame no longer closes the socket either.
+- **REST:** a 500 with the message. **REPL:** prints it and keeps taking input.
+
+**What is persisted, and when.**
+
+- **The user's message is written before the turn runs**, not in `submitTurn`'s `finally`. Everything that can fail happens after that point, so a turn that times out, throws or is killed still leaves the question on the record. Losing what the user said is worse than losing the answer, because only one of the two can be asked for again. The hook fires *inside* the turn chain — called from outside it would race the serialization.
+- **A tool-call group is never persisted incomplete.** An assistant `tool_calls` message whose results are missing is rejected outright by the API, so leaving one in history would break *every later turn in that session*, not just the one that failed. When a failure cuts a group short, calls that ran **keep their real results** — a tool with side effects has already had them, and the model cannot account for what it is not told — and every call that never ran gets an explicit `not executed … Nothing happened` placeholder. Rejected alternative: truncating the group, which is simpler but hides a side effect that actually occurred.
+
+**Logging.** One line per tool call (`tool <name> ok|error|timeout|declined|cancelled|unknown <ms> <args truncated to 120 chars>`), one per failed LLM attempt (`llm attempt 1/2 failed: status=429 retry-after=10`), one per abort (`llm aborted: no chunk for 15000ms (stream inactivity)`), and one for the malformed-tool-call retry, which was previously silent.
+
+**Can a turn still hang?** Every LLM call and every tool execution is now bounded, so `submitTurn`'s `finally` is always reached and **the idle timer always re-arms**. One honest caveat: the SDK's retry backoff `sleep` is not abortable, so the request ceiling is enforced at the next attempt boundary and can overshoot by that sleep — bounded by the SDK's own 60s cap on `retry-after`, so still bounded, not indefinite.
+
+**Verification.** 17 automated cases (144 total, up from 127), driven against local stub servers rather than Groq, because a real provider cannot be asked to stall: a dead backend, a request that never gets headers, and a server that sends headers plus one chunk and then stops. Live end-to-end against the real stack with the LLM pointed at a dead port: error at 514ms, apology spoken through real Kokoro, message order `error → audioStart → audioOutputEnd → replyEnd`, socket still open, and the user's message in SQLite with no assistant turn beside it.
+
 ### LLM abstraction and configuration
 - Application config values are read through **one config module** (`src/config.ts`). Exceptions: some files read `HOME`, and the shell tools and `src/core/sidecars.ts` pass the process environment through to child processes. Don't add new direct `process.env` reads for config.
 - The canonical list of variables lives in **`.env.example`**, not in this doc. Several (e.g. `STT_URL`, `TTS_URL`, `STT_MODEL`) have working defaults in `config.ts`.
@@ -513,7 +541,7 @@ Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/
 (Home Assistant moved to Phase 4 and will be built via MCP.)
 
 ### Current open items
-- **Groq free tier is now the binding constraint.** Measured limits: **8000 tokens per minute** and **200000 tokens per day**, both enforced as 429s (`x-ratelimit-limit-tokens: 8000`). A single request larger than the per-minute allowance is rejected outright — the 413 seen on an 8123-token request. Measured sizes, which say where the budget actually goes:
+- **Groq free tier — resolved, measurements retained.** Ixa is now on the **Groq Dev tier**, so 429s are rare and the daily cap no longer blocks live verification; the decision flagged below (paid tier vs. local-LLM migration) has been made in favour of the paid tier for now. The measurements are kept because they still say where the token budget goes. Previously measured limits: **8000 tokens per minute** and **200000 tokens per day**, both enforced as 429s (`x-ratelimit-limit-tokens: 8000`). A single request larger than the per-minute allowance is rejected outright — the 413 seen on an 8123-token request. Measured sizes, which say where the budget actually goes:
 
   | Piece | Size |
   |---|---|
@@ -523,7 +551,7 @@ Confirmation gate (transport-agnostic `Confirmer`), Tavily search, `shell_read`/
   | A `web_search` result | ~5300 chars |
   | Full voice request, `IXA_CONTEXT_BUDGET_CHARS=24000` | **~4500 tok** |
 
-  Consequences: **the per-day cap is reached easily** — a day of development testing exhausted 200000 and the window then refills by trickle, costing ~6 minutes of waiting per 2000-token request, which blocks live verification entirely. **The freshness rule increases `web_search` traffic**, and a search turn is two LLM calls, the second carrying the ~5300-char result. And **the prompt trim did not save tokens**: removing the duplicated tool list saved less than the memory, honesty and freshness rules cost, so `SYSTEM_PROMPT` grew from 262 to 522 tokens. The real levers are the tool schemas (`remember_preference`'s description alone is ~1470 chars) and `IXA_CONTEXT_BUDGET_CHARS`. **Decide between a paid Groq tier and the local-LLM migration before the next phase that needs live verification.**
+  Consequences: **the per-day cap is reached easily** — a day of development testing exhausted 200000 and the window then refills by trickle, costing ~6 minutes of waiting per 2000-token request, which blocks live verification entirely. **The freshness rule increases `web_search` traffic**, and a search turn is two LLM calls, the second carrying the ~5300-char result. And **the prompt trim did not save tokens**: removing the duplicated tool list saved less than the memory, honesty and freshness rules cost, so `SYSTEM_PROMPT` grew from 262 to 522 tokens. The real levers are the tool schemas (`remember_preference`'s description alone is ~1470 chars) and `IXA_CONTEXT_BUDGET_CHARS`. ~~Decide between a paid Groq tier and the local-LLM migration~~ — decided: Dev tier.
 - **Sidecar warmup** before readiness (removes the small cold-start inter-chunk gap).
 - **SearXNG:** `SEARXNG_URL` is in `.env.example`. Determine whether `search.ts` has a SearXNG path. A self-hosted, keyless search backend fits the project better than Tavily long-term.
 - **Re-benchmark TTS** now that WSL exposes 8 vCPUs (see Compute gotcha). The recorded real-time factors are still the 4-vCPU ones.
@@ -554,6 +582,9 @@ Five problems found in live voice testing, all of them behaviour rather than plu
 5. **"What did we talk about last time?" unanswerable.** `search_memory`'s query is optional; no query means recency, from SQLite. See *Memory architecture*.
 
 **Verification status.** The automated suite covers all five (127 cases, up from 84): the sanitizer, `/reset` handled locally with an LLM that fails the test if called, the deferred session end including the queued-turn case, and `search_memory` with and without a query. The **live** end-to-end run (a real voice-origin turn, a real reset, real memory questions) is **incomplete**: the Groq free tier's 200000-token daily cap was exhausted partway through, and the window refills too slowly to finish. Token sizes were measured before it ran out and are recorded under Current open items. Finish the live run when there is LLM budget.
+
+### Turn resilience — ✅ DONE
+LLM request ceiling and stream-inactivity deadline, explicit `maxRetries`, a logging `fetch` wrapper instead of a second retry policy, a generic per-tool ceiling with confirmation time excluded, bounded `fetch` in `web_search` and the notifier, a TTS inactivity deadline, fail-well on all three transports (`replyEnd` from a `finally`, socket kept open), the user message persisted before the turn runs, and tool-call groups completed truthfully on failure. See *Turn resilience*.
 
 ### Phase 3d — Obsidian vault pipeline — 🔜
 - Obsidian + Syncthing + chokidar → chunk → nomic-embed → Qdrant (a second collection).

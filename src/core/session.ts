@@ -1,8 +1,9 @@
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { chat as defaultChat, type LLMResponse, Message } from "./llm"
-import { registry } from "../tools/registry"
+import { chat as defaultChat, LLMDeadlineError, type LLMResponse, type Message, type ToolCall } from "./llm"
+import { registry, type Tool } from "../tools/registry"
+import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
 import { runWithSessionControl } from "./session-context"
@@ -71,6 +72,56 @@ export const VOICE_RESPONSE_PROMPT =
   "- If a full answer genuinely needs length or code, say so in a sentence and ask whether to go " +
   "on, rather than speaking an essay.\n" +
   "Say the useful part first. The user can always ask for more."
+
+// What a tool result says when the turn failed before that call ever ran.
+// Truthful on purpose: the model is told nothing happened, not handed a
+// vague error it might read as "the action may have gone through".
+const NOT_EXECUTED =
+  "not executed: the turn failed before this tool ran. Nothing happened."
+
+// Arguments are truncated in the log: a web_search query is short, but a
+// shell command or a remembered preference is not, and a log line that wraps
+// four times is a log nobody reads.
+const TOOL_LOG_ARG_CHARS = 120
+
+function logToolCall(
+  name: string,
+  status: string,
+  startedAt: number,
+  args: string,
+  note?: string
+): void {
+  const shown =
+    args.length > TOOL_LOG_ARG_CHARS ? `${args.slice(0, TOOL_LOG_ARG_CHARS)}…` : args
+  console.log(
+    `tool ${name} ${status} ${Date.now() - startedAt}ms ${shown}${note ? ` — ${note}` : ""}`
+  )
+}
+
+export class ToolTimeoutError extends Error {
+  constructor(name: string, ms: number) {
+    super(
+      `Tool '${name}' did not finish within ${ms}ms and was abandoned. Its work may still ` +
+        `complete — do not tell the user it did not happen, and do not run it again without asking.`
+    )
+    this.name = "ToolTimeoutError"
+  }
+}
+
+// A backstop deadline around one tool execution.
+//
+// The tool's promise cannot be cancelled from here — execute() owns whatever
+// it started, and there is no generic way to reach in and stop it. So this
+// stops the TURN waiting, not the work. Both the log line and the result
+// handed to the model say exactly that, because a tool that is still running
+// is not the same thing as a tool that did not run.
+function withToolDeadline<T>(work: Promise<T>, ms: number, name: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ToolTimeoutError(name, ms)), ms)
+  })
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer))
+}
 
 export type MessageOrigin = "voice" | "text"
 
@@ -163,10 +214,17 @@ export class Session {
   // connection it came from. The returned promise settles with THIS turn's
   // outcome; a turn that throws is isolated to its own caller and does not
   // break the queue for the turns behind it.
+  //
+  // `onUserMessage` fires once the user's message is in history and before
+  // any LLM call. It has to run INSIDE the turn chain — called from outside,
+  // it would race the serialization and could persist a history snapshot
+  // belonging to a different turn. The manager uses it to make the question
+  // durable before the work that might fail begins.
   send(
     userInput: string,
     connection: Connection,
-    origin: MessageOrigin = "text"
+    origin: MessageOrigin = "text",
+    onUserMessage?: () => void
   ): Promise<string> {
     const run = (): Promise<string> =>
       // Binds the session-control channel for the whole turn, so a tool that
@@ -175,6 +233,7 @@ export class Session {
         { requestNewConversation: () => { this.endRequested = true } },
         async (): Promise<string> => {
           this.messages.push({ role: "user", content: userInput })
+          onUserMessage?.()
           // Once per turn, before the first LLM call. Already inside the turn
           // chain, so it cannot interleave with another turn's recall.
           this.recalled = this.recall ? await this.recall(userInput) : null
@@ -271,6 +330,54 @@ export class Session {
     return [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
   }
 
+  // Runs one tool call under the generic ceiling, and logs it. Every path
+  // that actually invokes a tool goes through here, so there is exactly one
+  // place where a tool can hang and exactly one place that reports it.
+  private async executeTool(tool: Tool, tc: ToolCall): Promise<string> {
+    const startedAt = Date.now()
+    try {
+      const input = JSON.parse(tc.arguments || "{}")
+      const output = await withToolDeadline(
+        Promise.resolve(tool.execute(input)),
+        config.tools.timeoutMs,
+        tool.name
+      )
+      const result = typeof output === "string" ? output : JSON.stringify(output)
+      logToolCall(tool.name, "ok", startedAt, tc.arguments)
+      return result
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (err instanceof ToolTimeoutError) {
+        logToolCall(
+          tool.name,
+          "timeout",
+          startedAt,
+          tc.arguments,
+          "abandoned; its underlying work may still complete"
+        )
+      } else {
+        logToolCall(tool.name, "error", startedAt, tc.arguments, message)
+      }
+      return JSON.stringify({ error: message })
+    }
+  }
+
+  // Closes a tool-call group that a failure cut short.
+  //
+  // Calls that ran keep their real results: a tool with side effects has
+  // already had them, and the model cannot account for what it is not told.
+  // Calls that never ran get an explicit placeholder. Either way the group
+  // ends up complete — an assistant `tool_calls` message whose results are
+  // missing is rejected outright by the API, so leaving one in history would
+  // make every later turn in this session fail, not just the one that broke.
+  private completeToolGroup(calls: ToolCall[], answered: Set<string>): void {
+    for (const tc of calls) {
+      if (answered.has(tc.id)) continue
+      this.messages.push({ role: "tool", tool_call_id: tc.id, content: NOT_EXECUTED })
+      console.log(`tool ${tc.name} not-executed — the turn failed before it ran`)
+    }
+  }
+
   private async runToolLoop(origin: MessageOrigin, connection: Connection): Promise<string> {
     const tools = registry.toOpenAI()
     let retrying = false
@@ -281,6 +388,9 @@ export class Session {
       try {
         response = await this.chat(this.messagesForCall(origin), retrying ? [] : tools)
       } catch (err) {
+        // A deadline is never a malformed tool call, and asking again without
+        // tools would just spend the budget twice.
+        if (err instanceof LLMDeadlineError) throw err
         const msg = err instanceof Error ? err.message : String(err)
         if (!retrying && (
           msg.toLowerCase().includes("failed to call a function") ||
@@ -289,6 +399,7 @@ export class Session {
           msg.toLowerCase().includes("parsing failed") ||
           msg.toLowerCase().includes("could not be parsed")
         )) {
+          console.log(`llm retry without tools: ${msg}`)
           retrying = true
           continue
         }
@@ -316,6 +427,7 @@ export class Session {
       }
 
       if (anyParseFailure && !retrying) {
+        console.log("llm retry without tools: tool call arguments were not valid JSON")
         retrying = true
         continue
       }
@@ -330,68 +442,77 @@ export class Session {
         })),
       })
 
-      for (const tc of response.calls) {
-        const tool = registry.get(tc.name)
-        let result: string
+      // Which calls in this group already have their result in history. The
+      // group is only valid once every call does — see completeToolGroup.
+      const answered = new Set<string>()
+      try {
+        for (const tc of response.calls) {
+          const tool = registry.get(tc.name)
+          let result: string
 
-        if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
-          try {
-            const parsed = JSON.parse(tc.arguments || "{}") as Record<string, unknown>
-            tc.arguments = JSON.stringify({ ...parsed, cwd: this.cwd })
-          } catch {
-            // leave arguments unchanged if they're unparseable
-          }
-        }
-
-        if (!tool) {
-          result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
-        } else if (tool.requiresConfirmation) {
-          const description = await this.generateDescription(tc.name, tc.arguments)
-          const outcome = await requestConfirmation(connection.confirmer, description)
-          if (outcome === "cancelled") {
-            // Recorded distinctly from a decline so the LLM knows the action
-            // did not happen because the asking client vanished, not because
-            // the user refused. Nothing executed either way.
-            result =
-              "Action cancelled: the client that requested it disconnected before confirming. " +
-              "Nothing was executed."
-          } else if (outcome === "declined") {
-            result = "Action declined by user."
-          } else {
+          if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
             try {
-              const input = JSON.parse(tc.arguments || "{}")
-              const output = await tool.execute(input)
-              result = typeof output === "string" ? output : JSON.stringify(output)
-            } catch (err) {
-              result = JSON.stringify({ error: err instanceof Error ? err.message : String(err) })
+              const parsed = JSON.parse(tc.arguments || "{}") as Record<string, unknown>
+              tc.arguments = JSON.stringify({ ...parsed, cwd: this.cwd })
+            } catch {
+              // leave arguments unchanged if they're unparseable
             }
           }
-        } else {
-          try {
-            const input = JSON.parse(tc.arguments || "{}")
-            const output = await tool.execute(input)
-            result = typeof output === "string" ? output : JSON.stringify(output)
-          } catch (err) {
-            result = JSON.stringify({ error: err instanceof Error ? err.message : String(err) })
-          }
-        }
 
-        if (tool?.name === "shell_write") {
-          try {
-            const parsed = JSON.parse(result) as { newCwd?: string; display?: string }
-            if (parsed.newCwd) {
-              this.cwd = path.resolve(parsed.newCwd)
-              result = parsed.display ?? result
+          if (!tool) {
+            result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
+            logToolCall(tc.name, "unknown", Date.now(), tc.arguments)
+          } else if (tool.requiresConfirmation) {
+            const description = await this.generateDescription(tc.name, tc.arguments)
+            // Deliberately OUTSIDE the tool deadline. The user may take as
+            // long as they like to answer, and the confirmer has its own
+            // 30-second limit; charging their thinking time to the tool's
+            // budget would time out tools that had not started yet.
+            const askedAt = Date.now()
+            const outcome = await requestConfirmation(connection.confirmer, description)
+            if (outcome === "cancelled") {
+              // Recorded distinctly from a decline so the LLM knows the action
+              // did not happen because the asking client vanished, not because
+              // the user refused. Nothing executed either way.
+              result =
+                "Action cancelled: the client that requested it disconnected before confirming. " +
+                "Nothing was executed."
+              logToolCall(tool.name, "cancelled", askedAt, tc.arguments)
+            } else if (outcome === "declined") {
+              result = "Action declined by user."
+              logToolCall(tool.name, "declined", askedAt, tc.arguments)
+            } else {
+              result = await this.executeTool(tool, tc)
             }
-          } catch {
-            // not a cd result, use result as-is
+          } else {
+            result = await this.executeTool(tool, tc)
           }
+
+          if (tool?.name === "shell_write") {
+            try {
+              const parsed = JSON.parse(result) as { newCwd?: string; display?: string }
+              if (parsed.newCwd) {
+                this.cwd = path.resolve(parsed.newCwd)
+                result = parsed.display ?? result
+              }
+            } catch {
+              // not a cd result, use result as-is
+            }
+          }
+          this.messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: result,
+          })
+          answered.add(tc.id)
         }
-        this.messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: result,
-        })
+      } catch (err) {
+        // executeTool turns a failing tool into an error RESULT, so reaching
+        // here means the turn itself came apart — a confirmation that threw,
+        // an abort. Close the group before the error leaves, or history is
+        // left in a state the API will reject on every subsequent turn.
+        this.completeToolGroup(response.calls, answered)
+        throw err
       }
     }
 

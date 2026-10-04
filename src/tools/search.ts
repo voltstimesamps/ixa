@@ -64,8 +64,16 @@ export const searchTool: Tool = {
           max_results: count,
           search_depth: "basic",
         }),
+        // Without this the turn waits on Tavily indefinitely. The generic
+        // tool ceiling in the tool loop would eventually abandon the call,
+        // but a tool that owns a network request should bound it itself and
+        // return a result the model can act on.
+        signal: AbortSignal.timeout(config.tools.httpTimeoutMs),
       })
     } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        return `Search failed: Tavily did not respond within ${config.tools.httpTimeoutMs}ms.`
+      }
       const msg = err instanceof Error ? err.message : String(err)
       return `Search failed: ${msg}`
     }

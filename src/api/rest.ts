@@ -23,7 +23,11 @@ const restConnection: Connection = {
   sendBinary: () => {},
 }
 
-export function createRestServer(port: number, sessions: SessionManager): Promise<void> {
+// Resolves with the server once it is listening — see createWsServer for why.
+export function createRestServer(
+  port: number,
+  sessions: SessionManager
+): Promise<ReturnType<typeof serve>> {
   const app = new Hono()
 
   app.post("/chat", async (c) => {
@@ -70,14 +74,14 @@ export function createRestServer(port: number, sessions: SessionManager): Promis
     return c.json({ ok: true, model: config.llm.model })
   })
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<ReturnType<typeof serve>>((resolve, reject) => {
     const server = serve(
       { fetch: app.fetch, port, hostname: "0.0.0.0" },
       () => {
         server.off("error", reject)
         server.on("error", (err) => console.error("REST server error:", err))
         console.log(`REST server listening on http://localhost:${port}`)
-        resolve()
+        resolve(server)
       }
     )
     server.on("error", reject)

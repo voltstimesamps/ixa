@@ -163,7 +163,13 @@ export class SessionManager {
     this.clearIdleTimer(session.id)
 
     try {
-      return await session.send(input, connection, origin)
+      // The user's message is persisted the moment it is in history, before
+      // the first LLM call. Everything that can fail happens after this
+      // point, so a turn that times out, throws, or is killed outright still
+      // leaves the question on the record — losing what the user said is
+      // worse than losing the answer, because only one of the two can be
+      // asked for again.
+      return await session.send(input, connection, origin, () => this.store.save(session))
     } finally {
       session.pendingTurns--
       if (session.pendingTurns === 0 && session.endedAt === null) {

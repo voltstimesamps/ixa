@@ -12,12 +12,45 @@ export const config = {
     baseURL: process.env.LLM_BASE_URL ?? "https://api.groq.com/openai/v1",
     apiKey: process.env.LLM_API_KEY ?? "",
     model: process.env.LLM_MODEL ?? "openai/gpt-oss-20b",
+    // Hard ceiling on ONE chat() call, the SDK's own retries included. The
+    // SDK's request timeout only covers getting the response headers — it is
+    // cleared the moment they arrive, so a stream that stops mid-reply would
+    // otherwise hang the turn forever. Deliberately generous: a slower local
+    // model later must not be cut off mid-thought. The inactivity deadline
+    // below is what actually catches a stall.
+    requestTimeoutMs: parseInt(process.env.LLM_REQUEST_TIMEOUT_MS ?? "120000"),
+    // Abort if no chunk arrives for this long. Groq's time-to-first-token is
+    // well under a second, so this is a stall, not slowness.
+    streamIdleTimeoutMs: parseInt(process.env.LLM_STREAM_IDLE_TIMEOUT_MS ?? "15000"),
+    // Explicit rather than inherited: the SDK's default is also 2, but a
+    // silent default is a thing nobody knows is there. Retries happen inside
+    // one request ceiling, so they cannot extend a turn without bound.
+    maxRetries: parseInt(process.env.LLM_MAX_RETRIES ?? "2"),
+  },
+  tools: {
+    // A backstop above every tool's own limit, not a substitute for one: a
+    // tool that owns a network call or a subprocess bounds it itself (see
+    // httpTimeoutMs, and the execFile timeouts in the shell tools). This
+    // catches the ones that forget — including MCP tools in Phase 4, whose
+    // timeout behaviour is not ours to set. Time spent waiting for a
+    // confirmation is NOT counted against it.
+    timeoutMs: parseInt(process.env.IXA_TOOL_TIMEOUT_MS ?? "45000"),
+    // Deadline for a tool's outbound HTTP call (web_search, ntfy). Well
+    // inside timeoutMs so the tool returns its own error message rather than
+    // being abandoned by the backstop.
+    httpTimeoutMs: parseInt(process.env.IXA_TOOL_HTTP_TIMEOUT_MS ?? "15000"),
   },
   voice: {
     enabled: process.env.VOICE_MODE === "true",
     ttsUrl: process.env.TTS_URL ?? "http://localhost:5001",
     sttUrl: process.env.STT_URL ?? "http://localhost:5002",
     sttModel: process.env.STT_MODEL ?? "base.en",
+    // Abort synthesis if the sidecar sends no audio frame for this long.
+    // Without it, a TTS sidecar that accepts the request and then hangs holds
+    // the turn open forever — including the turn-failure path, where the
+    // whole point is that the client gets its terminator promptly. Generous,
+    // because the first frame of a cold Kokoro waits on the model loading.
+    ttsIdleTimeoutMs: parseInt(process.env.TTS_IDLE_TIMEOUT_MS ?? "20000"),
   },
   qdrant: {
     url: process.env.QDRANT_URL ?? "http://localhost:6333",
