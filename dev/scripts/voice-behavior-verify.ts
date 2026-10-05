@@ -12,6 +12,7 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
 //   npx tsx dev/scripts/voice-behavior-verify.ts dismiss      # 5
+//   npx tsx dev/scripts/voice-behavior-verify.ts priceguard   # 7
 //   npx tsx dev/scripts/voice-behavior-verify.ts tokens       # prompt cost
 //   npx tsx dev/scripts/voice-behavior-verify.ts strays       # 6, read-only
 //
@@ -35,6 +36,7 @@ import { registry } from "../../src/tools/registry"
 import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
 import { shortenForSpeech, CONTINUE_OFFER } from "../../src/voice/shorten"
 import { parseDismiss } from "../../src/voice/dismiss"
+import { findCurrencyAmounts } from "../../src/core/prices"
 import { getPreferenceStore } from "../../src/memory/preferences"
 import { formatEpisodeWhen, getEpisodeStore } from "../../src/memory/episodes"
 import {
@@ -365,6 +367,56 @@ async function verifyDismiss(): Promise<void> {
   await client.close()
 }
 
+// ----------------------------------------------------------- 7: price guard
+
+// The two questions that produced tiered prices with no search in live
+// testing, plus a direct price question that SHOULD search — the guard must
+// not fire on a reply whose figures were actually looked up.
+const PRICE_CASES: Array<{ question: string; expectSearch: boolean }> = [
+  { question: "What CPU should I get for local AI?", expectSearch: false },
+  { question: "What GPU should I get for local AI?", expectSearch: false },
+  { question: "How much does a used RTX 3060 cost right now?", expectSearch: true },
+]
+
+async function verifyPriceGuard(): Promise<void> {
+  section("7. a reply cannot state a price without a search behind it")
+
+  const client = await connect()
+  for (const { question, expectSearch } of PRICE_CASES) {
+    const reply = await say(client, question)
+    const live = liveSession()
+    const calls = live ? toolCallsInLastTurn(live) : []
+    const searched = calls.filter((name) => name === "web_search").length
+    const amounts = findCurrencyAmounts(reply.text)
+
+    console.log(`    tools:   ${calls.join(", ") || "none"}`)
+    console.log(`    prices:  ${amounts.join(", ") || "none"}`)
+
+    check(`answered: ${question.slice(0, 44)}`, reply.text.trim().length > 0, `${reply.text.length} chars`)
+
+    // The invariant, whichever way the turn went: a price in the DELIVERED
+    // reply means a search happened in the same turn.
+    check(
+      amounts.length === 0 ? "no price stated" : "every stated price had a search behind it",
+      amounts.length === 0 || searched > 0,
+      amounts.length > 0 ? `${amounts.join(", ")} with ${searched} search(es)` : ""
+    )
+
+    if (expectSearch) {
+      // A direct price question should search and keep its figures. If it
+      // searched, the guard must have stayed out of the way entirely.
+      check("a direct price question searched", searched > 0, `${searched} search(es)`)
+    }
+  }
+  await client.close()
+
+  console.log(
+    "\n  The backend log shows every firing: grep for \"price guard:\". A line reading\n" +
+      "  \"asking again\" is the retry; \"delivering it\" is the second draft going out\n" +
+      "  anyway, which is the bounded-retry case rather than a loop."
+  )
+}
+
 // ---------------------------------------------------------------- 6: strays
 
 // Read-only. Reports; fixes nothing.
@@ -480,6 +532,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   lasttime: verifyLastTime,
   freshness: verifyFreshness,
   dismiss: verifyDismiss,
+  priceguard: verifyPriceGuard,
   strays: verifyStrays,
   tokens: verifyTokens,
 }

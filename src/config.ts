@@ -66,9 +66,15 @@ export const config = {
     // Domain words faster-whisper is told to expect. base.en has never heard
     // of most of these, and the ones it mishears it mishears expensively:
     // "RTX 3090" came back as "$30.90" in a live price question.
+    // The bare brand names survive on their own; the MODEL NUMBERS do not.
+    // Live testing heard "RTX 3090" as "RTX 39D" — the decoder got "RTX" and
+    // then guessed at four digits it had no reason to expect. Whole model
+    // names are listed for that reason, not for completeness: the hint slot
+    // competes with the audio, so a longer list makes every entry weaker.
     sttHotwords:
       process.env.IXA_STT_HOTWORDS ??
-      "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale",
+      "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale, " +
+        "RTX 3090, RTX 4090, RTX 5090",
     // How the hint list reaches faster-whisper: "hotwords", "prompt", "both"
     // or "off". Both mechanisms land in the same decoder slot and compose —
     // see sidecars/stt/hints.py.

@@ -89,7 +89,10 @@ export async function connect(): Promise<Client> {
 
   function await_(send: () => void): Promise<Reply> {
     return new Promise<Reply>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timed out after 180s")), 180_000)
+      // 300s, not 180s: a turn can now be a draft, a price-guard correction,
+      // two web_searches and a final reply, and a text-origin reply has no
+      // length constraint on it. One such turn measured 124s on its own.
+      const timer = setTimeout(() => reject(new Error("timed out after 300s")), 300_000)
       pending = {
         resolve: (reply) => {
           clearTimeout(timer)

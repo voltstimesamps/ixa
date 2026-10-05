@@ -54,7 +54,11 @@ cacheDir = os.path.join(repoRoot, "Ixa-Tests", "stt", "synthesized")
 modelName = os.environ.get("STT_MODEL", "base.en")
 ttsUrl = os.environ.get("TTS_URL", "http://localhost:5001")
 hintWords = parseHintWords(
-    os.environ.get("STT_HOTWORDS", "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale")
+    os.environ.get(
+        "STT_HOTWORDS",
+        "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale, "
+        "RTX 3090, RTX 4090, RTX 5090",
+    )
 )
 
 # expect: a substring the transcript must contain, case-insensitively.
@@ -68,6 +72,11 @@ DOMAIN_CASES = [
     ("qdrant", "Is Qdrant still up?", "qdrant"),
     ("ollama", "Restart Ollama for me.", "ollama"),
     ("tailscale", "Connect over Tailscale.", "tailscale"),
+    # Model NUMBERS, which fail separately from the brand: live testing heard
+    # "RTX 3090" as "RTX 39D", so the expectation is the digits, not "RTX".
+    ("rtx-4090", "Is the RTX 4090 overkill for this?", "4090"),
+    ("rtx-5090", "How much faster is the RTX 5090?", "5090"),
+    ("rtx-3090-again", "I am looking at a used RTX 3090.", "3090"),
 ]
 
 # Must transcribe to nothing. Named recordings only — synthesizing silence

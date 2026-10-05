@@ -8,6 +8,7 @@ import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
 import { runWithSessionControl } from "./session-context"
 import { shortenForSpeech } from "../voice/shorten"
+import { findCurrencyAmounts, priceCorrectionPrompt } from "./prices"
 import type { Connection } from "./connection"
 import type { PersistedSession } from "./session-store"
 
@@ -247,6 +248,11 @@ export class Session {
   // serialized on turnChain: only one turn is ever in flight.
   private recalled: string | null = null
 
+  // The price guard's corrective instruction, set for exactly one retry. Same
+  // single-field reasoning as `recalled`, and like it, never written to stored
+  // history — see priceCorrectionPrompt.
+  private priceCorrection: string | null = null
+
   // Set when a tool asked for this conversation to end (start_new_conversation).
   // Read and cleared by the manager at the turn boundary: ending the session
   // mid-turn would pull the history out from under the tool loop that is still
@@ -314,6 +320,7 @@ export class Session {
             throw err
           } finally {
             this.recalled = null
+            this.priceCorrection = null
           }
         }
       )
@@ -403,8 +410,18 @@ export class Session {
       messages = [...messages.slice(0, lead), ...injected, ...messages.slice(lead)]
     }
 
-    if (origin !== "voice") return messages
-    return [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+    if (origin === "voice") {
+      messages = [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+    }
+
+    // Last, so it is the most recent thing the model is told: it is a
+    // correction to the draft it just produced, and it outranks everything
+    // above it for this one call.
+    if (this.priceCorrection) {
+      messages = [...messages, { role: "system", content: this.priceCorrection }]
+    }
+
+    return messages
   }
 
   // Applies the spoken-length backstop to a voice reply, and says both what to
@@ -505,6 +522,14 @@ export class Session {
   private async runToolLoop(origin: MessageOrigin, connection: Connection): Promise<string> {
     const tools = registry.toOpenAI()
     let retrying = false
+    // Did a web_search actually happen in THIS turn? The freshness rule is
+    // about this turn's facts, so a search two turns ago does not license a
+    // price now.
+    let searchedThisTurn = false
+    // The price guard retries once and once only. A model that states prices
+    // twice is not going to stop on the third ask, and a loop here would spend
+    // the turn's budget arguing with it.
+    let priceGuardUsed = false
 
     for (let i = 0; i < 10; i++) {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
@@ -532,6 +557,30 @@ export class Session {
 
       if (response.type === "text") {
         if (response.content) {
+          // The price guard, before anything is recorded or delivered. The
+          // rejected draft is deliberately NOT pushed to history: the user
+          // never heard it, and history claiming she said it would be the same
+          // drift the turn-failure path exists to prevent.
+          const amounts = findCurrencyAmounts(response.content)
+          if (amounts.length > 0 && !searchedThisTurn) {
+            if (!priceGuardUsed) {
+              priceGuardUsed = true
+              this.priceCorrection = priceCorrectionPrompt(amounts)
+              console.log(
+                `price guard: draft stated ${amounts.join(", ")} with no web_search this turn — ` +
+                  `asking again`
+              )
+              continue
+            }
+            // Delivered anyway. Looping is worse than one unsearched price,
+            // and the user is waiting.
+            console.warn(
+              `price guard: second draft still states ${amounts.join(", ")} with no ` +
+                `web_search — delivering it`
+            )
+          }
+          this.priceCorrection = null
+
           const spoken = this.shortenIfSpoken(response.content, origin)
           this.messages.push({ role: "assistant", content: spoken.recorded })
           return spoken.text
@@ -575,6 +624,10 @@ export class Session {
         for (const tc of response.calls) {
           const tool = registry.get(tc.name)
           let result: string
+          // Whether the tool actually ran, as opposed to being unknown,
+          // declined or cancelled. The price guard asks "did a search
+          // happen", and a search the user declined did not happen.
+          let ran = false
 
           if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
             try {
@@ -609,10 +662,14 @@ export class Session {
               logToolCall(tool.name, "declined", askedAt, tc.arguments)
             } else {
               result = await this.executeTool(tool, tc)
+              ran = true
             }
           } else {
             result = await this.executeTool(tool, tc)
+            ran = true
           }
+
+          if (ran && tc.name === "web_search") searchedThisTurn = true
 
           if (tool?.name === "shell_write") {
             try {
