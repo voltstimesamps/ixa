@@ -8,7 +8,7 @@ import { createWsConfirmer, resolveConfirmation } from "../core/confirmation"
 import { speakStreaming } from "../voice/tts"
 import { sanitizeForSpeech } from "../voice/sanitize"
 import { transcribe, pcmToWav } from "../voice/stt"
-import { isDismissPhrase, DISMISS_ACKNOWLEDGMENT } from "../voice/dismiss"
+import { parseDismiss, DISMISS_ACKNOWLEDGMENT } from "../voice/dismiss"
 import type { WsMessage } from "./types"
 
 // Resolves with the server once it is listening. index.ts ignores the handle;
@@ -112,10 +112,19 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
       }
 
       // Exactly one terminator per accepted turn: "replyEnd" normally, or
-      // "sessionEnd" on a dismiss. A voice client stops its own conversation
-      // timeout for the duration of a turn, so without a terminator it has no
-      // way to know a text-only, empty or failed reply is over and would sit
-      // waiting until its own safety-net timeout.
+      // "sessionEnd" for a dismiss with nothing to answer. An utterance that
+      // asks something AND dismisses gets both, in that order — the turn's
+      // "replyEnd", then "sessionEnd" to close the window. Both clients cope
+      // with the pair: client.py handles frames in order and its "replyEnd"
+      // blocks in finishPlayback() until the speaker has drained, so the
+      // "sessionEnd" behind it lands after the answer has been heard, and the
+      // browser page's sleep() leaves playback running and resumes wake
+      // listening when it ends.
+      //
+      // A voice client stops its own conversation timeout for the duration of
+      // a turn, so without a terminator it has no way to know a text-only,
+      // empty or failed reply is over and would sit waiting until its own
+      // safety-net timeout.
       //
       // A failed turn is still a finished turn. It gets the same treatment as
       // a successful one — something to hear, then the terminator — and the
@@ -177,16 +186,27 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
                   // waiting on this turn, so it still needs its terminator.
                   console.log("STT: empty transcript, discarding")
                   send({ type: "replyEnd" })
-                } else if (isDismissPhrase(text)) {
+                } else {
                   // A dismiss closes the CLIENT's listening window, like the
                   // client-side conversation timeout. It does not end the
                   // session: with one shared session, a dismiss on one device
                   // would otherwise wipe context for every device.
-                  console.log("Dismiss phrase detected, ending listening window")
-                  await speak(DISMISS_ACKNOWLEDGMENT)
-                  send({ type: "sessionEnd" })
-                } else {
-                  await handleUserMessage(text, "voice")
+                  const dismiss = parseDismiss(text)
+                  if (dismiss.dismissed && dismiss.remainder) {
+                    // "What's the capital of Japan? Stop listening." — both
+                    // halves were meant, so answer first and close after.
+                    console.log(
+                      `Dismiss phrase after a question, answering first: ${JSON.stringify(dismiss.remainder)}`
+                    )
+                    await handleUserMessage(dismiss.remainder, "voice")
+                    send({ type: "sessionEnd" })
+                  } else if (dismiss.dismissed) {
+                    console.log("Dismiss phrase detected, ending listening window")
+                    await speak(DISMISS_ACKNOWLEDGMENT)
+                    send({ type: "sessionEnd" })
+                  } else {
+                    await handleUserMessage(text, "voice")
+                  }
                 }
               } catch (err) {
                 console.error("STT error:", err instanceof Error ? err.message : String(err))

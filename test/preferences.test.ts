@@ -140,15 +140,28 @@ test("the injected block is capped by row count, keeping the newest", () => {
 })
 
 test("the injected block is capped by characters", () => {
-  const store = makeStore({ maxInjected: 1000, maxChars: 260 })
+  // The cap is derived from the header rather than hardcoded. A fixed number
+  // silently stops testing the cap the moment the header text grows past it:
+  // with the header alone over budget, nothing is included and the assertion
+  // fails for a reason that has nothing to do with capping.
+  const measure = makeStore({ maxInjected: 1000, maxChars: 100_000 })
+  measure.remember({ topic: "topic 0", value: "x".repeat(40) })
+  const oneLine = measure.buildInjection().text!.length
+  const lineChars = 1 + "- [general] topic 0: ".length + 40
+  const cap = oneLine + lineChars * 2
+
+  const store = makeStore({ maxInjected: 1000, maxChars: cap })
   for (let i = 0; i < 20; i++) {
     store.remember({ topic: `topic ${i}`, value: "x".repeat(40) })
   }
 
   const result = store.buildInjection()
   assert.equal(result.truncated, true)
-  assert.ok(result.included > 0 && result.included < 20)
-  assert.ok(result.text!.length <= 260, `block is ${result.text!.length} chars, cap is 260`)
+  assert.ok(
+    result.included > 0 && result.included < 20,
+    `included ${result.included} of 20 under a ${cap}-char cap`
+  )
+  assert.ok(result.text!.length <= cap, `block is ${result.text!.length} chars, cap is ${cap}`)
 })
 
 test("an uncapped block reports no truncation and holds every preference", () => {

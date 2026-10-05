@@ -3,7 +3,7 @@ import { chat as defaultChat } from "../core/llm"
 import type { ChatFn, Session } from "../core/session"
 import type { SessionEndReason } from "../core/session-manager"
 import type { Embedder } from "./embeddings"
-import type { Episode, EpisodeStore } from "./episodes"
+import { formatEpisodeWhen, type Episode, type EpisodeStore } from "./episodes"
 import type { VectorIndex } from "./qdrant"
 import { countUserTurns, summarizeSession } from "./summarizer"
 
@@ -357,6 +357,38 @@ export class EpisodicMemory {
       )
     }
     return [RECALL_HEADER, ...lines].join("\n")
+  }
+
+  // One line naming the most recent conversation, injected into every LLM
+  // call. Null when there are no episodes yet.
+  //
+  // Why this exists at all: recall matches on MEANING, and "what did we talk
+  // about last time?" has no subject in it, so it embeds to a vector near
+  // nothing and falls under the score threshold. Nothing was injected, and the
+  // only memory-shaped text left in context was the preference block — so that
+  // is what the model answered from. Having search_memory answer recency
+  // (Phase 3c) was necessary but not sufficient: the model has to know there
+  // is something to look up before it will go looking.
+  //
+  // Deliberately not the summary, just when it was and what it was about:
+  // enough to recognise the question as answerable and to make the tool call,
+  // and small enough to afford on every call. The details come from the tool.
+  //
+  // Straight SQLite, like recent() — no embedding, no network, no timeout
+  // budget, so the one memory fact in every request survives Qdrant and Ollama
+  // both being down.
+  lastEpisodeLine(): string | null {
+    const [latest] = this.store.recent(1)
+    if (!latest) return null
+
+    const tags = latest.tags.length > 0 ? ` Its topics were: ${latest.tags.join(", ")}.` : ""
+    return (
+      `Your most recent conversation with the user ended ${formatEpisodeWhen(latest.endedAt)}.` +
+      `${tags} If the user asks what you talked about last time, or anything else about recency, ` +
+      `that is the conversation they mean — call search_memory with no query for what was ` +
+      `actually said. Do not answer from the preference block; a saved preference is a standing ` +
+      `instruction, not a record of a conversation.`
+    )
   }
 
   // The no-query half of search_memory: the N most recent episodes, newest

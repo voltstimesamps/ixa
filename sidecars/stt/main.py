@@ -8,12 +8,27 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from faster_whisper import WhisperModel
 
+from hints import hintArgs, parseHintWords, segmentRejection
+
 modelName = os.environ.get('STT_MODEL', 'base.en')
 port = int(os.environ.get('STT_PORT', '5002'))
+
+# Vocabulary hints and segment filtering. See hints.py for what each one is
+# for and which live mishearing it came from.
+hintMode = os.environ.get('STT_HINT_MODE', 'prompt')
+hintWords = parseHintWords(os.environ.get('STT_HOTWORDS', ''))
+hintKwargs = hintArgs(hintMode, hintWords)
+maxNoSpeechProb = float(os.environ.get('STT_MAX_NO_SPEECH_PROB', '0.6'))
+minAvgLogprob = float(os.environ.get('STT_MIN_AVG_LOGPROB', '-1.0'))
 
 print(f"Loading faster-whisper model '{modelName}'...")
 model = WhisperModel(modelName, device='cpu', compute_type='int8')
 print("faster-whisper ready.")
+if hintKwargs:
+    print(f"[STT] hint mode '{hintMode}' with {len(hintWords)} word(s): {', '.join(hintWords)}")
+else:
+    print(f"[STT] hint mode '{hintMode}' — no vocabulary hints")
+print(f"[STT] dropping segments with no_speech_prob > {maxNoSpeechProb} or avg_logprob < {minAvgLogprob}")
 
 
 def transcribeWav(wavBytes: bytes):
@@ -24,9 +39,22 @@ def transcribeWav(wavBytes: bytes):
             raise ValueError(f"expected 16-bit PCM, got {wf.getsampwidth() * 8}-bit")
 
     audioBuf = io.BytesIO(wavBytes)
-    segments, info = model.transcribe(audioBuf, beam_size=5, vad_filter=True)
-    text = "".join(segment.text for segment in segments).strip()
-    return text, info.language
+    segments, info = model.transcribe(audioBuf, beam_size=5, vad_filter=True, **hintKwargs)
+
+    # Filtering happens here, segment by segment, rather than on the joined
+    # text: the scores that say "this was invented" are per-segment, and a
+    # real utterance followed by a hallucinated tail should keep its first
+    # half. Dropping everything is a legitimate outcome — it returns the empty
+    # transcript the transport already handles as a false VAD trigger.
+    kept = []
+    for segment in segments:
+        rejection = segmentRejection(segment, maxNoSpeechProb, minAvgLogprob)
+        if rejection:
+            print(f"[STT] dropped segment ({rejection}): {segment.text.strip()!r}")
+            continue
+        kept.append(segment.text)
+
+    return "".join(kept).strip(), info.language
 
 
 class SttHandler(BaseHTTPRequestHandler):

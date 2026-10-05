@@ -7,6 +7,7 @@ import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
 import { runWithSessionControl } from "./session-context"
+import { shortenForSpeech } from "../voice/shorten"
 import type { Connection } from "./connection"
 import type { PersistedSession } from "./session-store"
 
@@ -40,7 +41,12 @@ export const SYSTEM_PROMPT =
   "position, this week's weather: search the web before you answer. Do not state a figure, a " +
   "model name or a date from memory and do not estimate one. If you cannot search, say plainly " +
   "that you are not sure and that the number may be out of date — a wrong price stated " +
-  "confidently costs the user money.\n\n" +
+  "confidently costs the user money.\n" +
+  "This is about the FACT, not about the question. It applies just as much when the user never " +
+  "asked: a price, a street price, an availability or a current product named in passing inside " +
+  "a recommendation, a comparison or an aside needs the same search a direct \"how much is it\" " +
+  "would. If you have not searched, name the product without the number and say you would have " +
+  "to look up what it costs now.\n\n" +
   "TOOLS. Use them whenever they are the right way to fulfill a request, and read their " +
   "descriptions for what each one does. For a purely conversational message with no action " +
   "required, just answer. When reading file contents, prefer head -n 50 over cat unless the " +
@@ -71,7 +77,17 @@ export const VOICE_RESPONSE_PROMPT =
   "\"there are a few more if you want them.\" Do not recite the list.\n" +
   "- If a full answer genuinely needs length or code, say so in a sentence and ask whether to go " +
   "on, rather than speaking an essay.\n" +
-  "Say the useful part first. The user can always ask for more."
+  "Say the useful part first. The user can always ask for more.\n\n" +
+  "This is the length that is wanted, in questions that all invite a list:\n" +
+  "User: Recommend some GPUs for a budget gaming build.\n" +
+  "Ixa: The RTX 3060 is the safe pick at that budget, or the 6700 XT if you want more VRAM for " +
+  "the money. I can go through a few others if you like.\n" +
+  "User: Why is my 3D print failing?\n" +
+  "Ixa: Nine times out of ten it is bed adhesion or a first layer printed too cold. Tell me what " +
+  "it looks like and I will narrow it down.\n" +
+  "User: How do I set up Tailscale on this machine?\n" +
+  "Ixa: Install the client, run tailscale up, and sign in — that is a basic node done. Do you " +
+  "want the exit-node version?"
 
 // Spoken when a turn fails, and recorded as the assistant's reply to the turn
 // that failed. Short, fixed, and free of any suggestion about what went wrong:
@@ -82,6 +98,10 @@ export const VOICE_RESPONSE_PROMPT =
 // the user HEARS and the words history SAYS they heard cannot drift apart.
 export const TURN_FAILURE_APOLOGY =
   "Sorry, something went wrong on my end. Could you try that again?"
+
+// A voice reply with no sentence boundary in it cannot be trimmed, so past
+// this length it is logged instead. Only diagnostics: nothing branches on it.
+const UNBROKEN_REPLY_CHARS = 400
 
 // How much of the underlying error goes into the bracketed reason. Enough to
 // tell a timeout from a dead backend, not so much that a stack-shaped message
@@ -174,6 +194,11 @@ export interface SessionOptions {
   // preference saved mid-turn applies to the very next one. Injected rather
   // than imported so Session stays unaware of SQLite and tests can stub it.
   preferenceBlock?: () => string | null
+  // Returns the one-line recency fact to inject, or null when there are no
+  // episodes. A function for the same reason preferenceBlock is one: it is a
+  // local SQLite read, so calling it per LLM call costs nothing and means a
+  // conversation that ends mid-session is reflected on the very next call.
+  lastEpisode?: () => string | null
   // Looks up episodes related to the user's message. Called ONCE per user
   // turn, before the first LLM call — not per call, because it costs a network
   // round trip and the question does not change inside a turn. Returns null
@@ -213,6 +238,7 @@ export class Session {
   private readonly limits: ContextWindowLimits
   private readonly chat: ChatFn
   private readonly preferenceBlock?: () => string | null
+  private readonly lastEpisode?: () => string | null
   private readonly recall?: (userInput: string) => Promise<string | null>
 
   // This turn's recalled episodes. Safe as a single field because turns are
@@ -244,6 +270,7 @@ export class Session {
     this.limits = options.limits
     this.chat = options.chat ?? defaultChat
     this.preferenceBlock = options.preferenceBlock
+    this.lastEpisode = options.lastEpisode
     this.recall = options.recall
   }
 
@@ -344,8 +371,8 @@ export class Session {
   // Builds the message array for one LLM call. Always a new array: stored
   // history is the record and is never trimmed or mutated here.
   //
-  // Order: system prompt, preferences, recalled episodes, windowed history,
-  // voice constraint.
+  // Order: system prompt, preferences, the recency line, recalled episodes,
+  // windowed history, voice constraint.
   //
   // Neither the preference block nor the voice constraint is ever written to
   // history. Both are statements about THIS call, not things that were said:
@@ -355,12 +382,16 @@ export class Session {
   private messagesForCall(origin: MessageOrigin): Message[] {
     const windowed = buildWindow(this.messages, this.limits)
 
-    // Both blocks go after the leading system prompt(s) and before any
+    // All three blocks go after the leading system prompt(s) and before any
     // history, preferences first: a standing instruction outranks a note about
-    // something that happened once.
+    // something that happened once. The recency line sits next to the recalled
+    // episodes because both are facts about past conversations, and before
+    // them because it is the one that is always true.
     const injected: Message[] = []
     const preferences = this.preferenceBlock?.()
     if (preferences) injected.push({ role: "system", content: preferences })
+    const lastEpisode = this.lastEpisode?.()
+    if (lastEpisode) injected.push({ role: "system", content: lastEpisode })
     if (this.recalled) injected.push({ role: "system", content: this.recalled })
 
     let messages = windowed
@@ -372,6 +403,49 @@ export class Session {
 
     if (origin !== "voice") return messages
     return [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+  }
+
+  // Applies the spoken-length backstop to a voice reply, and says both what to
+  // speak and what to record.
+  //
+  // The two differ by a bracketed note, the same trick turnFailureReply uses
+  // in reverse: what the user HEARS is the trimmed reply, and what history
+  // SAYS is that same text plus a note that it was shortened. That note is for
+  // the model — restored into this history it can see the answer was cut off
+  // and offer the rest, without having an example of a long spoken reply to
+  // imitate. The dropped sentences are deliberately not kept: if the user asks
+  // for more, generating it again under the same prompt is better than reciting
+  // a list the prompt exists to prevent.
+  //
+  // A text turn is returned untouched — a text client asked for text.
+  private shortenIfSpoken(
+    content: string,
+    origin: MessageOrigin
+  ): { text: string; recorded: string } {
+    if (origin !== "voice") return { text: content, recorded: content }
+
+    const result = shortenForSpeech(content, config.voice.maxSpokenSentences)
+    if (!result.trimmed) {
+      // Nothing to cut can still mean the reply was too long: one unbroken
+      // 200-word sentence has no boundary to cut at, and the backstop leaves
+      // it alone by design. Worth a line, because it is the one shape of
+      // over-long reply only the prompt can fix.
+      if (result.total <= 1 && content.length > UNBROKEN_REPLY_CHARS) {
+        console.log(
+          `voice backstop: nothing to trim — ${content.length} chars in one unbroken sentence`
+        )
+      }
+      return { text: content, recorded: content }
+    }
+
+    console.log(
+      `voice backstop: spoke ${result.kept} of ${result.total} sentences ` +
+        `(${content.length} chars → ${result.spoken.length})`
+    )
+    return {
+      text: result.spoken,
+      recorded: `${result.spoken} [reply shortened for speech: spoke ${result.kept} of ${result.total} sentences]`,
+    }
   }
 
   // Runs one tool call under the generic ceiling, and logs it. Every path
@@ -452,7 +526,9 @@ export class Session {
 
       if (response.type === "text") {
         if (response.content) {
-          this.messages.push({ role: "assistant", content: response.content })
+          const spoken = this.shortenIfSpoken(response.content, origin)
+          this.messages.push({ role: "assistant", content: spoken.recorded })
+          return spoken.text
         }
         return response.content
       }

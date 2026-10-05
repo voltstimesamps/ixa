@@ -51,6 +51,43 @@ export const config = {
     // whole point is that the client gets its terminator promptly. Generous,
     // because the first frame of a cold Kokoro waits on the model loading.
     ttsIdleTimeoutMs: parseInt(process.env.TTS_IDLE_TIMEOUT_MS ?? "20000"),
+    // Hard ceiling on how many spoken units (sentences, and the list items the
+    // sanitizer turns into sentences) a voice reply may contain. The backstop
+    // behind VOICE_RESPONSE_PROMPT, for the replies where the prompt loses.
+    // Set to 0 to turn it off, which is how the scoreboard measures the prompt
+    // change on its own.
+    maxSpokenSentences: parseInt(process.env.IXA_VOICE_MAX_SENTENCES ?? "3"),
+    // Domain words faster-whisper is told to expect. base.en has never heard
+    // of most of these, and the ones it mishears it mishears expensively:
+    // "RTX 3090" came back as "$30.90" in a live price question.
+    sttHotwords:
+      process.env.IXA_STT_HOTWORDS ??
+      "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale",
+    // How the hint list reaches faster-whisper: "hotwords", "prompt", "both"
+    // or "off". Both mechanisms land in the same decoder slot and compose —
+    // see sidecars/stt/hints.py.
+    //
+    // Measured in dev/scripts/stt-vocab-check.py: with no hints base.en got 9
+    // of 14 domain phrases, and "hotwords", "prompt" and "both" all got 14 of
+    // 14. "prompt" wins the tie on transcript quality — "hotwords" alone comes
+    // back as "is the RTX 3090 still worth buying." with no capital and no
+    // question mark, where "prompt" returns a properly formed sentence.
+    sttHintMode: process.env.IXA_STT_HINT_MODE ?? "prompt",
+    // Segment filtering, applied to faster-whisper's own per-segment scores.
+    // Whisper invents words over noise — a live session recorded "Please the
+    // President." as a user turn — and these are what drop them. Both are
+    // thresholds on the model's confidence, not on the text.
+    //
+    // 0.6 / -1.0 is the tightest pair that is SAFE: at 0.5 / -0.8 a
+    // synthesized "yes" is filtered away, and confirmations are answered with
+    // single words, so a threshold that drops one is wrong however many
+    // hallucinations it removes. Its benefit is not yet proven — the only
+    // noise sample on hand is digital silence, which transcribes to nothing
+    // either way, while the hallucination seen live came from a room with
+    // sound in it. Add a room-tone recording as Ixa-Tests/stt/noise-*.wav and
+    // the check script will measure it.
+    sttMaxNoSpeechProb: parseFloat(process.env.IXA_STT_MAX_NO_SPEECH_PROB ?? "0.6"),
+    sttMinAvgLogprob: parseFloat(process.env.IXA_STT_MIN_AVG_LOGPROB ?? "-1.0"),
   },
   qdrant: {
     url: process.env.QDRANT_URL ?? "http://localhost:6333",

@@ -433,3 +433,73 @@ test("summarizingChat wiring produces the tags that reach the payload", async ()
   assert.deepEqual(episode.tags, ["food", "coffee"])
   assert.deepEqual(harness.index.points.get(episode.id)!.payload.tags, ["food", "coffee"])
 })
+
+// ------------------------------------------------------- the recency line
+
+test("lastEpisodeLine names the most recent episode, with its tags", () => {
+  const { memory, store } = makeMemory()
+  const endedAt = new Date(2026, 9, 4, 16, 25).getTime()
+  store.save({
+    sessionId: "s-old",
+    startedAt: endedAt - 7_200_000,
+    endedAt: endedAt - 3_600_000,
+    summary: "An older conversation.",
+    tags: ["3d-printing"],
+  })
+  store.save({
+    sessionId: "s-new",
+    startedAt: endedAt - 600_000,
+    endedAt,
+    summary: "GPU options for a budget build.",
+    tags: ["gpu", "budget"],
+  })
+
+  const line = memory.lastEpisodeLine()!
+
+  assert.match(line, /most recent conversation/)
+  assert.match(line, /Sun, 4 Oct 2026, 16:25/)
+  assert.match(line, /gpu, budget/)
+  assert.ok(!line.includes("3d-printing"), "only the newest episode is named")
+  // The summary is deliberately left out: the line exists to make the model
+  // call search_memory, not to replace it.
+  assert.ok(!line.includes("GPU options for a budget build"), "the summary is not inlined")
+  assert.match(line, /search_memory/)
+  assert.match(line, /preference/)
+})
+
+test("lastEpisodeLine is null when there are no episodes", () => {
+  const { memory } = makeMemory()
+  assert.equal(memory.lastEpisodeLine(), null)
+})
+
+test("lastEpisodeLine omits the tag clause when an episode has no tags", () => {
+  const { memory, store } = makeMemory()
+  store.save({
+    sessionId: "s-untagged",
+    startedAt: Date.now() - 600_000,
+    endedAt: Date.now(),
+    summary: "Something.",
+    tags: [],
+  })
+
+  const line = memory.lastEpisodeLine()!
+  assert.ok(!line.includes("topics were"), "no empty topic list")
+  assert.match(line, /most recent conversation/)
+})
+
+// Recency is the one memory question that must survive an outage, because it
+// reads the source of truth rather than the index over it.
+test("lastEpisodeLine works with the embedder and index both down", () => {
+  const { memory, store, embedder, index } = makeMemory()
+  embedder.fail = new Error("ollama is down")
+  index.fail = new Error("qdrant is down")
+  store.save({
+    sessionId: "s-degraded",
+    startedAt: Date.now() - 600_000,
+    endedAt: Date.now(),
+    summary: "Something.",
+    tags: ["tts"],
+  })
+
+  assert.match(memory.lastEpisodeLine()!, /most recent conversation/)
+})

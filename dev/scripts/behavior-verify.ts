@@ -22,17 +22,29 @@
 // from the reply text: a model saying "I searched my memory" is exactly the
 // claim under test, so the evidence has to be the recorded tool_calls.
 import { execFileSync, spawn } from "child_process"
-import Database from "better-sqlite3"
 import OpenAI from "openai"
-import { WebSocket } from "ws"
 import { config } from "../../src/config"
+// The WS client and the audio helpers live in lib/voice.ts so this script and
+// voice-behavior-verify.ts drive a turn identically.
+import {
+  audioSeconds,
+  connect,
+  markdownIn,
+  say,
+  synthesize,
+} from "./lib/voice"
+import {
+  episodeRows,
+  liveSession,
+  messagesOf,
+  sessionRows,
+  toolCallsIn,
+} from "./lib/db"
 import "../../src/tools/register"
 import { registry } from "../../src/tools/registry"
 import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
 import { buildWindow } from "../../src/core/context-window"
 import type { Message } from "../../src/core/llm"
-
-const WS_URL = process.env.IXA_WS_URL ?? "ws://localhost:3001"
 
 let failures = 0
 
@@ -46,251 +58,6 @@ function section(title: string): void {
   console.log(`\n=== ${title} ===`)
 }
 
-// --------------------------------------------------------------- SQLite view
-
-interface SessionRow {
-  id: string
-  created_at: number
-  last_turn_at: number
-  ended_at: number | null
-  messages: string
-}
-
-interface StoredMessage {
-  role: string
-  content: string | null
-  tool_calls?: Array<{ function?: { name?: string; arguments?: string } }>
-  tool_call_id?: string
-}
-
-function withDb<T>(run: (db: Database.Database) => T): T {
-  const db = new Database(config.data.dbPath, { readonly: true })
-  try {
-    return run(db)
-  } finally {
-    db.close()
-  }
-}
-
-function sessionRows(): SessionRow[] {
-  return withDb((db) =>
-    db
-      .prepare("SELECT id, created_at, last_turn_at, ended_at, messages FROM sessions ORDER BY created_at")
-      .all() as SessionRow[]
-  )
-}
-
-function messagesOf(row: SessionRow): StoredMessage[] {
-  try {
-    return JSON.parse(row.messages) as StoredMessage[]
-  } catch {
-    return []
-  }
-}
-
-// Every tool name the session called, in order.
-function toolCallsIn(row: SessionRow): string[] {
-  return messagesOf(row).flatMap((message) =>
-    (message.tool_calls ?? []).map((call) => call.function?.name ?? "?")
-  )
-}
-
-function liveSession(): SessionRow | undefined {
-  return sessionRows().filter((row) => row.ended_at === null).at(-1)
-}
-
-function episodeRows(): Array<{ id: number; session_id: string; summary: string; indexed_at: number | null }> {
-  return withDb(
-    (db) =>
-      db.prepare("SELECT id, session_id, summary, indexed_at FROM episodes ORDER BY id").all() as Array<{
-        id: number
-        session_id: string
-        summary: string
-        indexed_at: number | null
-      }>
-  )
-}
-
-// ------------------------------------------------------------- WS client
-
-interface Reply {
-  text: string
-  audioChunks: Buffer[]
-  elapsedMs: number
-}
-
-interface Client {
-  ask(text: string): Promise<Reply>
-  askAudio(pcm16k: Buffer): Promise<Reply>
-  close(): Promise<void>
-}
-
-async function connect(): Promise<Client> {
-  const ws = new WebSocket(WS_URL)
-  await new Promise<void>((resolve, reject) => {
-    ws.once("open", () => resolve())
-    ws.once("error", reject)
-  })
-
-  let pending: {
-    resolve: (reply: Reply) => void
-    reject: (err: Error) => void
-    startedAt: number
-    text: string
-    chunks: Buffer[]
-  } | null = null
-
-  ws.on("message", (data, isBinary) => {
-    // Captured once: `pending` is cleared below, and narrowing a mutable
-    // closure variable does not survive that.
-    const turn = pending
-    if (!turn) return
-
-    if (isBinary) {
-      turn.chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer))
-      return
-    }
-
-    const msg = JSON.parse(data.toString()) as { type: string; content?: string }
-    if (msg.type === "assistant") turn.text = msg.content ?? ""
-    if (msg.type === "error") {
-      pending = null
-      turn.reject(new Error(msg.content ?? "ws error"))
-      return
-    }
-    // replyEnd is the one terminator per accepted turn: it arrives after the
-    // last audio chunk, so waiting on it means no chunk is missed.
-    if (msg.type === "replyEnd" || msg.type === "sessionEnd") {
-      pending = null
-      turn.resolve({ text: turn.text, audioChunks: turn.chunks, elapsedMs: Date.now() - turn.startedAt })
-    }
-  })
-
-  function await_(send: () => void): Promise<Reply> {
-    return new Promise<Reply>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timed out after 180s")), 180_000)
-      pending = {
-        resolve: (reply) => {
-          clearTimeout(timer)
-          resolve(reply)
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        },
-        startedAt: Date.now(),
-        text: "",
-        chunks: [],
-      }
-      send()
-    })
-  }
-
-  return {
-    ask: (text) => await_(() => ws.send(JSON.stringify({ type: "user", content: text }))),
-    askAudio: (pcm) =>
-      await_(() => {
-        ws.send(JSON.stringify({ type: "audioStart" }))
-        // 20ms of 16kHz mono 16-bit audio per frame, as the desktop client sends it.
-        for (let offset = 0; offset < pcm.length; offset += 640) {
-          ws.send(pcm.subarray(offset, Math.min(offset + 640, pcm.length)))
-        }
-        ws.send(JSON.stringify({ type: "audioInputEnd" }))
-      }),
-    close: () =>
-      new Promise<void>((resolve) => {
-        ws.once("close", () => resolve())
-        ws.close()
-      }),
-  }
-}
-
-async function say(client: Client, text: string): Promise<Reply> {
-  console.log(`  > ${text}`)
-  const reply = await client.ask(text)
-  console.log(`  < ${reply.text}  (${reply.elapsedMs}ms)`)
-  return reply
-}
-
-// --------------------------------------------------------------- audio
-
-// Each TTS frame is a standalone WAV. Pull the PCM out of the data chunk
-// rather than assuming a 44-byte header, since Python's wave module may emit
-// extra chunks.
-function pcmFromWav(wav: Buffer): { pcm: Buffer; sampleRate: number } {
-  const sampleRate = wav.readUInt32LE(24)
-  let offset = 12
-  while (offset + 8 <= wav.length) {
-    const id = wav.toString("ascii", offset, offset + 4)
-    const size = wav.readUInt32LE(offset + 4)
-    if (id === "data") {
-      return { pcm: wav.subarray(offset + 8, Math.min(offset + 8 + size, wav.length)), sampleRate }
-    }
-    offset += 8 + size + (size % 2)
-  }
-  return { pcm: Buffer.alloc(0), sampleRate }
-}
-
-// Linear resample, 24kHz (Kokoro) → 16kHz (what the STT path assumes).
-function resample(pcm: Buffer, from: number, to: number): Buffer {
-  if (from === to) return pcm
-  const inSamples = Math.floor(pcm.length / 2)
-  const outSamples = Math.floor((inSamples * to) / from)
-  const out = Buffer.alloc(outSamples * 2)
-  for (let i = 0; i < outSamples; i++) {
-    const position = (i * from) / to
-    const base = Math.floor(position)
-    const frac = position - base
-    const a = pcm.readInt16LE(Math.min(base, inSamples - 1) * 2)
-    const b = pcm.readInt16LE(Math.min(base + 1, inSamples - 1) * 2)
-    out.writeInt16LE(Math.round(a + (b - a) * frac), i * 2)
-  }
-  return out
-}
-
-// Speaks `text` with the TTS sidecar and returns it as 16kHz PCM, so a voice
-// turn can be driven end to end without a microphone.
-async function synthesize(text: string): Promise<Buffer> {
-  const response = await fetch(`${config.voice.ttsUrl}/speak`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  })
-  if (!response.ok) throw new Error(`TTS returned ${response.status}`)
-
-  const bytes = Buffer.from(await response.arrayBuffer())
-  const pieces: Buffer[] = []
-  let sampleRate = 24000
-  let offset = 0
-  while (offset + 4 <= bytes.length) {
-    const length = bytes.readUInt32BE(offset)
-    const frame = bytes.subarray(offset + 4, offset + 4 + length)
-    const { pcm, sampleRate: rate } = pcmFromWav(frame)
-    sampleRate = rate
-    pieces.push(pcm)
-    offset += 4 + length
-  }
-  return resample(Buffer.concat(pieces), sampleRate, 16000)
-}
-
-function audioSeconds(chunks: Buffer[]): number {
-  let samples = 0
-  let rate = 24000
-  for (const chunk of chunks) {
-    const { pcm, sampleRate } = pcmFromWav(chunk)
-    rate = sampleRate
-    samples += pcm.length / 2
-  }
-  return samples / rate
-}
-
-const MARKDOWN_MARKERS = ["**", "__", "##", "```", "- ", "* ", "](", "~~"]
-
-function markdownIn(text: string): string[] {
-  const found = MARKDOWN_MARKERS.filter((marker) => text.includes(marker))
-  if (/^\s*\d+[.)]\s/m.test(text)) found.push("numbered list")
-  return found
-}
 
 // ------------------------------------------------------------------ a: REPL
 

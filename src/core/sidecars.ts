@@ -24,8 +24,15 @@ const specs: SidecarSpec[] = [
     name: "stt",
     dir: path.join(repoRoot, "sidecars", "stt"),
     url: config.voice.sttUrl,
-    // main.py reads both of these; STT_PORT must agree with STT_URL.
-    env: { STT_MODEL: config.voice.sttModel, STT_PORT: String(portOf(config.voice.sttUrl)) },
+    // main.py reads all of these; STT_PORT must agree with STT_URL.
+    env: {
+      STT_MODEL: config.voice.sttModel,
+      STT_PORT: String(portOf(config.voice.sttUrl)),
+      STT_HOTWORDS: config.voice.sttHotwords,
+      STT_HINT_MODE: config.voice.sttHintMode,
+      STT_MAX_NO_SPEECH_PROB: String(config.voice.sttMaxNoSpeechProb),
+      STT_MIN_AVG_LOGPROB: String(config.voice.sttMinAvgLogprob),
+    },
   },
   {
     name: "tts",

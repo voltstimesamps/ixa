@@ -1,5 +1,5 @@
 import { getEpisodicMemory } from "../memory/episodic-memory"
-import type { Episode } from "../memory/episodes"
+import { formatEpisodeWhen, type Episode } from "../memory/episodes"
 import type { Tool } from "./registry"
 
 // requiresConfirmation: false — this only reads Ixa's own memory of past
@@ -48,21 +48,10 @@ function parseDate(value: string | undefined, endOfDay: boolean): number | undef
   return date.getTime()
 }
 
-// Local time, matching parseDate. The time of day is included, not just the
-// date: with no query the results are a recency list, and two conversations on
-// the same day would otherwise render identically and leave the model unable
-// to say which was the last one.
+// Local time, matching parseDate — see formatEpisodeWhen for why.
 function formatEpisode(episode: Episode): string {
-  const when = new Date(episode.endedAt).toLocaleString("en-GB", {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  })
   const tags = episode.tags.length > 0 ? ` [${episode.tags.join(", ")}]` : ""
-  return `- ${when}: ${episode.summary}${tags}`
+  return `- ${formatEpisodeWhen(episode.endedAt)}: ${episode.summary}${tags}`
 }
 
 export const searchMemoryTool: Tool = {

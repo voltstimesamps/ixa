@@ -55,9 +55,17 @@ export interface PreferenceLimits {
 
 const DEFAULT_CATEGORY = "general"
 
+// The second sentence is there because of a live failure, not for tidiness:
+// asked "what did we talk about last time?", Ixa answered from this list. It
+// was the only memory-shaped text in the request — recall matches on meaning
+// and a question with no subject matches nothing — so the model read standing
+// instructions as a record of conversations. The recency line that now ships
+// alongside this block is the other half of that fix.
 const INJECTION_HEADER =
   "The user's saved preferences, from your long-term memory. Apply them without " +
-  "being asked, unless the user overrides one in this conversation."
+  "being asked, unless the user overrides one in this conversation. These are standing " +
+  "instructions, NOT a record of past conversations: never answer a question about what you " +
+  "talked about, or when, from this list — that is what search_memory is for."
 
 interface PreferenceRow {
   id: number

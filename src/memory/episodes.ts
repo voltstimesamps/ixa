@@ -40,6 +40,26 @@ interface EpisodeRow {
   created_at: number
 }
 
+// When an episode ended, in the BACKEND'S LOCAL TIMEZONE — the user means
+// their own Tuesday, not UTC's, and search_memory's date bounds are parsed
+// locally too, so the two have to be rendered in the same zone to agree.
+//
+// The time of day is included, not just the date. Two conversations on the
+// same day would otherwise render identically, leaving the model unable to say
+// which was the last one. Shared so the recency line injected into context and
+// the search_memory results the model reads back cannot describe the same
+// episode two different ways.
+export function formatEpisodeWhen(timestamp: number): string {
+  return new Date(timestamp).toLocaleString("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
 function toEpisode(row: EpisodeRow): Episode {
   let tags: string[] = []
   try {

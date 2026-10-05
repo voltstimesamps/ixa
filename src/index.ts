@@ -41,6 +41,7 @@ async function main() {
       budgetChars: config.session.contextBudgetChars,
     },
     preferenceBlock: () => preferences.injectionBlock(),
+    lastEpisode: () => memory.lastEpisodeLine(),
     recall: (userInput) => memory.recall(userInput),
     // Sessions now survive a backend restart. InMemorySessionStore stays the
     // default inside the manager, which is what the tests use.

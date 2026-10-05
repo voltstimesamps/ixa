@@ -20,6 +20,7 @@ interface Harness {
   preferences: PreferenceStore
   recallCalls: string[]
   setRecall: (value: string | null) => void
+  setLastEpisode: (value: string | null) => void
 }
 
 function setup(options: { limits?: typeof TEST_LIMITS } = {}): Harness {
@@ -30,12 +31,14 @@ function setup(options: { limits?: typeof TEST_LIMITS } = {}): Harness {
   const sent: Message[][] = []
   const recallCalls: string[] = []
   let recalled: string | null = null
+  let lastEpisode: string | null = null
 
   const sessions = new SessionManager({
     idleTimeoutMs: 60_000,
     limits: options.limits ?? TEST_LIMITS,
     chat: recordingChat(sent),
     preferenceBlock: () => preferences.injectionBlock(),
+    lastEpisode: () => lastEpisode,
     recall: async (userInput) => {
       recallCalls.push(userInput)
       return recalled
@@ -49,6 +52,9 @@ function setup(options: { limits?: typeof TEST_LIMITS } = {}): Harness {
     recallCalls,
     setRecall: (value) => {
       recalled = value
+    },
+    setLastEpisode: (value) => {
+      lastEpisode = value
     },
   }
 }
@@ -236,4 +242,82 @@ test("a recall that rejects does not take the turn down with it", async () => {
 
   sessions.shutdown()
   working.shutdown()
+})
+
+// --------------------------------------------------- the recency line (item 2)
+//
+// "What did we talk about last time?" was answered from the preference block,
+// because recall matches on meaning and that question has no subject in it, so
+// the preferences were the only memory-shaped text in the request. These cover
+// the line that now says there IS a last conversation.
+
+test("the recency line is injected between preferences and recalled episodes", async () => {
+  const h = setup()
+  h.preferences.remember({ topic: "coffee", value: "black", category: "food" })
+  h.setLastEpisode("Your most recent conversation with the user ended Sat 4 Oct 2026, 16:25.")
+  h.setRecall("Notes from earlier conversations.\n- Tue, 29 Sept 2026: Fixed the TTS chunking.")
+
+  await h.sessions.submitTurn("what did we talk about last time?", makeConnection({ id: "r1" }), "text")
+
+  const messages = h.sent.at(-1)!
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "system", "system", "user"])
+  assert.match(String(messages[1]!.content), /saved preferences/)
+  assert.match(String(messages[2]!.content), /most recent conversation/)
+  assert.match(String(messages[3]!.content), /earlier conversations/)
+
+  h.sessions.shutdown()
+})
+
+test("the recency line is injected with no preferences and no recall", async () => {
+  const h = setup()
+  h.setLastEpisode("Your most recent conversation with the user ended Sat 4 Oct 2026, 16:25.")
+
+  await h.sessions.submitTurn("what did we talk about?", makeConnection({ id: "r2" }), "text")
+
+  const messages = h.sent.at(-1)!
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
+  assert.match(String(messages[1]!.content), /most recent conversation/)
+
+  h.sessions.shutdown()
+})
+
+test("nothing is injected when there are no episodes to name", async () => {
+  const h = setup()
+  h.setLastEpisode(null)
+
+  await h.sessions.submitTurn("hello", makeConnection({ id: "r3" }), "text")
+
+  const messages = h.sent.at(-1)!
+  assert.deepEqual(messages.map((m) => m.role), ["system", "user"])
+
+  h.sessions.shutdown()
+})
+
+test("the recency line is rebuilt per call, so an episode saved mid-session appears", async () => {
+  const h = setup()
+  h.setLastEpisode(null)
+  await h.sessions.submitTurn("one", makeConnection({ id: "r4" }), "text")
+  assert.deepEqual(h.sent.at(-1)!.map((m) => m.role), ["system", "user"])
+
+  h.setLastEpisode("Your most recent conversation with the user ended Sat 4 Oct 2026, 16:25.")
+  await h.sessions.submitTurn("two", makeConnection({ id: "r4" }), "text")
+
+  const messages = h.sent.at(-1)!
+  assert.equal(messages[1]!.role, "system")
+  assert.match(String(messages[1]!.content), /most recent conversation/)
+
+  h.sessions.shutdown()
+})
+
+test("the preference block says it is not a record of past conversations", async () => {
+  const h = setup()
+  h.preferences.remember({ topic: "coffee", value: "black", category: "food" })
+
+  await h.sessions.submitTurn("hello", makeConnection({ id: "r5" }), "text")
+
+  const block = String(h.sent.at(-1)![1]!.content)
+  assert.match(block, /NOT a record of past conversations/)
+  assert.match(block, /search_memory/)
+
+  h.sessions.shutdown()
 })
