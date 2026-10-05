@@ -1,5 +1,5 @@
 // The length backstop behind VOICE_RESPONSE_PROMPT: speak at most N spoken
-// units and offer the rest.
+// units and no more than W words, and offer the rest.
 //
 // The prompt (and now its examples) is the mechanism. This is what happens
 // when the model ignores it anyway — one live reply named four GPUs where the
@@ -15,6 +15,13 @@
 //      the sanitizer's job.
 //   3. VOICE-ORIGIN TURNS ONLY. The caller enforces that; a text client asked
 //      for text and gets all of it.
+//
+// There are TWO limits because measurement showed one was not enough. Over six
+// list-tempting questions the model kept to three sentences and then wrote
+// sentences of 5 to 12 seconds each, so a unit count bounded the number of full
+// stops and not the length of the reply. Words are the better proxy for spoken
+// duration; the unit count stays because it is what stops a six-item list, and
+// whichever limit binds first applies.
 //
 // "Spoken unit", not "sentence", because the thing being counted is how many
 // times the listener hears a full stop — and the sanitizer already turns a
@@ -37,6 +44,13 @@ const ABBREVIATIONS = new Set([
   "eg", "ie", "am", "pm", "us", "uk",
 ])
 
+// Both limits; either can be disabled with a value below one, which is how the
+// scoreboard measures the prompt change with no backstop at all.
+export interface SpokenLimits {
+  maxUnits: number
+  maxWords: number
+}
+
 export interface Shortened {
   // What to speak, send to the client and record. The original text when
   // nothing was trimmed.
@@ -45,6 +59,16 @@ export interface Shortened {
   // Units kept and units found. Equal when nothing was trimmed.
   kept: number
   total: number
+  // Words in the units kept, and in the whole reply. The offer is not counted
+  // in either: it is the backstop talking, not the answer.
+  words: number
+  totalWords: number
+}
+
+// Whitespace-separated runs that contain at least one letter or digit, so a
+// lone dash or ellipsis between clauses is not charged to the budget.
+function countWords(text: string): number {
+  return (text.match(/[^\s]+/g) ?? []).filter((token) => /[a-z0-9]/i.test(token)).length
 }
 
 // Where one spoken unit ends, as an offset into the original text.
@@ -119,27 +143,49 @@ function isRealBoundary(text: string, start: number, cursor: number, unitStart: 
   return true
 }
 
-export function shortenForSpeech(text: string, maxUnits: number): Shortened {
-  const whole = (count: number): Shortened => ({
+function enabled(limit: number): boolean {
+  return Number.isFinite(limit) && limit >= 1
+}
+
+export function shortenForSpeech(text: string, limits: SpokenLimits): Shortened {
+  const ends = unitEnds(text)
+  const totalWords = countWords(text)
+
+  const whole = (): Shortened => ({
     spoken: text,
     trimmed: false,
-    kept: count,
-    total: count,
+    kept: ends.length,
+    total: ends.length,
+    words: totalWords,
+    totalWords,
   })
 
-  if (!text.trim()) return whole(0)
-  // Zero or less turns the backstop off, which is what the scoreboard uses to
-  // measure the prompt change on its own.
-  if (!Number.isFinite(maxUnits) || maxUnits < 1) return whole(unitEnds(text).length)
+  if (!text.trim()) return whole()
+  if (!enabled(limits.maxUnits) && !enabled(limits.maxWords)) return whole()
 
-  const ends = unitEnds(text)
-  if (ends.length <= maxUnits) return whole(ends.length)
+  // Walk whole units, charging each one's words to the budget. The first unit
+  // is always kept: a single sentence over the word budget has no boundary
+  // inside it to cut at, and speaking a long sentence beats speaking none.
+  let kept = 0
+  let words = 0
+  for (let i = 0; i < ends.length; i++) {
+    const unit = text.slice(i === 0 ? 0 : ends[i - 1]!, ends[i]!)
+    const unitWords = countWords(unit)
+    if (kept > 0) {
+      if (enabled(limits.maxUnits) && kept >= limits.maxUnits) break
+      if (enabled(limits.maxWords) && words + unitWords > limits.maxWords) break
+    }
+    kept++
+    words += unitWords
+  }
 
-  const kept = text.slice(0, ends[maxUnits - 1]!).trimEnd()
+  if (kept >= ends.length) return whole()
+
+  const prefix = text.slice(0, ends[kept - 1]!).trimEnd()
 
   // An offer after a question would be a second question in a row, and the
   // model's own closing question already invites the follow-up.
-  const spoken = kept.endsWith("?") ? kept : `${kept} ${CONTINUE_OFFER}`
+  const spoken = prefix.endsWith("?") ? prefix : `${prefix} ${CONTINUE_OFFER}`
 
-  return { spoken, trimmed: true, kept: maxUnits, total: ends.length }
+  return { spoken, trimmed: true, kept, total: ends.length, words, totalWords }
 }

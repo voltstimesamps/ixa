@@ -36,6 +36,7 @@ import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
 import { shortenForSpeech, CONTINUE_OFFER } from "../../src/voice/shorten"
 import { parseDismiss } from "../../src/voice/dismiss"
 import { getPreferenceStore } from "../../src/memory/preferences"
+import { formatEpisodeWhen, getEpisodeStore } from "../../src/memory/episodes"
 import {
   audioSeconds,
   connect,
@@ -90,11 +91,21 @@ const LIST_TEMPTING = [
 
 async function verifyScoreboard(): Promise<void> {
   section("1. spoken length on six list-tempting voice questions")
-  console.log(`  backstop: ${config.voice.maxSpokenSentences === 0 ? "OFF" : `${config.voice.maxSpokenSentences} sentences`}`)
+  const limitsOff = config.voice.maxSpokenSentences < 1 && config.voice.maxSpokenWords < 1
+  console.log(
+    `  backstop: ${limitsOff ? "OFF (both limits disabled)" : `${config.voice.maxSpokenSentences} sentences / ${config.voice.maxSpokenWords} words`}`
+  )
   console.log(`  model:    ${config.llm.model}\n`)
 
   const firesBefore = backstopFiresInHistory().length
-  const rows: Array<{ question: string; seconds: number; sentences: number; chars: number; markdown: string[] }> = []
+  const rows: Array<{
+    question: string
+    seconds: number
+    sentences: number
+    words: number
+    chars: number
+    markdown: string[]
+  }> = []
 
   const client = await connect()
   for (const question of LIST_TEMPTING) {
@@ -118,12 +129,20 @@ async function verifyScoreboard(): Promise<void> {
     // would otherwise count as the limit plus one and fail a check it actually
     // passed. The column means sentences OF ANSWER.
     const trimmed = reply.text.trimEnd().endsWith(CONTINUE_OFFER)
-    const sentences = shortenForSpeech(reply.text, 0).total - (trimmed ? 1 : 0)
-    rows.push({ question, seconds, sentences, chars: reply.text.length, markdown: markdownIn(reply.text) })
+    const counted = shortenForSpeech(reply.text, { maxUnits: 0, maxWords: 0 })
+    const sentences = counted.total - (trimmed ? 1 : 0)
+    // The offer is the backstop talking, not the answer, so it is excluded from
+    // both counts — otherwise a reply that landed exactly on budget reads as
+    // over it.
+    const offerWords = trimmed
+      ? shortenForSpeech(CONTINUE_OFFER, { maxUnits: 0, maxWords: 0 }).totalWords
+      : 0
+    const words = counted.totalWords - offerWords
+    rows.push({ question, seconds, sentences, words, chars: reply.text.length, markdown: markdownIn(reply.text) })
     console.log(`  < ${reply.text}`)
     console.log(
-      `    ${seconds.toFixed(1)}s spoken, ${sentences} sentence(s)${trimmed ? " + offer" : ""}, ` +
-        `${reply.text.length} chars\n`
+      `    ${seconds.toFixed(1)}s spoken, ${words} word(s), ${sentences} sentence(s)` +
+        `${trimmed ? " + offer" : ""}, ${reply.text.length} chars\n`
     )
   }
   await client.close()
@@ -131,11 +150,11 @@ async function verifyScoreboard(): Promise<void> {
   const fires = backstopFiresInHistory().slice(firesBefore)
 
   console.log("  scoreboard:")
-  console.log("    seconds  sentences  chars  question")
+  console.log("    seconds  words  sentences  question")
   for (const row of rows) {
     console.log(
-      `    ${row.seconds.toFixed(1).padStart(7)}  ${String(row.sentences).padStart(9)}  ` +
-        `${String(row.chars).padStart(5)}  ${row.question.slice(0, 46)}`
+      `    ${row.seconds.toFixed(1).padStart(7)}  ${String(row.words).padStart(5)}  ` +
+        `${String(row.sentences).padStart(9)}  ${row.question.slice(0, 46)}`
     )
   }
 
@@ -146,9 +165,15 @@ async function verifyScoreboard(): Promise<void> {
   const overLimit = rows.filter((row) => row.sentences > Math.max(1, config.voice.maxSpokenSentences))
   const withMarkdown = rows.filter((row) => row.markdown.length > 0)
 
+  const wordCounts = rows.map((row) => row.words)
+  const meanWords = wordCounts.reduce((sum, value) => sum + value, 0) / (answered || 1)
+  const worstWords = Math.max(0, ...wordCounts)
+
   console.log(`\n  answered:        ${answered}/${LIST_TEMPTING.length}`)
   console.log(`  mean spoken:     ${mean.toFixed(1)}s`)
   console.log(`  longest spoken:  ${worst.toFixed(1)}s`)
+  console.log(`  mean words:      ${meanWords.toFixed(1)}`)
+  console.log(`  most words:      ${worstWords}`)
   console.log(`  backstop fired:  ${fires.length}/${answered}${fires.length ? ` (${fires.map((f) => `${f.kept}/${f.total}`).join(", ")})` : ""}`)
   console.log(`  markdown:        ${withMarkdown.length}/${answered}`)
 
@@ -162,6 +187,13 @@ async function verifyScoreboard(): Promise<void> {
     `  (seconds per sentence: ${rows.map((row) => (row.sentences ? (row.seconds / row.sentences).toFixed(1) : "-")).join(", ")})`
   )
   check("no markdown reached TTS", withMarkdown.length === 0, withMarkdown.map((row) => row.markdown.join(" ")).join("; "))
+  if (!limitsOff) {
+    check(
+      "no spoken reply exceeded the word budget",
+      worstWords <= config.voice.maxSpokenWords,
+      `most ${worstWords}, budget ${config.voice.maxSpokenWords}`
+    )
+  }
   if (config.voice.maxSpokenSentences > 0) {
     check(
       "no spoken reply exceeded the sentence limit",
@@ -396,15 +428,14 @@ async function verifyTokens(): Promise<void> {
     return response.usage?.prompt_tokens ?? -1
   }
 
-  // The recency line, built from a real episode where there is one so the
-  // measurement is of the thing that actually ships.
+  // The recency line as the code actually builds it, from a real episode where
+  // there is one, so this measures what ships rather than a paraphrase.
   const episodes = episodeRows()
-  const recencyLine =
-    "Your most recent conversation with the user ended Sun, 4 Oct 2026, 16:25. Its topics were: " +
-    "gpu, budget. If the user asks what you talked about last time, or anything else about " +
-    "recency, that is the conversation they mean — call search_memory with no query for what " +
-    "was actually said. Do not answer from the preference block; a saved preference is a " +
-    "standing instruction, not a record of a conversation."
+  const newest = episodes.length > 0 ? getEpisodeStore().byId(episodes.at(-1)!.id) : null
+  const recencyLine = newest
+    ? `Your most recent conversation with the user ended ${formatEpisodeWhen(newest.endedAt)}` +
+      `${newest.tags.length > 0 ? ` [${newest.tags.join(", ")}]` : ""}.`
+    : "Your most recent conversation with the user ended Sun, 4 Oct 2026, 16:25 [gpu, budget]."
 
   const pieces: Array<[string, string]> = [
     ["SYSTEM_PROMPT", SYSTEM_PROMPT],

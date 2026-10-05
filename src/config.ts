@@ -57,6 +57,12 @@ export const config = {
     // Set to 0 to turn it off, which is how the scoreboard measures the prompt
     // change on its own.
     maxSpokenSentences: parseInt(process.env.IXA_VOICE_MAX_SENTENCES ?? "3"),
+    // The other half of the same backstop, and in practice the binding one.
+    // Measured: the model keeps to three sentences and then writes sentences of
+    // 5 to 12 seconds each, so counting full stops bounded the number of pauses
+    // and not the length of the reply. 40 words is a little above the ~35 the
+    // prompt asks for, so an answer that lands on budget is never cut.
+    maxSpokenWords: parseInt(process.env.IXA_VOICE_MAX_WORDS ?? "40"),
     // Domain words faster-whisper is told to expect. base.en has never heard
     // of most of these, and the ones it mishears it mishears expensively:
     // "RTX 3090" came back as "$30.90" in a live price question.

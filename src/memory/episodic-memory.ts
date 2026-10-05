@@ -370,9 +370,14 @@ export class EpisodicMemory {
   // (Phase 3c) was necessary but not sufficient: the model has to know there
   // is something to look up before it will go looking.
   //
-  // Deliberately not the summary, just when it was and what it was about:
-  // enough to recognise the question as answerable and to make the tool call,
-  // and small enough to afford on every call. The details come from the tool.
+  // Deliberately the date, the time and the tags and nothing else: enough to
+  // recognise a question about recency as answerable, and small enough to
+  // afford on every call. The summary is not inlined and the tool is not
+  // explained here — SYSTEM_PROMPT already says past conversations can be
+  // searched, search_memory's own description says a question about recency
+  // needs it with no query, and the preference block's header says not to
+  // answer from preferences. Repeating all of that per call cost 160 tokens to
+  // say what three other places already said.
   //
   // Straight SQLite, like recent() — no embedding, no network, no timeout
   // budget, so the one memory fact in every request survives Qdrant and Ollama
@@ -381,14 +386,8 @@ export class EpisodicMemory {
     const [latest] = this.store.recent(1)
     if (!latest) return null
 
-    const tags = latest.tags.length > 0 ? ` Its topics were: ${latest.tags.join(", ")}.` : ""
-    return (
-      `Your most recent conversation with the user ended ${formatEpisodeWhen(latest.endedAt)}.` +
-      `${tags} If the user asks what you talked about last time, or anything else about recency, ` +
-      `that is the conversation they mean — call search_memory with no query for what was ` +
-      `actually said. Do not answer from the preference block; a saved preference is a standing ` +
-      `instruction, not a record of a conversation.`
-    )
+    const tags = latest.tags.length > 0 ? ` [${latest.tags.join(", ")}]` : ""
+    return `Your most recent conversation with the user ended ${formatEpisodeWhen(latest.endedAt)}${tags}.`
   }
 
   // The no-query half of search_memory: the N most recent episodes, newest

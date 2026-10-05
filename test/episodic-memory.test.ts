@@ -458,13 +458,15 @@ test("lastEpisodeLine names the most recent episode, with its tags", () => {
 
   assert.match(line, /most recent conversation/)
   assert.match(line, /Sun, 4 Oct 2026, 16:25/)
-  assert.match(line, /gpu, budget/)
+  assert.match(line, /\[gpu, budget\]/)
   assert.ok(!line.includes("3d-printing"), "only the newest episode is named")
   // The summary is deliberately left out: the line exists to make the model
-  // call search_memory, not to replace it.
+  // reach for search_memory, not to replace it.
   assert.ok(!line.includes("GPU options for a budget build"), "the summary is not inlined")
-  assert.match(line, /search_memory/)
-  assert.match(line, /preference/)
+  // Date, time and tags and nothing else. SYSTEM_PROMPT, the search_memory
+  // description and the preference header already carry the instructions this
+  // line used to repeat on every call.
+  assert.ok(line.length <= 130, `${line.length} chars`)
 })
 
 test("lastEpisodeLine is null when there are no episodes", () => {
@@ -483,7 +485,7 @@ test("lastEpisodeLine omits the tag clause when an episode has no tags", () => {
   })
 
   const line = memory.lastEpisodeLine()!
-  assert.ok(!line.includes("topics were"), "no empty topic list")
+  assert.ok(!line.includes("["), "no empty tag list")
   assert.match(line, /most recent conversation/)
 })
 

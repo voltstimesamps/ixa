@@ -65,8 +65,30 @@ test("a voice reply within the limit is recorded with no note", async () => {
   sessions.shutdown()
 })
 
-// The default the backstop ships with. If this changes, the scoreboard numbers
+// The defaults the backstop ships with. If these change, the scoreboard numbers
 // in ARCHITECTURE.md stop describing the thing that shipped.
-test("the configured default is three spoken sentences", () => {
+test("the configured defaults are three sentences and forty words", () => {
   assert.equal(config.voice.maxSpokenSentences, 3)
+  assert.equal(config.voice.maxSpokenWords, 40)
+})
+
+// The word budget is the limit that usually binds, so it needs its own wiring
+// test: three sentences can be well over forty words.
+test("a voice reply over the word budget is shortened even within three sentences", async () => {
+  const wordy =
+    "The RTX 3060 is the safe pick at that budget because it has twelve gigabytes of memory. " +
+    "The 6700 XT costs a little more but gives you more memory for the money if you can stretch. " +
+    "The 4070 is faster again but runs well past what you said you wanted to spend."
+  const sessions = manager(wordy)
+
+  const spoken = await sessions.submitTurn("recommend some GPUs", makeConnection({ id: "v5" }), "voice")
+
+  assert.ok(spoken.length < wordy.length, "the reply was shortened")
+  assert.ok(spoken.endsWith(CONTINUE_OFFER), "the offer was appended")
+  assert.ok(!spoken.includes("4070"), "the third sentence was dropped")
+
+  const recorded = String(sessions.primarySession().history().at(-1)!.content)
+  assert.match(recorded, /\[reply shortened for speech: spoke \d+ of 3 sentences\]$/)
+
+  sessions.shutdown()
 })

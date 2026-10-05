@@ -68,8 +68,10 @@ const DESCRIBE_ACTION_PROMPT =
 // almost any question can be read as inviting detail.
 export const VOICE_RESPONSE_PROMPT =
   "THIS REPLY WILL BE SPOKEN ALOUD. It is read by a speech synthesizer, not shown as text.\n" +
-  "- Length: one to three short sentences. That is the default, not a target to beat. Roughly " +
-  "fifteen seconds of speech is already long for a spoken answer.\n" +
+  "- Length: about THIRTY-FIVE WORDS in total, in one to three short sentences. That is the " +
+  "default, not a target to beat. Keep the sentences short too — one that runs past about " +
+  "fifteen words takes too long to say out loud, so split it or cut it. Roughly fifteen seconds " +
+  "of speech is already long for a spoken answer.\n" +
   "- No formatting of any kind: no numbered or bulleted lists, no headings, no bold or italics, " +
   "no code blocks, no tables, no links. None of it exists in speech — it is read out as literal " +
   "asterisks and numbers. Write plain spoken sentences.\n" +
@@ -78,7 +80,7 @@ export const VOICE_RESPONSE_PROMPT =
   "- If a full answer genuinely needs length or code, say so in a sentence and ask whether to go " +
   "on, rather than speaking an essay.\n" +
   "Say the useful part first. The user can always ask for more.\n\n" +
-  "This is the length that is wanted, in questions that all invite a list:\n" +
+  "These are the right length — about thirty words each — in questions that all invite a list:\n" +
   "User: Recommend some GPUs for a budget gaming build.\n" +
   "Ixa: The RTX 3060 is the safe pick at that budget, or the 6700 XT if you want more VRAM for " +
   "the money. I can go through a few others if you like.\n" +
@@ -424,7 +426,10 @@ export class Session {
   ): { text: string; recorded: string } {
     if (origin !== "voice") return { text: content, recorded: content }
 
-    const result = shortenForSpeech(content, config.voice.maxSpokenSentences)
+    const result = shortenForSpeech(content, {
+      maxUnits: config.voice.maxSpokenSentences,
+      maxWords: config.voice.maxSpokenWords,
+    })
     if (!result.trimmed) {
       // Nothing to cut can still mean the reply was too long: one unbroken
       // 200-word sentence has no boundary to cut at, and the backstop leaves
@@ -432,14 +437,15 @@ export class Session {
       // over-long reply only the prompt can fix.
       if (result.total <= 1 && content.length > UNBROKEN_REPLY_CHARS) {
         console.log(
-          `voice backstop: nothing to trim — ${content.length} chars in one unbroken sentence`
+          `voice backstop: nothing to trim — ${result.totalWords} words in one unbroken sentence`
         )
       }
       return { text: content, recorded: content }
     }
 
     console.log(
-      `voice backstop: spoke ${result.kept} of ${result.total} sentences ` +
+      `voice backstop: spoke ${result.kept} of ${result.total} sentences, ` +
+        `${result.words} of ${result.totalWords} words ` +
         `(${content.length} chars → ${result.spoken.length})`
     )
     return {
