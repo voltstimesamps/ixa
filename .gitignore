@@ -31,6 +31,11 @@ logs/
 # Runtime state: the SQLite database (preferences, persisted sessions)
 data/
 
+# Test and measurement media: recordings and synthesized audio, kept locally.
+# Not ignored before, so a stray `git add .` would have committed the WAVs
+# dev/scripts/tts-render-check.ts writes.
+Ixa-Tests/
+
 # Qdrant local data (if running without Docker)
 qdrant_storage/
 ixa-test.txt

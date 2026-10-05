@@ -25,6 +25,22 @@ Run them against a backend already started with `npm run dev`.
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping
   synthesis" line and no traceback; `complete` is the control run.
+- `tts-render-check.ts` — measures how Kokoro RENDERS written text as speech.
+  Synthesizes a fixture list through the real spoken path (`sanitizeForSpeech`
+  then `speakStreaming`, exactly as `speak()` does), writes one WAV per fixture
+  to `Ixa-Tests/tts/` and a `report.md` whose verdict column is filled in BY
+  EAR. Fixtures are real assistant replies from `data/ixa.db`, plus invented
+  ones only where the corpus has a gap; each hypothesized cause appears twice,
+  once broken and once with a single substitution applied, so a pair can be
+  compared back to back. Needs only the sidecar, already running — it never
+  spawns Kokoro.
+- `tts-phonemes.py` — the companion diagnostic: what the G2P decided before the
+  vocoder ran, for the same fixtures. Reads `Ixa-Tests/tts/fixtures.json`, which
+  `tts-render-check.ts` writes, so the fixture strings exist in one place. Needs
+  the TTS sidecar's venv, not the sidecar itself. It says whether a twin's
+  substitution changed anything Kokoro can hear, which duration alone cannot:
+  `$1,360`, `$1360` and `one thousand three hundred sixty dollars` are
+  phoneme-identical.
 
 Usage:
     npx tsx dev/scripts/phase3a-verify.ts
@@ -35,3 +51,5 @@ Usage:
     npx tsx dev/scripts/forget-episode.ts 12 --dry-run
     npx tsx dev/scripts/tts-abort.ts            # expect the one-line disconnect
     npx tsx dev/scripts/tts-abort.ts complete   # control: expect "done: N chunk(s)"
+    npx tsx dev/scripts/tts-render-check.ts     # needs the TTS sidecar running
+    sidecars/tts/venv/bin/python dev/scripts/tts-phonemes.py
