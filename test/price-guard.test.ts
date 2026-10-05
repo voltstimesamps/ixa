@@ -64,6 +64,90 @@ test("an empty reply has no prices in it", () => {
   assert.deepEqual(findCurrencyAmounts(""), [])
 })
 
+// ------------------------------------------------- the same price, in words
+//
+// VOICE_RESPONSE_PROMPT tells the model to write numbers as words in a spoken
+// reply, because Kokoro mis-renders digits. Without these the guard would have
+// gone quiet on every voice turn: a reply with no digits in it matched none of
+// the patterns above, and nothing would have said so.
+
+test("a spelled-out amount is a price too", () => {
+  for (const [text, expected] of [
+    ["About three hundred fifty dollars.", "three hundred fifty dollars"],
+    ["Around one thousand three hundred sixty dollars right now.", "one thousand three hundred sixty dollars"],
+    ["Listings are near thirteen hundred sixty dollars.", "thirteen hundred sixty dollars"],
+    ["That is fifty cents.", "fifty cents"],
+    ["Roughly two hundred fifty quid.", "two hundred fifty quid"],
+    ["Say eighty euros.", "eighty euros"],
+    // "a" can lead a run, and "and" can sit inside one.
+    ["About a thousand dollars all in.", "a thousand dollars"],
+    ["Four hundred and twenty dollars.", "Four hundred and twenty dollars"],
+    // Hyphens, including the compound-adjective form, which states a price.
+    ["Twenty-five dollars, give or take.", "Twenty-five dollars"],
+    ["It is a two-hundred-dollar card.", "a two-hundred-dollar"],
+  ] as const) {
+    assert.deepEqual(findCurrencyAmounts(text), [expected], text)
+  }
+})
+
+// A vague figure is still a figure stated from memory, so the guard fires. The
+// quantifier is absorbed only so the correction quotes back something a person
+// would recognise, rather than a bare "hundred dollars".
+test("a vague amount is quoted back with its quantifier", () => {
+  for (const [text, expected] of [
+    ["These setups keep costs under a few hundred dollars.", "a few hundred dollars"],
+    ["It runs a couple of hundred dollars.", "a couple of hundred dollars"],
+    ["Expect several thousand dollars.", "several thousand dollars"],
+    // No number word at all: the quantifier carries it.
+    ["It is only a few dollars.", "a few dollars"],
+  ] as const) {
+    assert.deepEqual(findCurrencyAmounts(text), [expected], text)
+  }
+})
+
+// Adjacency is what makes the spelled-out net safe: a number word and a
+// currency word in the same sentence are not a price unless they are touching.
+// A spurious match costs a wasted corrective LLM call.
+test("number words in ordinary prose are not prices", () => {
+  for (const text of [
+    "The dollar is strong this year.",
+    "There is a dollar store on the corner.",
+    "A thousand times better than the old one.",
+    "Nine times out of ten it is bed adhesion.",
+    "It has sixteen gigabytes of VRAM.",
+    "The RTX thirty ninety is the pick.",
+    "That is thirty percent faster.",
+    "It draws three hundred twenty watts under load.",
+    "Worth millions of dollars to the company.",
+    "One of the dollars was counterfeit.",
+    "The dollar fell two percent today.",
+    "Two pounds of flour and a pinch of salt.",
+    "I have one thousand reasons not to.",
+    "Pick one: dollars or euros.",
+    "It takes about fifteen seconds to say out loud.",
+    // Hyphenated compounds that bridge a number word into a noun which is not
+    // a currency. The hyphen is permitted before a currency word, so these are
+    // the shape most likely to be caught by mistake.
+    "A sixteen-gigabyte card is enough.",
+    "Use a three-hundred-twenty-watt supply.",
+    "That is a two-pound loaf.",
+    "It gives thirty-ninety-class performance.",
+    "A sixty-four-bit build runs fine.",
+    "Try the twelve-hour format instead.",
+  ]) {
+    assert.deepEqual(findCurrencyAmounts(text), [], text)
+  }
+})
+
+// Both forms at once: a voice turn writes words, a text turn writes digits, and
+// one build has to detect either.
+test("digit and spelled-out amounts are found in the same reply", () => {
+  assert.deepEqual(findCurrencyAmounts("It was $350, so about three hundred fifty dollars."), [
+    "$350",
+    "three hundred fifty dollars",
+  ])
+})
+
 // --------------------------------------------------------------- the guard
 
 function scripted(replies: LLMResponse[]): { chat: ChatFn; sent: Message[][] } {

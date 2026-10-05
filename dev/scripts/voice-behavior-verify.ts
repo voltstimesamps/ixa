@@ -9,6 +9,7 @@
 // and this script run with the same two variables set.
 //
 //   npx tsx dev/scripts/voice-behavior-verify.ts scoreboard   # 1
+//   npx tsx dev/scripts/voice-behavior-verify.ts numbers      # 8
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
 //   npx tsx dev/scripts/voice-behavior-verify.ts dismiss      # 5
@@ -525,10 +526,173 @@ async function verifyTokens(): Promise<void> {
   console.log(`\n  episodes in this database: ${episodes.length}`)
 }
 
+// ------------------------------------------------------------- 8: numbers
+
+// Does the model actually write numbers as words when told to? Eight questions
+// that are hard to answer without a price, a size or a model number.
+const NUMBER_TEMPTING = [
+  "How much is a used RTX 3090 right now?",
+  "What GPU should I get for local AI?",
+  "What CPU should I get for local AI?",
+  "How much VRAM does a 3060 have?",
+  "How much RAM do I need to run a 7B model?",
+  "How fast is a 4070 compared to a 3060?",
+  "What time is it?",
+  "What is fifteen percent of two hundred?",
+]
+
+// A compliant spoken reply has no digit and no currency or percent sign in it.
+// Crude on purpose: it is the rule as written, and it is objective.
+//
+// It cannot tell whether a compliant reply SOUNDS right — "RTX three zero nine
+// zero" has no digits and is still wrong — which is why every reply is printed
+// verbatim rather than only the violations.
+const NUMERAL = /[\d$£€¥₹%]/
+
+function numeralsIn(text: string): string[] {
+  const found: string[] = []
+  for (const token of text.match(/\S+/g) ?? []) {
+    if (!NUMERAL.test(token)) continue
+    const cleaned = token.replace(/^[("']+|[)"'.,;:!?]+$/g, "")
+    if (cleaned && !found.includes(cleaned)) found.push(cleaned)
+  }
+  return found
+}
+
+async function verifyNumbers(): Promise<void> {
+  section("8. spoken replies write numbers as words")
+
+  const limitsOff = config.voice.maxSpokenSentences < 1 && config.voice.maxSpokenWords < 1
+  console.log(
+    `  backstop: ${limitsOff ? "OFF (both limits disabled)" : `${config.voice.maxSpokenSentences} sentences / ${config.voice.maxSpokenWords} words`}`
+  )
+  console.log(`  model:    ${config.llm.model}\n`)
+
+  const firesBefore = backstopFiresInHistory().length
+  const rows: Array<{
+    question: string
+    text: string
+    seconds: number
+    words: number
+    trimmed: boolean
+    numerals: string[]
+  }> = []
+
+  const client = await connect()
+  for (const question of NUMBER_TEMPTING) {
+    console.log(`  > (spoken) ${question}`)
+    // Synthesized, so the turn is genuinely voice-origin: the constraint only
+    // goes on the request for a voice turn, so a typed question measures
+    // nothing at all.
+    const pcm = await synthesize(question)
+    let reply: Reply
+    try {
+      reply = await client.askAudio(pcm)
+    } catch (err) {
+      check(`answered: ${question.slice(0, 40)}`, false, err instanceof Error ? err.message : String(err))
+      continue
+    }
+
+    // Counted exactly as the scoreboard counts: the offer the backstop appends
+    // is the backstop talking, not the answer, so it is excluded from the word
+    // count and from the numeral scan.
+    const trimmed = reply.text.trimEnd().endsWith(CONTINUE_OFFER)
+    const answer = trimmed ? reply.text.trimEnd().slice(0, -CONTINUE_OFFER.length).trimEnd() : reply.text
+    const counted = shortenForSpeech(answer, { maxUnits: 0, maxWords: 0 })
+
+    rows.push({
+      question,
+      text: reply.text,
+      seconds: audioSeconds(reply.audioChunks),
+      words: counted.totalWords,
+      trimmed,
+      numerals: numeralsIn(answer),
+    })
+
+    console.log(`  < ${reply.text}`)
+    console.log(
+      `    ${counted.totalWords} word(s), ${audioSeconds(reply.audioChunks).toFixed(1)}s spoken` +
+        `${trimmed ? ", trimmed by the backstop" : ""}` +
+        `${rows.at(-1)!.numerals.length ? `, NUMERALS: ${rows.at(-1)!.numerals.join(" ")}` : ", no numerals"}\n`
+    )
+  }
+  await client.close()
+
+  const fires = backstopFiresInHistory().slice(firesBefore)
+  const answered = rows.length
+  // An empty reply has no numerals in it and is not evidence of compliance.
+  // Scored as compliant it would make the rate look better the more often the
+  // model said nothing at all.
+  const spoke = rows.filter((row) => row.text.trim().length > 0)
+  const empty = rows.filter((row) => row.text.trim().length === 0)
+  const compliant = spoke.filter((row) => row.numerals.length === 0)
+
+  // Every reply in full. A digit test cannot hear "RTX three zero nine zero",
+  // so the transcript is the evidence and the ear is the judge.
+  console.log("  every reply, verbatim:")
+  for (const row of rows) {
+    console.log(`\n    Q: ${row.question}`)
+    console.log(`    A: ${row.text}`)
+    console.log(
+      `       ${row.words} words, ${row.seconds.toFixed(1)}s` +
+        `${row.numerals.length ? `, numerals: ${row.numerals.join(" ")}` : ""}`
+    )
+  }
+
+  const words = spoke.map((row) => row.words)
+  const meanWords = words.reduce((sum, value) => sum + value, 0) / (spoke.length || 1)
+  const worstWords = Math.max(0, ...words)
+
+  console.log(`\n  answered:        ${answered}/${NUMBER_TEMPTING.length}`)
+  if (empty.length) console.log(`  EMPTY replies:   ${empty.length} (excluded from the rate below)`)
+  console.log(`  compliant:       ${compliant.length}/${spoke.length} (no digits or currency symbols)`)
+  console.log(`  mean words:      ${meanWords.toFixed(1)}`)
+  console.log(`  most words:      ${worstWords}`)
+  console.log(`  backstop fired:  ${fires.length}/${answered}${fires.length ? ` (${fires.map((f) => `${f.kept}/${f.total}`).join(", ")})` : ""}`)
+
+  const violations = rows.filter((row) => row.numerals.length > 0)
+  if (violations.length) {
+    console.log("\n  violations:")
+    for (const row of violations) {
+      console.log(`    ${row.numerals.join(" ")}  <- ${row.question}`)
+    }
+  }
+
+  // Spelling numbers out costs words, so the 40-word budget binds sooner and
+  // the backstop fires more. That is expected, not a failure of the rule — the
+  // useful output is the cap that would have left these replies alone.
+  if (limitsOff) {
+    console.log(
+      `\n  word cap that would leave every reply here untrimmed: ${worstWords}` +
+        ` (current ${config.voice.maxSpokenWords})`
+    )
+  } else {
+    console.log(
+      "\n  For the cap these replies would need, re-run with the backstop off:\n" +
+        "  IXA_VOICE_MAX_SENTENCES=0 IXA_VOICE_MAX_WORDS=0 ... npm run dev"
+    )
+  }
+
+  check(
+    "every question got a non-empty reply",
+    spoke.length === NUMBER_TEMPTING.length,
+    `${spoke.length}/${NUMBER_TEMPTING.length}${empty.length ? `, ${empty.length} empty` : ""}`
+  )
+  // Reported, not gated. The point of this run is the rate itself: a poor one
+  // sizes the deterministic backstop in a later branch, and patching around it
+  // here would hide the number that decision needs.
+  console.log(
+    `\n  Compliance is reported, not enforced: ${compliant.length}/${spoke.length} is the measurement.` +
+      "\n  A reply with no digits in it can still be WRONG — read the transcript above:" +
+      "\n  \"RTX three sixty\" for a 3060 obeys the rule and names a card that does not exist."
+  )
+}
+
 // ------------------------------------------------------------------- main
 
 const commands: Record<string, () => void | Promise<void>> = {
   scoreboard: verifyScoreboard,
+  numbers: verifyNumbers,
   lasttime: verifyLastTime,
   freshness: verifyFreshness,
   dismiss: verifyDismiss,

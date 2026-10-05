@@ -42,6 +42,55 @@ const PATTERNS: RegExp[] = [
   new RegExp(String.raw`\b(?:usd|gbp|eur)\s?${NUMBER}`, "gi"),
 ]
 
+// ------------------------------------------------- the same price, in words
+//
+// VOICE_RESPONSE_PROMPT now tells the model to write numbers as words in a
+// spoken reply, because Kokoro mis-renders digits. That would have taken the
+// guard above out silently: "three hundred fifty dollars" contains no digit,
+// so all three patterns return nothing and the freshness backstop stops
+// existing on voice turns without an error or a log line to say so.
+//
+// Both forms are detected, not one. A text turn gets no voice prompt and will
+// keep writing digits.
+//
+// The vocabulary is closed and small. Plural scales are deliberately absent:
+// "worth millions of dollars" is vague, not a figure that was stated.
+const ONES =
+  String.raw`zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|` +
+  String.raw`fourteen|fifteen|sixteen|seventeen|eighteen|nineteen`
+const TENS = String.raw`twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety`
+const SCALES = String.raw`hundred|thousand|million|billion|trillion`
+const NUMBER_WORD = String.raw`(?:${ONES}|${TENS}|${SCALES})`
+
+// A run of number words, joined by whitespace, a hyphen, or "and":
+// "twenty-five", "four hundred and twenty", "one thousand three hundred sixty".
+const WORD_RUN = String.raw`${NUMBER_WORD}(?:[\s\-]+(?:and[\s\-]+)?${NUMBER_WORD})*`
+
+// "under a few hundred dollars" is a price stated from memory, so the guard
+// should fire on it. The quantifier is absorbed into the match only so that
+// priceCorrectionPrompt quotes back something a person would recognise — "a
+// few hundred dollars" rather than a bare "hundred dollars".
+const VAGUE = String.raw`a few|a couple of|a couple|several`
+
+// Only the unambiguous currency words. Bare "pounds" stays out for the same
+// reason it is absent above: "two pounds of flour" is a weight.
+const SPOKEN_CURRENCY = String.raw`dollars?|bucks|quid|cents?|pence|euros?|yen|rupees?|pounds? sterling`
+
+// ADJACENCY IS THE WHOLE GUARD AGAINST FALSE POSITIVES. The currency word has
+// to come straight after the number run, with nothing between but whitespace
+// or a hyphen — which is what keeps the number words and the currency word of
+// "one of the dollars was counterfeit" and "the dollar fell two percent" from
+// being read together. A hyphen is allowed so "a two-hundred-dollar card",
+// which states a price, is caught.
+//
+// "a" may lead a run but is never itself a number, so "a thousand dollars"
+// matches and "a dollar store" cannot. A vague quantifier may stand alone
+// ("a few dollars"); a bare number run may not be empty.
+const SPOKEN_PATTERN = new RegExp(
+  String.raw`\b(?:(?:${VAGUE})(?:[\s\-]+${WORD_RUN})?|(?:a[\s\-]+)?${WORD_RUN})[\s\-]+(?:${SPOKEN_CURRENCY})\b`,
+  "gi"
+)
+
 // A price range written as "$300-$400" matches twice, which is right: both
 // figures were stated. Duplicates are collapsed so the log line stays short.
 export function findCurrencyAmounts(text: string): string[] {
@@ -52,6 +101,13 @@ export function findCurrencyAmounts(text: string): string[] {
       const amount = match[0].trim()
       if (!found.includes(amount)) found.push(amount)
     }
+  }
+  // Digit amounts keep their exact text — the separator inside "$1 200" is part
+  // of what was written. A spelled-out amount can span a line break in a draft,
+  // so its whitespace is collapsed to keep the quoted-back figure readable.
+  for (const match of text.matchAll(SPOKEN_PATTERN)) {
+    const amount = match[0].trim().replace(/\s+/g, " ")
+    if (!found.includes(amount)) found.push(amount)
   }
   return found
 }
