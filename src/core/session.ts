@@ -169,6 +169,28 @@ export function turnFailureReply(err: unknown): string {
 const NOT_EXECUTED =
   "not executed: the turn failed before this tool ran. Nothing happened."
 
+// What a tool result says when the per-turn search cap is reached.
+//
+// It must not read as a failure. A result that looks like a broken search is
+// an invitation to retry it, and retrying is the exact behaviour the cap
+// exists to stop — the live turn that fired eight searches repeated several
+// queries verbatim. So the message says three things in order: the search did
+// not run, the reason is a limit rather than a fault, and what to do instead.
+//
+// "Nothing is wrong" is stated outright because the model cannot tell a cap
+// from an outage by inference, and the honest reading of an unexplained empty
+// result is that the network is down.
+function searchCapReached(limit: number): string {
+  return (
+    `This search was NOT run. You have already used all ${limit} web_search calls allowed ` +
+    `in this turn, and that is the limit — nothing is wrong, nothing failed, and the ` +
+    `search tool is working. Running another one is not possible in this turn, so do not ` +
+    `try again. Answer from the search results you already have above. If they genuinely ` +
+    `do not contain what you need, say which part you could not confirm rather than ` +
+    `guessing at it or stating a figure from memory.`
+  )
+}
+
 // Arguments are truncated in the log: a web_search query is short, but a
 // shell command or a remembered preference is not, and a log line that wraps
 // four times is a log nobody reads.
@@ -556,6 +578,10 @@ export class Session {
     // about this turn's facts, so a search two turns ago does not license a
     // price now.
     let searchedThisTurn = false
+    // How many have run, for the per-turn cap. Counted rather than flagged
+    // because the loop caps ITERATIONS at 10 and one iteration may carry any
+    // number of parallel calls — so the bound has to be on the calls.
+    let searchesThisTurn = 0
     // The price guard retries once and once only. A model that states prices
     // twice is not going to stop on the third ask, and a loop here would spend
     // the turn's budget arguing with it.
@@ -692,6 +718,24 @@ export class Session {
           if (!tool) {
             result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
             logToolCall(tc.name, "unknown", Date.now(), tc.arguments)
+          } else if (
+            tool.name === "web_search" &&
+            config.tools.maxSearchesPerTurn > 0 &&
+            searchesThisTurn >= config.tools.maxSearchesPerTurn
+          ) {
+            // `ran` stays false, so a capped call cannot satisfy the price
+            // guard's "did a search happen" question on its own. In practice
+            // the guard is already satisfied — the cap is only reachable once
+            // real searches have run — but a capped call is not a search and
+            // must not be counted as one.
+            result = searchCapReached(config.tools.maxSearchesPerTurn)
+            logToolCall(
+              tool.name,
+              "capped",
+              Date.now(),
+              tc.arguments,
+              `${searchesThisTurn} already run this turn`
+            )
           } else if (tool.requiresConfirmation) {
             const description = await this.generateDescription(tc.name, tc.arguments)
             // Deliberately OUTSIDE the tool deadline. The user may take as
@@ -720,7 +764,10 @@ export class Session {
             ran = true
           }
 
-          if (ran && tc.name === "web_search") searchedThisTurn = true
+          if (ran && tc.name === "web_search") {
+            searchedThisTurn = true
+            searchesThisTurn++
+          }
 
           if (tool?.name === "shell_write") {
             try {

@@ -39,6 +39,17 @@ export const config = {
     // inside timeoutMs so the tool returns its own error message rather than
     // being abandoned by the backstop.
     httpTimeoutMs: parseInt(process.env.IXA_TOOL_HTTP_TIMEOUT_MS ?? "15000"),
+    // How many web_search calls one turn may run. Nothing bounded this
+    // before: the tool loop caps ITERATIONS at 10, and a single iteration can
+    // carry any number of parallel calls, so one live price question fired
+    // eight searches with several queries repeated verbatim.
+    //
+    // 3 because that is what the context budget holds. An uncapped Tavily
+    // result is ~5300 chars and the four results of one parallel group come
+    // to ~21.4k against contextBudgetChars' 24000 — past three, results start
+    // evicting the turn that gathered them, and the model searches again for
+    // what it can no longer see. Set to 0 to turn the cap off.
+    maxSearchesPerTurn: parseInt(process.env.IXA_MAX_SEARCHES_PER_TURN ?? "3"),
   },
   voice: {
     enabled: process.env.VOICE_MODE === "true",
