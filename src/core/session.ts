@@ -564,8 +564,11 @@ export class Session {
     for (let i = 0; i < 10; i++) {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
       let response: LLMResponse
+      // Built once and kept, so the empty-reply diagnostic below describes the
+      // array that was actually sent rather than a second, rebuilt one.
+      const sent = this.messagesForCall(origin)
       try {
-        response = await this.chat(this.messagesForCall(origin), retrying ? [] : tools)
+        response = await this.chat(sent, retrying ? [] : tools)
       } catch (err) {
         // A deadline is never a malformed tool call, and asking again without
         // tools would just spend the budget twice.
@@ -615,6 +618,24 @@ export class Session {
           this.messages.push({ role: "assistant", content: spoken.recorded })
           return spoken.text
         }
+
+        // The model returned a text response with nothing in it. Logged
+        // rather than papered over: the transport already handles it
+        // correctly — speak() is never reached with an empty string, and
+        // replyEnd still fires — and a stand-in apology would put words in
+        // history the user never heard.
+        //
+        // What the line says is how much conversation the call carried,
+        // because that is what distinguishes the two causes. A call that
+        // carried the conversation and still came back empty is the model. A
+        // call that carried only system prompts was starved by the context
+        // budget, which is the shape buildWindow used to produce from four
+        // parallel web_search results.
+        console.warn(
+          `empty reply: the model returned no content on call ${i + 1} of this turn — ` +
+            `the call carried ${sent.length} messages ` +
+            `(${sent.filter((m) => m.role !== "system").length} of them conversation)`
+        )
         return response.content
       }
 
