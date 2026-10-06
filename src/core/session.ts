@@ -67,6 +67,21 @@ const DESCRIBE_ACTION_PROMPT =
 // explicitly asking for something that requires more detail (e.g. reciting a
 // list they asked for)" — an escape hatch the model took constantly, because
 // almost any question can be read as inviting detail.
+//
+// The numbers rule is in three cases because two was wrong. Written as one
+// rule — "numbers as words", with model numbers listed among the things it
+// covered — the model obeyed by turning identifiers into amounts: a 3060
+// became "RTX three hundred sixty", a 4090 "RTX four hundred ninety", and the
+// clock grew seconds it was never given. None of those contain a digit, so the
+// compliance check passed every one of them. An identifier is a NAME that
+// happens to be spelled with digits, and naming it as a quantity produces
+// hardware that does not exist.
+//
+// Measured: Kokoro reads every bare four-digit model number as place value
+// ("RTX 3090" → "three thousand ninety"), which is why this rule has to exist
+// at all. It also reads DDR4, PCIe 4.0 and Ubuntu 24.04 correctly as written,
+// which is why the rule says to leave those alone — an instruction to convert
+// them would be churn with a chance of invention and no upside.
 export const VOICE_RESPONSE_PROMPT =
   "THIS REPLY WILL BE SPOKEN ALOUD. It is read by a speech synthesizer, not shown as text.\n" +
   "- Length: about THIRTY-FIVE WORDS in total, in one to three short sentences. That is the " +
@@ -76,11 +91,15 @@ export const VOICE_RESPONSE_PROMPT =
   "- No formatting of any kind: no numbered or bulleted lists, no headings, no bold or italics, " +
   "no code blocks, no tables, no links. None of it exists in speech — it is read out as literal " +
   "asterisks and numbers. Write plain spoken sentences.\n" +
-  "- NUMBERS AS WORDS, never digits or symbols. Write \"three hundred fifty dollars\", not " +
-  "\"$350\". Write \"sixteen gigabytes\", not \"16 GB\". Write \"an RTX thirty ninety\", not " +
-  "\"RTX 3090\". The synthesizer mangles digits — it has read \"$1 200\" aloud as \"one " +
-  "two-hundred\" — so a figure written in digits is a figure the user hears wrong. This covers " +
-  "prices, sizes, speeds, model numbers, times and dates.\n" +
+  "- SPELL NUMBERS OUT, the way a person says them aloud. Three kinds, not said alike:\n" +
+  "  - A QUANTITY is an amount: \"three hundred fifty dollars\", not \"$350\"; \"sixteen " +
+  "gigabytes\", not \"16 GB\".\n" +
+  "  - A MODEL OR PART NUMBER IS A NAME, NOT AN AMOUNT. Say it in pairs, and never drop a " +
+  "digit: \"RTX thirty ninety\" for RTX 3090, \"RTX forty seventy\" for RTX 4070, \"Ryzen " +
+  "five fifty-six hundred G\" for Ryzen 5 5600G. Never \"three thousand ninety\", \"three " +
+  "hundred sixty\" or \"thirty nine zero\" — those are not cards.\n" +
+  "  - A CLOCK TIME is a time: \"ten fifty-three in the evening\". Never add seconds.\n" +
+  "  Leave standards and versions alone: DDR4, GDDR6, PCIe 4.0, Ubuntu 24.04 are already right.\n" +
   "- If the answer has several items, say the best one or two in a sentence and offer the rest: " +
   "\"there are a few more if you want them.\" Do not recite the list.\n" +
   "- If a full answer genuinely needs length or code, say so in a sentence and ask whether to go " +
@@ -88,18 +107,20 @@ export const VOICE_RESPONSE_PROMPT =
   "Say the useful part first. The user can always ask for more.\n\n" +
   "These are the right length — about thirty words each — in questions that all invite a list:\n" +
   "User: Recommend some GPUs for a budget gaming build.\n" +
-  "Ixa: The RTX thirty sixty is the safe pick at that budget, or the sixty-seven hundred XT if " +
-  "you want more VRAM for the money. I can go through a few others if you like.\n" +
+  "Ixa: The RTX thirty sixty is the safe pick at that budget, or the RTX forty seventy if you " +
+  "have a bit more to spend. I can go through a few others if you like.\n" +
   "User: Why is my 3D print failing?\n" +
   "Ixa: Nine times out of ten it is bed adhesion or a first layer printed too cold. Tell me what " +
   "it looks like and I will narrow it down.\n" +
   "User: How do I set up Tailscale on this machine?\n" +
   "Ixa: Install the client, run tailscale up, and sign in — that is a basic node done. Do you " +
   "want the exit-node version?\n\n" +
-  "And this is how a figure is written — spelled out, the way you would say it:\n" +
+  "And these show the three kinds said aloud — an amount, a name, and a time:\n" +
   "User: How much is a used RTX 3090 going for?\n" +
-  "Ixa: Listings right now are around thirteen hundred sixty dollars. They move fast, so I " +
-  "would check again before you buy."
+  "Ixa: A used RTX thirty ninety is around thirteen hundred sixty dollars right now. They move " +
+  "fast, so I would check again before you buy.\n" +
+  "User: What time is it?\n" +
+  "Ixa: It is ten fifty-three in the evening."
 
 // Spoken when a turn fails, and recorded as the assistant's reply to the turn
 // that failed. Short, fixed, and free of any suggestion about what went wrong:

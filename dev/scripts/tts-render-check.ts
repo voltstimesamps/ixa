@@ -25,6 +25,13 @@
 // This script never spawns Kokoro. Loading the model is the dominant cost and
 // main.py hardcodes port 5001, so a second copy would collide with the one
 // `npm run dev` already owns.
+//
+// OPEN, found while measuring and deliberately not fixed here: Kokoro renders
+// "\u2264 $400" as "less four hundred dollars" \u2014 the symbol loses "than or
+// equal", which inverts nothing but states a different bound than the text. The
+// voice prompt now tells the model to write numbers as words, which should keep
+// the symbol out of a spoken reply in the first place; if one gets through, this
+// is where the evidence is.
 import { mkdirSync, readdirSync, writeFileSync } from "node:fs"
 import * as path from "node:path"
 import { speakStreaming } from "../../src/voice/tts"

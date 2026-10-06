@@ -528,17 +528,84 @@ async function verifyTokens(): Promise<void> {
 
 // ------------------------------------------------------------- 8: numbers
 
-// Does the model actually write numbers as words when told to? Eight questions
-// that are hard to answer without a price, a size or a model number.
-const NUMBER_TEMPTING = [
-  "How much is a used RTX 3090 right now?",
-  "What GPU should I get for local AI?",
-  "What CPU should I get for local AI?",
-  "How much VRAM does a 3060 have?",
-  "How much RAM do I need to run a 7B model?",
-  "How fast is a 4070 compared to a 3060?",
-  "What time is it?",
-  "What is fifteen percent of two hundred?",
+// Does the model actually write numbers as words when told to, AND keep an
+// identifier an identifier? Those are two different questions, and the digit
+// check only answers the first: "RTX three hundred sixty" has no digit in it
+// and names a card that does not exist.
+//
+// `identifiers` lists what the reply has to get right if it names the thing at
+// all. `accept` is how a person says it; `reject` is a form seen coming back
+// from a live run. Letter-suffixed part numbers (12400, 7700X, 13700K) carry
+// no expected form on purpose: Kokoro itself is inconsistent on them and human
+// convention is unsettled, so there is no correct answer to score against.
+// They are reported unscored.
+interface IdentifierCheck {
+  written: string
+  accept: string[]
+  reject: string[]
+}
+
+interface NumberQuestion {
+  ask: string
+  identifiers?: IdentifierCheck[]
+  // Checked against the real clock at the moment it is asked, not a fixture.
+  clock?: boolean
+  unscored?: string
+}
+
+const GPU_3090: IdentifierCheck = {
+  written: "RTX 3090",
+  accept: ["thirty ninety", "thirty-ninety"],
+  reject: ["three thousand ninety", "three hundred ninety", "thirty nine zero", "three zero nine zero", "three oh nine oh"],
+}
+const GPU_3060: IdentifierCheck = {
+  written: "RTX 3060",
+  accept: ["thirty sixty", "thirty-sixty"],
+  reject: ["three thousand sixty", "three hundred sixty", "thirty six zero", "three zero six zero", "three sixty"],
+}
+const GPU_4070: IdentifierCheck = {
+  written: "RTX 4070",
+  accept: ["forty seventy", "forty-seventy"],
+  reject: ["four thousand seventy", "four hundred seventy", "forty seven zero", "four zero seven zero", "four seventy"],
+}
+
+const NUMBER_QUESTIONS: NumberQuestion[] = [
+  { ask: "How much is a used RTX 3090 right now?", identifiers: [GPU_3090] },
+  { ask: "What GPU should I get for local AI?" },
+  { ask: "What CPU should I get for local AI?", unscored: "CPU part numbers have no agreed spoken form" },
+  { ask: "How much VRAM does a 3060 have?", identifiers: [GPU_3060] },
+  { ask: "How much RAM do I need to run a 7B model?" },
+  { ask: "How fast is a 4070 compared to a 3060?", identifiers: [GPU_4070, GPU_3060] },
+  { ask: "What time is it?", clock: true },
+  { ask: "What is fifteen percent of two hundred?" },
+  // The hard cases: a standard, a version, and identifiers carrying a letter.
+  {
+    ask: "What RAM does a Ryzen 5 5600G take?",
+    identifiers: [
+      { written: "DDR4", accept: ["ddr4", "ddr four"], reject: ["ddr for", "d d r four"] },
+      { written: "Ryzen 5 5600G", accept: ["fifty-six hundred g", "fifty six hundred g", "5600g"], reject: ["five thousand six hundred", "five six hundred g"] },
+    ],
+  },
+  {
+    ask: "What memory does a 3060 use?",
+    identifiers: [GPU_3060, { written: "GDDR6", accept: ["gddr6", "gddr six"], reject: ["gddr sixth", "g d d r six"] }],
+  },
+  {
+    ask: "What PCIe version does a 4070 use?",
+    identifiers: [GPU_4070, { written: "PCIe 4.0", accept: ["pcie 4", "pcie four", "pci express four", "pcie gen four", "pcie gen 4"], reject: ["pcie forty", "pcie four thousand"] }],
+  },
+  {
+    ask: "Which Ubuntu version should I install for local AI?",
+    identifiers: [
+      {
+        written: "Ubuntu 24.04",
+        accept: ["24.04", "twenty-four oh four", "twenty four oh four", "twenty-four point oh four", "twenty four point zero four", "twenty-four point zero four"],
+        reject: ["twenty-four oh forty", "two thousand four", "twenty four hundred"],
+      },
+    ],
+  },
+  { ask: "Is an i5-12400 enough for local AI?", unscored: "12400 has no agreed spoken form" },
+  { ask: "Is the RX 7800 XT good for local AI?", unscored: "7800 takes the hundred-form, which the pairs rule does not cover" },
 ]
 
 // A compliant spoken reply has no digit and no currency or percent sign in it.
@@ -546,17 +613,101 @@ const NUMBER_TEMPTING = [
 //
 // It cannot tell whether a compliant reply SOUNDS right — "RTX three zero nine
 // zero" has no digits and is still wrong — which is why every reply is printed
-// verbatim rather than only the violations.
+// verbatim and the identifier checks run alongside it.
 const NUMERAL = /[\d$£€¥₹%]/
+
+// Standards and versions are EXEMPT, because the prompt now tells the model to
+// leave them as they are: Kokoro reads "DDR4" as "DDR four" and "Ubuntu 24.04"
+// as "Ubuntu twenty four point zero four", both correct. Counting them as
+// violations is what made the last run report "GDDR6" as a failure when
+// nothing was wrong with it.
+const STANDARD_TOKEN =
+  /^(?:[a-z]*ddr\d|pcie|pci-e|usb\d?|sata\d?|hdmi\d?|ecc|lpddr\d|gen\d|\d+\.\d+|v\d+(?:\.\d+)*)$/i
 
 function numeralsIn(text: string): string[] {
   const found: string[] = []
   for (const token of text.match(/\S+/g) ?? []) {
     if (!NUMERAL.test(token)) continue
     const cleaned = token.replace(/^[("']+|[)"'.,;:!?]+$/g, "")
-    if (cleaned && !found.includes(cleaned)) found.push(cleaned)
+    if (!cleaned || STANDARD_TOKEN.test(cleaned)) continue
+    if (!found.includes(cleaned)) found.push(cleaned)
   }
   return found
+}
+
+// Normalized for substring matching: lowercase, curly quotes folded, and every
+// hyphen and exotic space turned into one plain space.
+//
+// Hyphens have to GO, not be normalized to "-". The model hyphenates wherever
+// it likes — it wrote "twenty‑four point zero‑four", which is the
+// correct spoken form of Ubuntu 24.04 and was scored "not named" against an
+// expected "twenty-four point zero four". Where a hyphen falls inside a spoken
+// number is not a thing worth being strict about.
+function flatten(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[‘’]/g, "'")
+    .replace(/[‐-―\-   ]/g, " ")
+    .replace(/\s+/g, " ")
+}
+
+type IdVerdict = "correct" | "mangled" | "as digits" | "not named"
+
+// An identifier is only judged if the reply tried to name it. A reply about a
+// different card is not evidence either way — but a reply that writes the
+// identifier in DIGITS is not "not named", it is the original failure: Kokoro
+// reads "RTX 3060" as "three thousand sixty". Scoring that as absent is what
+// made the baseline look as accurate as the new prompt, when in fact it had
+// simply left seven identifiers in digits for the synthesizer to mangle.
+//
+// Accept is tested before digits, because for a standard or a version the digit
+// form IS the correct answer ("DDR4", "Ubuntu 24.04") and is listed in accept.
+function judgeIdentifier(reply: string, check: IdentifierCheck): IdVerdict {
+  const flat = flatten(reply)
+  if (check.reject.some((form) => flat.includes(flatten(form)))) return "mangled"
+  if (check.accept.some((form) => flat.includes(flatten(form)))) return "correct"
+  // The bare number out of the written form: "RTX 3060" -> "3060".
+  const digits = check.written.match(/\d[\d.]*/g) ?? []
+  if (digits.some((run) => new RegExp(`(?:^|[^\\d.])${run.replace(/\./g, "\\.")}(?:[^\\d]|$)`).test(reply))) {
+    return "as digits"
+  }
+  return "not named"
+}
+
+// The clock case, checked against the real time at the moment of asking. The
+// failure it exists to catch is invented precision: "ten fifty-three AND
+// FORTY-NINE SECONDS", and in another run "ten fifty-fourteen".
+const ONES_WORDS = [
+  "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+  "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+]
+const TENS_WORDS = ["", "", "twenty", "thirty", "forty", "fifty"]
+
+function minuteWords(minute: number): string[] {
+  if (minute === 0) return ["o'clock", "oh clock"]
+  if (minute < 10) return [`oh ${ONES_WORDS[minute]}`, `zero ${ONES_WORDS[minute]}`, ONES_WORDS[minute]!]
+  if (minute < 20) return [ONES_WORDS[minute]!]
+  const tens = TENS_WORDS[Math.floor(minute / 10)]!
+  const ones = minute % 10
+  return ones === 0 ? [tens] : [`${tens}-${ONES_WORDS[ones]}`, `${tens} ${ONES_WORDS[ones]}`]
+}
+
+function judgeClock(reply: string, at: Date): { verdict: IdVerdict; detail: string } {
+  const flat = flatten(reply)
+  const hour12 = at.getHours() % 12 === 0 ? 12 : at.getHours() % 12
+  const hourWord = ONES_WORDS[hour12] ?? String(hour12)
+  const minutes = minuteWords(at.getMinutes())
+  const expected = `${hourWord} ${minutes[0]}`
+
+  // Invented seconds are wrong whatever the rest says.
+  if (/\bseconds?\b/.test(flat)) {
+    return { verdict: "mangled", detail: `invented seconds; expected about "${expected}"` }
+  }
+  const hourOk = flat.includes(` ${hourWord} `) || flat.includes(`is ${hourWord}`) || flat.includes(`${hourWord} `)
+  const minuteOk = minutes.some((form) => flat.includes(form))
+  if (hourOk && minuteOk) return { verdict: "correct", detail: `"${expected}"` }
+  if (!hourOk && !minuteOk) return { verdict: "not named", detail: `no time said; expected about "${expected}"` }
+  return { verdict: "mangled", detail: `expected about "${expected}"` }
 }
 
 async function verifyNumbers(): Promise<void> {
@@ -576,20 +727,23 @@ async function verifyNumbers(): Promise<void> {
     words: number
     trimmed: boolean
     numerals: string[]
+    identifiers: Array<{ written: string; verdict: IdVerdict; detail?: string }>
+    unscored?: string
   }> = []
 
   const client = await connect()
-  for (const question of NUMBER_TEMPTING) {
-    console.log(`  > (spoken) ${question}`)
+  for (const item of NUMBER_QUESTIONS) {
+    console.log(`  > (spoken) ${item.ask}`)
     // Synthesized, so the turn is genuinely voice-origin: the constraint only
     // goes on the request for a voice turn, so a typed question measures
     // nothing at all.
-    const pcm = await synthesize(question)
+    const pcm = await synthesize(item.ask)
+    const askedAt = new Date()
     let reply: Reply
     try {
       reply = await client.askAudio(pcm)
     } catch (err) {
-      check(`answered: ${question.slice(0, 40)}`, false, err instanceof Error ? err.message : String(err))
+      check(`answered: ${item.ask.slice(0, 40)}`, false, err instanceof Error ? err.message : String(err))
       continue
     }
 
@@ -600,21 +754,38 @@ async function verifyNumbers(): Promise<void> {
     const answer = trimmed ? reply.text.trimEnd().slice(0, -CONTINUE_OFFER.length).trimEnd() : reply.text
     const counted = shortenForSpeech(answer, { maxUnits: 0, maxWords: 0 })
 
+    const identifiers: Array<{ written: string; verdict: IdVerdict; detail?: string }> = (
+      item.identifiers ?? []
+    ).map((check) => ({ written: check.written, verdict: judgeIdentifier(answer, check) }))
+    if (item.clock) {
+      // askedAt, not now: the reply took seconds to synthesize, and a minute
+      // boundary crossed in between would fail a correct answer.
+      const clock = judgeClock(answer, askedAt)
+      identifiers.push({ written: "the time", verdict: clock.verdict, detail: clock.detail })
+    }
+
     rows.push({
-      question,
+      question: item.ask,
       text: reply.text,
       seconds: audioSeconds(reply.audioChunks),
       words: counted.totalWords,
       trimmed,
       numerals: numeralsIn(answer),
+      identifiers,
+      unscored: item.unscored,
     })
 
     console.log(`  < ${reply.text}`)
     console.log(
       `    ${counted.totalWords} word(s), ${audioSeconds(reply.audioChunks).toFixed(1)}s spoken` +
         `${trimmed ? ", trimmed by the backstop" : ""}` +
-        `${rows.at(-1)!.numerals.length ? `, NUMERALS: ${rows.at(-1)!.numerals.join(" ")}` : ", no numerals"}\n`
+        `${rows.at(-1)!.numerals.length ? `, NUMERALS: ${rows.at(-1)!.numerals.join(" ")}` : ", no numerals"}`
     )
+    for (const id of identifiers) {
+      console.log(`    ${id.written}: ${id.verdict.toUpperCase()}${id.detail ? ` — ${id.detail}` : ""}`)
+    }
+    if (item.unscored) console.log(`    (unscored: ${item.unscored})`)
+    console.log("")
   }
   await client.close()
 
@@ -637,14 +808,33 @@ async function verifyNumbers(): Promise<void> {
       `       ${row.words} words, ${row.seconds.toFixed(1)}s` +
         `${row.numerals.length ? `, numerals: ${row.numerals.join(" ")}` : ""}`
     )
+    for (const id of row.identifiers) {
+      console.log(`       ${id.written}: ${id.verdict.toUpperCase()}${id.detail ? ` — ${id.detail}` : ""}`)
+    }
+    if (row.unscored) console.log(`       (unscored: ${row.unscored})`)
   }
 
   const words = spoke.map((row) => row.words)
   const meanWords = words.reduce((sum, value) => sum + value, 0) / (spoke.length || 1)
   const worstWords = Math.max(0, ...words)
 
-  console.log(`\n  answered:        ${answered}/${NUMBER_TEMPTING.length}`)
-  if (empty.length) console.log(`  EMPTY replies:   ${empty.length} (excluded from the rate below)`)
+  // IDENTIFIER ACCURACY is the headline. "Not named" is neither credit nor
+  // blame: a reply that answers about a different card is not evidence that the
+  // rule works or that it fails.
+  const judged = spoke.flatMap((row) => row.identifiers)
+  const idCorrect = judged.filter((id) => id.verdict === "correct")
+  const idMangled = judged.filter((id) => id.verdict === "mangled")
+  const idDigits = judged.filter((id) => id.verdict === "as digits")
+  const idAbsent = judged.filter((id) => id.verdict === "not named")
+  const idScored = idCorrect.length + idMangled.length + idDigits.length
+
+  console.log(`\n  answered:        ${answered}/${NUMBER_QUESTIONS.length}`)
+  if (empty.length) console.log(`  EMPTY replies:   ${empty.length} (excluded from the rates below)`)
+  console.log(
+    `  IDENTIFIERS:     ${idCorrect.length}/${idScored} correct` +
+      `${idScored ? ` (${((idCorrect.length / idScored) * 100).toFixed(0)}%)` : ""}` +
+      `, ${idMangled.length} mangled, ${idDigits.length} left as digits, ${idAbsent.length} not named`
+  )
   console.log(`  compliant:       ${compliant.length}/${spoke.length} (no digits or currency symbols)`)
   console.log(`  mean words:      ${meanWords.toFixed(1)}`)
   console.log(`  most words:      ${worstWords}`)
@@ -652,10 +842,32 @@ async function verifyNumbers(): Promise<void> {
 
   const violations = rows.filter((row) => row.numerals.length > 0)
   if (violations.length) {
-    console.log("\n  violations:")
+    console.log("\n  numeral violations:")
     for (const row of violations) {
       console.log(`    ${row.numerals.join(" ")}  <- ${row.question}`)
     }
+  }
+
+  const badRows = spoke.filter((row) =>
+    row.identifiers.some((id) => id.verdict === "mangled" || id.verdict === "as digits")
+  )
+  if (badRows.length) {
+    console.log("\n  identifiers that will not survive the synthesizer:")
+    for (const row of badRows) {
+      for (const id of row.identifiers.filter(
+        (entry) => entry.verdict === "mangled" || entry.verdict === "as digits"
+      )) {
+        console.log(
+          `    ${id.written}: ${id.verdict}${id.detail ? ` — ${id.detail}` : ""}  <- ${row.question}`
+        )
+      }
+    }
+  }
+
+  const unscored = rows.filter((row) => row.unscored)
+  if (unscored.length) {
+    console.log("\n  unscored by design (no agreed spoken form to check against):")
+    for (const row of unscored) console.log(`    ${row.question} — ${row.unscored}`)
   }
 
   // Spelling numbers out costs words, so the 40-word budget binds sooner and
@@ -675,16 +887,19 @@ async function verifyNumbers(): Promise<void> {
 
   check(
     "every question got a non-empty reply",
-    spoke.length === NUMBER_TEMPTING.length,
-    `${spoke.length}/${NUMBER_TEMPTING.length}${empty.length ? `, ${empty.length} empty` : ""}`
+    spoke.length === NUMBER_QUESTIONS.length,
+    `${spoke.length}/${NUMBER_QUESTIONS.length}${empty.length ? `, ${empty.length} empty` : ""}`
   )
   // Reported, not gated. The point of this run is the rate itself: a poor one
   // sizes the deterministic backstop in a later branch, and patching around it
   // here would hide the number that decision needs.
   console.log(
-    `\n  Compliance is reported, not enforced: ${compliant.length}/${spoke.length} is the measurement.` +
-      "\n  A reply with no digits in it can still be WRONG — read the transcript above:" +
-      "\n  \"RTX three sixty\" for a 3060 obeys the rule and names a card that does not exist."
+    `\n  Reported, not enforced. Identifier accuracy ${idCorrect.length}/${idScored} is the` +
+      ` headline; compliance ${compliant.length}/${spoke.length} is the older number and no longer` +
+      " the interesting one." +
+      "\n  A reply with no digits in it can still be WRONG, which is what the identifier" +
+      "\n  verdicts exist to catch: \"RTX three hundred sixty\" passes the digit check and" +
+      "\n  names a card that does not exist."
   )
 }
 
