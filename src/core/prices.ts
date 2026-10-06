@@ -119,17 +119,40 @@ export function findCurrencyAmounts(text: string): string[] {
 // said. The draft it is correcting is never recorded either — the user never
 // heard it, and history must not claim otherwise.
 //
-// It offers a search OR removal, and exempts a figure the user themselves
-// supplied: repeating "your $500 budget" back is not an invented price, and a
-// guard that forced it out would be a worse answer, not a safer one.
+// IT ASKS FOR THE SEARCH AND NOTHING ELSE.
+//
+// It used to offer a choice: search, or name the products without any prices.
+// The model overwhelmingly took the second option, which is SAFE — it never
+// restated a price in 34 measured runs — but it is also the less useful
+// answer, and the user asked a price question. Searches per shape, before
+// and after removing the choice:
+//
+//   direct "how much is X"     8/8  -> 8/8
+//   a price in an aside        1/8  -> 5/8
+//   a budget the user gave     3/8  -> 3/8    (unmoved)
+//   a priced list of parts     2/10 -> 9/10
+//
+// Still zero restated prices after the change, so the safe outcome was not
+// traded away for the useful one. Small samples: the aside measured 4/8 on a
+// second run of the same wording, so treat these as a direction, not a rate.
+//
+// Forcing the tool with tool_choice was tried first and reverted: Groq
+// answers a forced tool the model declines with a 400 rather than a reply, so
+// it refused 6 to 8 times out of 8 on the two shapes that most needed help
+// and cost a wasted round trip every time. The prompt is the lever here, not
+// the API.
+//
+// The USER'S OWN figure stays exempt: repeating "your $500 budget" back is
+// not an invented price, and a guard that forced it out would be a worse
+// answer, not a safer one.
 export function priceCorrectionPrompt(amounts: string[]): string {
   return (
     `STOP. Your draft reply stated ${amounts.length === 1 ? "a price" : "prices"} ` +
     `(${amounts.join(", ")}) and you did not search the web in this turn, so ` +
     `${amounts.length === 1 ? "that figure is" : "those figures are"} from memory and may be ` +
-    "wrong. A wrong price costs the user money. Write the reply again, and either call " +
-    "web_search first and use what it returns, or name the products without any prices and say " +
-    "you would have to look up what they cost now. The one exception is a figure the USER stated " +
-    "in this conversation — their own budget is theirs to repeat."
+    "wrong. A wrong price costs the user money. Call web_search NOW, before you write anything, " +
+    "and use what it returns. Do not answer from memory, and do not answer without searching. " +
+    "The one exception is a figure the USER stated in this conversation — their own budget is " +
+    "theirs to repeat."
   )
 }
