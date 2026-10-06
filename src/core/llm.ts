@@ -95,6 +95,20 @@ export class LLMDeadlineError extends Error {
   }
 }
 
+// Groq's answer to a forced tool_choice the model declines to honour. It is a
+// 400, not a reply: the request fails outright rather than degrading to text.
+// Measured against api.groq.com with openai/gpt-oss-20b — a forced web_search
+// on a conversation that had already searched and had the answer in context
+// came back "400 Tool choice is required, but model did not call a tool".
+//
+// Exported because the caller that forces a tool is the only thing that can
+// decide what to do instead, and it should not be matching on a message
+// fragment of its own.
+export function isToolChoiceRefusal(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return message.toLowerCase().includes("tool choice is required")
+}
+
 // Races a promise against a deadline. Used per chunk, not per call: the point
 // is to notice that the stream went quiet, which only a per-chunk deadline can
 // see. Promise.race attaches handlers to both, so the loser rejecting later is
@@ -110,7 +124,10 @@ function withDeadline<T>(promise: Promise<T>, ms: number, reason: string): Promi
 export async function chat(
   messages: Message[],
   tools?: OpenAI.Chat.ChatCompletionTool[],
-  options?: { silent?: boolean }
+  // `forceTool` names a tool the model MUST call on this one request, which
+  // is a stronger thing than asking for it in the prompt — see the price
+  // guard in Session. It only means anything alongside a non-empty `tools`.
+  options?: { silent?: boolean; forceTool?: string }
 ): Promise<LLMResponse> {
   // One controller for the whole call. Aborting it reaches the SDK (which
   // checks the signal between retry attempts) and the underlying socket, so
@@ -136,7 +153,11 @@ export async function chat(
         model: config.llm.model,
         messages,
         tools: tools?.length ? tools : undefined,
-        tool_choice: tools?.length ? "auto" : undefined,
+        tool_choice: !tools?.length
+          ? undefined
+          : options?.forceTool
+            ? { type: "function", function: { name: options.forceTool } }
+            : "auto",
         temperature: 0.2,
         stream: true,
       },

@@ -344,3 +344,107 @@ test("the voice backstop applies to the final reply, not the discarded one", asy
 
   sessions.shutdown()
 })
+
+// ------------------------------------- forcing the search, not asking for it
+//
+// Asking for the search in the correction worked about half the time: the
+// other half the model wrote the reply again and restated the same prices from
+// memory, which is the exact failure the guard exists to stop. So the
+// corrective call REQUIRES web_search through tool_choice instead.
+//
+// Measured against api.groq.com with openai/gpt-oss-20b:
+// - A forced tool is honoured, streaming and not, on a turn that has not
+//   searched: finish_reason=tool_calls, no content, the named function called.
+// - A forced tool the model will not call is a 400, not a reply:
+//   "Tool choice is required, but model did not call a tool". That is why
+//   there is a fallback below rather than a bare force.
+
+// A chat stand-in that records the options each call was made with, so a test
+// can assert on tool_choice rather than on the reply it produced.
+function scriptedWithOptions(replies: (LLMResponse | Error)[]): {
+  chat: ChatFn
+  forced: (string | undefined)[]
+} {
+  const forced: (string | undefined)[] = []
+  const chat: ChatFn = async (_messages, _tools, options) => {
+    forced.push(options?.forceTool)
+    const next = replies.shift()
+    if (!next) throw new Error("ran out of scripted replies")
+    if (next instanceof Error) throw next
+    return next
+  }
+  return { chat, forced }
+}
+
+test("the corrective call requires web_search, and only that call does", async () => {
+  const { chat, forced } = scriptedWithOptions([
+    text("The 3060 is about $250 used."),
+    { type: "tool_calls", calls: [{ id: "c1", name: "web_search", arguments: '{"query":"rtx 3060 price"}' }] },
+    text("Listings have it at about $250 used."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  const reply = await sessions.submitTurn("what GPU?", makeConnection({ id: "pf1" }), "text")
+
+  assert.deepEqual(
+    forced,
+    [undefined, "web_search", undefined],
+    "the first call is free to answer; the correction is not, and the call after it is free again",
+  )
+  // The forced search ran, so the price in the delivered reply is a searched one.
+  assert.equal(reply, "Listings have it at about $250 used.")
+
+  sessions.shutdown()
+})
+
+test("a model that refuses the forced search is asked again unforced", async () => {
+  // Groq's 400 for a forced tool_choice the model declines to honour.
+  const refusal = new Error("400 Tool choice is required, but model did not call a tool")
+  const { chat, forced } = scriptedWithOptions([
+    text("The 3060 is about $250 used."),
+    refusal,
+    text("The 3060 or the 4070. I would have to look up what they cost now."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  const reply = await sessions.submitTurn("what GPU?", makeConnection({ id: "pf2" }), "text")
+
+  assert.deepEqual(forced, [undefined, "web_search", undefined], "forced once, then not")
+  assert.equal(
+    reply,
+    "The 3060 or the 4070. I would have to look up what they cost now.",
+    "a refused force must not fail a turn the user is waiting on",
+  )
+
+  sessions.shutdown()
+})
+
+test("a refused force still spends the guard's one retry", async () => {
+  const refusal = new Error("400 Tool choice is required, but model did not call a tool")
+  const { chat, forced } = scriptedWithOptions([
+    text("The 3060 is about $250 used."),
+    refusal,
+    // Still priced, and still no search. The guard is used up, so this is
+    // delivered rather than argued with a third time.
+    text("The 3060 is about $250 used."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  const reply = await sessions.submitTurn("what GPU?", makeConnection({ id: "pf3" }), "text")
+
+  assert.equal(reply, "The 3060 is about $250 used.", "delivered rather than looped on")
+  assert.equal(forced.length, 3, "no second correction")
+
+  sessions.shutdown()
+})
+
+test("a turn with no price in it never forces a tool", async () => {
+  const { chat, forced } = scriptedWithOptions([text("The 3060 is the safe pick.")])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  await sessions.submitTurn("what GPU?", makeConnection({ id: "pf4" }), "text")
+
+  assert.deepEqual(forced, [undefined])
+
+  sessions.shutdown()
+})
