@@ -1,14 +1,7 @@
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import {
-  chat as defaultChat,
-  isToolChoiceRefusal,
-  LLMDeadlineError,
-  type LLMResponse,
-  type Message,
-  type ToolCall,
-} from "./llm"
+import { chat as defaultChat, LLMDeadlineError, type LLMResponse, type Message, type ToolCall } from "./llm"
 import { registry, type Tool } from "../tools/registry"
 import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
@@ -567,43 +560,16 @@ export class Session {
     // twice is not going to stop on the third ask, and a loop here would spend
     // the turn's budget arguing with it.
     let priceGuardUsed = false
-    // Set for the price guard's corrective call: on that one call web_search
-    // is REQUIRED, not requested. Asking for it in the prompt worked about
-    // half the time — the other half the model restated the same prices from
-    // memory, which is the exact failure the guard exists to stop.
-    let forceSearch = false
 
     for (let i = 0; i < 10; i++) {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
       let response: LLMResponse
-      // Consumed here, so forcing applies to exactly this one call however it
-      // turns out. The catch below still needs to know it was forcing, which
-      // is why the flag is read into a local rather than cleared later.
-      const forcing = forceSearch
-      forceSearch = false
-      // Built once and kept, so the diagnostics below describe the array that
-      // was actually sent rather than a second, freshly rebuilt one.
-      const sent = this.messagesForCall(origin)
       try {
-        response = await this.chat(
-          sent,
-          retrying ? [] : tools,
-          forcing ? { forceTool: "web_search" } : undefined
-        )
+        response = await this.chat(this.messagesForCall(origin), retrying ? [] : tools)
       } catch (err) {
         // A deadline is never a malformed tool call, and asking again without
         // tools would just spend the budget twice.
         if (err instanceof LLMDeadlineError) throw err
-        // A forced tool the model will not call is a 400 from Groq, not a
-        // reply — see isToolChoiceRefusal. Ask again without forcing rather
-        // than failing the turn: the guard still has its deliver-anyway path,
-        // and the user is waiting on an answer, not on a correction.
-        if (forcing && isToolChoiceRefusal(err)) {
-          console.log(
-            "price guard: the model refused the forced web_search — asking again unforced"
-          )
-          continue
-        }
         const msg = err instanceof Error ? err.message : String(err)
         if (!retrying && (
           msg.toLowerCase().includes("failed to call a function") ||
@@ -630,10 +596,9 @@ export class Session {
             if (!priceGuardUsed) {
               priceGuardUsed = true
               this.priceCorrection = priceCorrectionPrompt(amounts)
-              forceSearch = true
               console.log(
                 `price guard: draft stated ${amounts.join(", ")} with no web_search this turn — ` +
-                  `requiring web_search and asking again`
+                  `asking again`
               )
               continue
             }
@@ -650,23 +615,6 @@ export class Session {
           this.messages.push({ role: "assistant", content: spoken.recorded })
           return spoken.text
         }
-
-        // The model returned a text response with nothing in it. Logged
-        // rather than papered over: the transport already handles it
-        // correctly (no speak() call, and replyEnd still fires), and a
-        // stand-in apology would put words in history the user never heard.
-        //
-        // What the line says is how much conversation the call carried, which
-        // is what distinguishes the two causes. A call that carried the
-        // conversation and still came back empty is the model; a call that
-        // carried only system prompts was starved by the context budget, and
-        // that is the shape buildWindow used to produce from four parallel
-        // web_search results.
-        console.warn(
-          `empty reply: the model returned no content on call ${i + 1} of this turn — ` +
-            `the call carried ${sent.length} messages ` +
-            `(${sent.filter((m) => m.role !== "system").length} of them conversation)`
-        )
         return response.content
       }
 
