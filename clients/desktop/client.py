@@ -207,6 +207,13 @@ async def main() -> None:
                     elif msgType == "audioStart":
                         collectingAudio = True
                         await gate.note_reply_audio_started()
+                        # A reply is starting, so anything still open on the
+                        # recorder was spoken over the top of the previous
+                        # turn. Drop it: the mic loop is about to stop feeding
+                        # frames for the duration of the reply, so trailing
+                        # silence cannot end it, and left open it would splice
+                        # the user's next utterance onto this fragment.
+                        recorder.abandon()
                         chunkCount = 0
                         firstChunkAt = None
                         audioStartedAt = time.monotonic()

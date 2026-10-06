@@ -70,3 +70,28 @@ class VoiceActivityRecorder:
             logger.debug("Recording -> Idle (score=%.3f, trailing silence=%.0fms)", score, self._silence_ms)
             self.state = RecorderState.IDLE
             await self._on_speech_end()
+
+    def abandon(self) -> None:
+        """Drop an open recording instead of finishing it.
+
+        Deliberately does NOT call on_speech_end, so no audioInputEnd is sent
+        and the backend discards the partial audio when the next audioStart
+        arrives. Sending it would hand whisper a fragment spoken over the top
+        of a reply, which it tends to "hear" as words. Same semantics as the
+        browser client's abandonTurn() (src/api/test-client.ts).
+
+        Synchronous and not a coroutine, because it fires no callbacks: the
+        reply-start handler can call it without awaiting anything.
+
+        Without this the recorder had no way out of RECORDING except trailing
+        silence, and trailing silence is counted from frames the mic loop
+        stops delivering the moment Ixa starts speaking. A user who talked
+        over a reply left the recorder RECORDING for the whole of it, and
+        their next utterance was appended to the abandoned one rather than
+        opening a turn of its own.
+        """
+        if self.state is RecorderState.IDLE:
+            return
+        logger.debug("Recording -> Idle (abandoned: a reply started)")
+        self.state = RecorderState.IDLE
+        self._silence_ms = 0.0
