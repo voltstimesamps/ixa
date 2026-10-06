@@ -95,16 +95,25 @@ test("the voice constraint survives windowing", async () => {
 // it could not see, the model returned an empty string — measured at roughly
 // one attempt in three against openai/gpt-oss-20b, a generic "what would you
 // like help with?" the rest of the time.
-test("a turn whose tool results exceed the budget still sends the question", async () => {
-  const RESULT = `1. Used RTX 3090 listings\nhttps://example.com\n${"x".repeat(5250)}`
+//
+// Driven here through a generic large-output tool rather than web_search,
+// because web_search is now additionally capped at 3 calls per turn (see
+// test/search-cap.test.ts), which makes the original four-search shape
+// unreachable through it. The invariant being tested is not about searching:
+// ANY tool group that outgrows the budget used to take the conversation with
+// it, and the cap is a second line of defence rather than a replacement for
+// this one. A lower budget, a chattier tool or an MCP tool in Phase 4 can all
+// reach the same place.
+test("a turn whose tool results exceed the budget still sends the conversation", async () => {
+  const BIG = "x".repeat(5250)
 
   const { registry } = await import("../src/tools/registry.js")
   registry.register({
-    name: "web_search",
-    description: "Search the web.",
-    inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    name: "read_page",
+    description: "Fetch a page and return its text.",
+    inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
     requiresConfirmation: false,
-    execute: async () => RESULT,
+    execute: async () => BIG,
   })
 
   const sent: Message[][] = []
@@ -116,8 +125,8 @@ test("a turn whose tool results exceed the budget still sends the question", asy
         type: "tool_calls",
         calls: Array.from({ length: 4 }, (_, i) => ({
           id: `call_${i}`,
-          name: "web_search",
-          arguments: JSON.stringify({ query: `used rtx 3090 price ${i}` }),
+          name: "read_page",
+          arguments: JSON.stringify({ url: `https://example.com/${i}` }),
         })),
       }
     }
