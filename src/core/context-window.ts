@@ -86,9 +86,37 @@ export function buildWindow(messages: Message[], limits: ContextWindowLimits): M
   for (let i = groups.length - 1; i >= 0; i--) {
     const group = groups[i]!
     const groupChars = group.reduce((sum, msg) => sum + charCost(msg), 0)
+    const overMessages = usedMessages + group.length > limits.maxMessages
+    const overChars = usedChars + groupChars > limits.budgetChars
 
-    if (usedMessages + group.length > limits.maxMessages) break
-    if (usedChars + groupChars > limits.budgetChars) break
+    // THE WINDOW IS NEVER EMPTY OF CONVERSATION.
+    //
+    // Every group used to be dropped the same way, and because the walk
+    // BREAKS at the first group that does not fit, dropping the newest one
+    // dropped everything behind it too: the window came back holding nothing
+    // but the leading system prompts. A single group can exceed the whole
+    // budget on its own — four parallel web_search calls are ~21.5k
+    // characters of tool results against the 24000 default — so one ordinary
+    // turn could reach it. Asked to answer a conversation it could not see,
+    // the model returned an empty reply.
+    //
+    // So the newest group is taken whatever it costs, and the budget binds
+    // normally from the second group on. The exception is deliberately this
+    // narrow: a tighter cap that drops older turns is the budget working as
+    // intended, and only a window with NOTHING in it is broken.
+    //
+    // Sending an over-budget group is a more expensive request than the
+    // budget asked for. Sending no conversation at all is not a request. The
+    // budget is a cost control, not a limit of the model's context, so the
+    // group goes out and the overrun is logged.
+    if (overMessages || overChars) {
+      if (kept.length > 0) break
+      console.log(
+        `context window: newest group is over budget, sending it anyway — ` +
+          `${group.length} messages, ${groupChars} chars ` +
+          `(limits: ${limits.maxMessages} messages, ${limits.budgetChars} chars)`
+      )
+    }
 
     kept.unshift(group)
     usedMessages += group.length

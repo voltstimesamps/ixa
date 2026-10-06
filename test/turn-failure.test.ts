@@ -195,6 +195,44 @@ test("a malformed frame does not close the socket", async () => {
   client.close()
 })
 
+// The empty reply, as the protocol sees it.
+//
+// A live voice session produced a turn with no text at all — "Ixa:" and
+// nothing after it — after four web_search calls succeeded. The cause was the
+// context budget handing the model a window with no conversation in it (see
+// buildWindow and test/session-window.test.ts). This is the other half of the
+// question: what the client is told when it happens. Nothing is spoken, and
+// the turn still terminates — so a voice client, which stops its own
+// conversation timer for the duration of a turn, gets the microphone back
+// instead of waiting out its safety net.
+test("an empty reply speaks nothing and still terminates the turn", async () => {
+  chatBehaviour = async () => ({ type: "text", content: "" })
+
+  const client = await connect()
+  const before = ttsRequests
+  const framesBefore = client.binaryFrames
+  const turn = await client.ask("how much is a used 3090 going for")
+  const types = turn.map((m) => m.type)
+
+  assert.deepEqual(types, ["assistant", "replyEnd"], `unexpected turn: ${types.join(",")}`)
+  assert.equal(turn.find((m) => m.type === "assistant")?.content, "")
+
+  // speak() is never reached with an empty string: nothing was synthesized
+  // and no audio frames were sent.
+  assert.equal(ttsRequests, before, "an empty reply must not reach TTS")
+  assert.equal(client.binaryFrames, framesBefore, "no audio for a reply with no words in it")
+  assert.ok(!types.includes("audioStart"))
+
+  // The session survives it, which is what the live log showed: the turn
+  // after the empty one was normal.
+  chatBehaviour = async () => ({ type: "text", content: "about eight hundred dollars" })
+  const next = await client.ask("say that again")
+  assert.equal(next.find((m) => m.type === "assistant")?.content, "about eight hundred dollars")
+  assert.equal(client.socket.readyState, WebSocket.OPEN)
+
+  client.close()
+})
+
 // Last, because it takes the TTS sidecar away for good.
 test("replyEnd still arrives when TTS is unavailable", async () => {
   for (const socket of ttsSockets) socket.destroy()

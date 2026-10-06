@@ -137,12 +137,17 @@ test("preferences survive a context budget that drops all history", async () => 
   await sessions.submitTurn("still there?", connection, "text")
 
   const messages = sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system"])
+  // The newest message always travels now (buildWindow keeps the newest group
+  // whatever it costs — a window with no conversation in it produced empty
+  // replies). Everything behind it is still clipped, which is what this test
+  // is about: the preference block is BUILT per call, not carried by history.
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
   assert.match(String(messages[1]!.content), /coffee: black/)
+  assert.equal(messages.at(-1)!.content, "still there?")
   assert.equal(
-    messages.some((m) => m.role === "user"),
+    messages.some((m) => m.content === "hello"),
     false,
-    "history really was clipped away — the preference was not",
+    "the earlier turn really was clipped away — the preference was not",
   )
 
   sessions.shutdown()

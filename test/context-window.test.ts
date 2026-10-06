@@ -19,7 +19,55 @@ function toolGroup(id: string): Message[] {
 test("keeps leading system prompts even when the budget is tiny", () => {
   const messages: Message[] = [SYSTEM, { role: "user", content: "hello" }]
   const out = buildWindow(messages, { maxMessages: 1, budgetChars: 1 })
-  assert.deepEqual(out, [SYSTEM])
+  assert.equal(out[0], SYSTEM)
+})
+
+// The newest group is not optional. It used to be dropped like any other when
+// it did not fit, and because the walk stops at the first group that does not
+// fit, that dropped the whole conversation: the model was handed its system
+// prompt and nothing else, and answered with an empty reply. Four parallel
+// web_search results are ~21.5k chars against the 24000 default, so one
+// ordinary turn could reach it.
+test("the newest group survives a budget it does not fit in", () => {
+  const messages: Message[] = [SYSTEM, { role: "user", content: "hello" }]
+  const out = buildWindow(messages, { maxMessages: 1, budgetChars: 1 })
+  assert.deepEqual(
+    out.map((m) => m.content),
+    ["system prompt", "hello"],
+    "a window with no conversation in it is not a request the model can answer",
+  )
+})
+
+test("an oversized newest group goes out whole, never sliced", () => {
+  const big = "x".repeat(50_000)
+  const call: Message = {
+    role: "assistant",
+    content: null,
+    tool_calls: [
+      { id: "a", type: "function", function: { name: "web_search", arguments: "{}" } },
+      { id: "b", type: "function", function: { name: "web_search", arguments: "{}" } },
+    ],
+  }
+  const messages: Message[] = [
+    SYSTEM,
+    { role: "user", content: "how much is it" },
+    call,
+    { role: "tool", tool_call_id: "a", content: big },
+    { role: "tool", tool_call_id: "b", content: big },
+  ]
+
+  const out = buildWindow(messages, { maxMessages: 40, budgetChars: 24000 })
+
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ["system", "assistant", "tool", "tool"],
+    "the group is over budget, so it travels alone — but it does travel, and whole",
+  )
+  assert.equal(
+    out.filter((m) => m.role === "tool").length,
+    2,
+    "both results travel with their call",
+  )
 })
 
 test("keeps only the most recent messages under a message cap", () => {
@@ -60,7 +108,30 @@ test("never sends a tool result without its call", () => {
   const tools = out.filter((m) => m.role === "tool")
   const calls = out.filter((m) => m.role === "assistant" && "tool_calls" in m)
   assert.equal(tools.length, calls.length, "tool results and tool calls must come in pairs")
-  assert.deepEqual(out, [SYSTEM], "a group that does not fit whole is dropped whole")
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ["system", "assistant", "tool"],
+    "the group is taken whole — and the user message behind it is what gets clipped",
+  )
+})
+
+// The same atomicity rule where the group that does not fit is NOT the newest
+// one, which is the case the newest-group exception does not cover.
+test("an older group that does not fit is dropped whole", () => {
+  const messages: Message[] = [
+    SYSTEM,
+    ...toolGroup("old_call"),
+    { role: "user", content: "newest" },
+  ]
+
+  // Room for the system prompt and the newest message, and not a byte more.
+  const out = buildWindow(messages, { maxMessages: 2, budgetChars: 100000 })
+
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ["system", "user"],
+    "neither half of the older group came along",
+  )
 })
 
 test("keeps a tool-call group intact when it does fit", () => {

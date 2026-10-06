@@ -205,8 +205,17 @@ test("a recalled block survives a budget that drops all history", async () => {
   await h.sessions.submitTurn("again", makeConnection({ id: "c7" }), "text")
 
   const messages = h.sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system"])
+  // The newest message always travels now — see buildWindow. The first turn
+  // is still clipped, which is the point: the recalled block is built per
+  // call rather than carried along by history.
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
   assert.match(String(messages[1]!.content), /earlier conversations/)
+  assert.equal(messages.at(-1)!.content, "again")
+  assert.equal(
+    messages.some((m) => m.content === "hello"),
+    false,
+    "the earlier turn really was clipped away — the recalled block was not",
+  )
 
   h.sessions.shutdown()
 })
