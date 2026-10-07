@@ -726,6 +726,11 @@ interface ClockValue {
   // flag has to exist — see judgeClock.
   missingOh?: boolean
   meridiem?: "am" | "pm"
+  // The words the reply actually used. Without it the detail line quotes a
+  // reply back at itself wrongly — an "in the afternoon" reply was reported as
+  // "in the evening", because pm renders as evening and nothing kept what was
+  // said.
+  partOfDay?: "morning" | "afternoon" | "evening"
 }
 
 const HOUR_WORDS = ONES_WORDS.slice(1, 13).join("|")
@@ -753,11 +758,13 @@ function parseSpokenTimes(text: string): ClockValue[] {
     const hour = ONES_WORDS.indexOf(match[1]!)
     const minute = parseMinutePhrase(match[2]!)
     if (minute === null) continue
+    const partOfDay = match[3] as "morning" | "afternoon" | "evening"
     found.push({
       hour,
       minute: minute.value,
       missingOh: minute.missingOh,
-      meridiem: match[3] === "morning" ? "am" : "pm",
+      meridiem: partOfDay === "morning" ? "am" : "pm",
+      partOfDay,
     })
   }
 
@@ -833,7 +840,13 @@ function minuteForms(minute: number): string[] {
 }
 
 function spoken(value: ClockValue): string {
-  const part = value.meridiem === "am" ? " in the morning" : value.meridiem === "pm" ? " in the evening" : ""
+  const part = value.partOfDay
+    ? ` in the ${value.partOfDay}`
+    : value.meridiem === "am"
+      ? " in the morning"
+      : value.meridiem === "pm"
+        ? " in the evening"
+        : ""
   return `${ONES_WORDS[value.hour]} ${minuteForms(value.minute)[0]}${part}`
 }
 
@@ -937,12 +950,12 @@ function judgeClock(
     }
   }
   for (const value of said) {
-    if (context.stale.some((old) => sameClock(old, value))) {
+    if (context.stale.some((seen) => sameClock(seen, value))) {
       return {
         verdict: "stale",
         detail:
-          `said "${spoken(value)}" — a time get_time returned earlier in this ` +
-          `session; expected ${expected}`,
+          `said "${spoken(value)}" — a time already in this conversation, from an ` +
+          `earlier get_time result or an earlier reply; expected ${expected}`,
       }
     }
   }
@@ -1209,11 +1222,34 @@ interface TimeAsk {
   staleOffByMinutes: number | null
 }
 
-// Every time get_time has returned in the live session so far.
+// Every clock value already sitting in the live session, from both places one
+// can come from.
+//
+// get_time's results are the obvious half. The other half is the times IXA
+// HERSELF stated on earlier turns, and leaving them out undercounted the very
+// failure being measured: in the first baseline run ask 1 invented "twelve
+// thirty-three in the afternoon" with no tool call, and ask 2 said it straight
+// back. That is the stale shape exactly — a value preferred because it was
+// visible — and scoring it "mangled" filed it as though the model could not say
+// a time at all.
+//
+// A value that is still the current minute is not counted against anything:
+// judgeClock tests the real clock first, so a correct answer can never be
+// called stale.
 function timesAlreadyInContext(): ClockValue[] {
   const row = liveSession()
   if (!row) return []
-  return toolResultsIn(row, "get_time").flatMap((result) => parseDigitTimes(result))
+
+  const fromTool = toolResultsIn(row, "get_time").flatMap((result) => parseDigitTimes(result))
+  const fromIxa = messagesOf(row)
+    .filter((message) => message.role === "assistant" && typeof message.content === "string")
+    .flatMap((message) => parseSpokenTimes(message.content!))
+
+  const unique: ClockValue[] = []
+  for (const value of [...fromTool, ...fromIxa]) {
+    if (!unique.some((seen) => sameClock(seen, value))) unique.push(value)
+  }
+  return unique
 }
 
 // How far apart two twelve-hour clock values are, in minutes, taking the
