@@ -681,6 +681,7 @@ type IdVerdict =
   | "as digits"
   | "not named"
   | "missing oh"
+  | "spurious oh"
   | "recited"
   | "stale"
 
@@ -726,6 +727,12 @@ interface ClockValue {
   // three". The value parses to the right minute, which is exactly why this
   // flag has to exist — see judgeClock.
   missingOh?: boolean
+  // The mirror of it, and found the same way — by reading what a baseline run
+  // actually said. An "oh" on a minute of TEN OR MORE: 12:18 as "twelve oh
+  // eighteen". Nobody says that, and it parses to the right minute too, so
+  // without its own flag the judge calls it correct and the after-run reports a
+  // compliance it has not got.
+  spuriousOh?: boolean
   meridiem?: "am" | "pm"
   // The words the reply actually used. Without it the detail line quotes a
   // reply back at itself wrongly — an "in the afternoon" reply was reported as
@@ -764,6 +771,7 @@ function parseSpokenTimes(text: string): ClockValue[] {
       hour,
       minute: minute.value,
       missingOh: minute.missingOh,
+      spuriousOh: minute.spuriousOh,
       meridiem: partOfDay === "morning" ? "am" : "pm",
       partOfDay,
     })
@@ -779,7 +787,9 @@ function parseSpokenTimes(text: string): ClockValue[] {
 
 // "fifty three" -> 53. "oh three" -> 3. "three" -> 3, flagged: a minute under
 // ten said without its "oh" is the leading-zero bug.
-function parseMinutePhrase(phrase: string): { value: number; missingOh: boolean } | null {
+function parseMinutePhrase(
+  phrase: string
+): { value: number; missingOh: boolean; spuriousOh: boolean } | null {
   const bare = phrase.replace(/^(?:oh|zero)\s+/, "")
   const hadOh = bare !== phrase
   const words = bare.split(/\s+/)
@@ -788,13 +798,17 @@ function parseMinutePhrase(phrase: string): { value: number; missingOh: boolean 
     const value = ONES_WORDS.indexOf(words[0]!)
     if (value < 0) return null
     if (value >= 20) return null
-    return { value, missingOh: value > 0 && value < 10 && !hadOh }
+    return {
+      value,
+      missingOh: value > 0 && value < 10 && !hadOh,
+      spuriousOh: value >= 10 && hadOh,
+    }
   }
   if (words.length === 2) {
     const tens = TENS_WORDS.indexOf(words[0]!)
     const ones = ONES_WORDS.indexOf(words[1]!)
     if (tens < 2 || ones < 1 || ones > 9) return null
-    return { value: tens * 10 + ones, missingOh: false }
+    return { value: tens * 10 + ones, missingOh: false, spuriousOh: hadOh }
   }
   return null
 }
@@ -928,6 +942,15 @@ function judgeClock(
       return {
         verdict: "missing oh",
         detail: `said the right minute without its "oh"; expected ${expected}`,
+      }
+    }
+    const spuriousOh = onTheClock.find((value) => value.spuriousOh)
+    if (spuriousOh) {
+      return {
+        verdict: "spurious oh",
+        detail:
+          `put an "oh" on a minute of ten or more — "${ONES_WORDS[spuriousOh.hour]} oh ` +
+          `${minuteForms(spuriousOh.minute)[0]}"; expected ${expected}`,
       }
     }
     const wrongHalf = onTheClock.find(
@@ -1439,8 +1462,9 @@ async function verifyClock(): Promise<void> {
   const recited = rows.filter((row) => row.verdict === "recited")
   const stale = rows.filter((row) => row.verdict === "stale")
   const missingOh = rows.filter((row) => row.verdict === "missing oh")
+  const spuriousOh = rows.filter((row) => row.verdict === "spurious oh")
   const other = rows.filter(
-    (row) => !["correct", "recited", "stale", "missing oh"].includes(row.verdict)
+    (row) => !["correct", "recited", "stale", "missing oh", "spurious oh"].includes(row.verdict)
   )
 
   // Right by luck: no call, and the answer happened to be the clock anyway.
@@ -1472,6 +1496,7 @@ async function verifyClock(): Promise<void> {
   console.log(`  RECITED a prompt time: ${recited.length}`)
   console.log(`  STALE value:           ${stale.length}`)
   console.log(`  missing "oh":          ${missingOh.length}`)
+  console.log(`  SPURIOUS "oh":         ${spuriousOh.length} (an "oh" on a minute of ten or more)`)
   console.log(`  wrong some other way:  ${other.length}`)
   console.log(
     `  right by luck:         ${luckyHits.length}` +
@@ -1634,6 +1659,8 @@ async function verifySource(): Promise<void> {
   const correct = rows.filter((row) => row.verdict === "correct")
   const recited = rows.filter((row) => row.verdict === "recited")
   const missingOh = rows.filter((row) => row.verdict === "missing oh")
+  const spuriousOh = rows.filter((row) => row.verdict === "spurious oh")
+  const invented = rows.filter((row) => row.detail.includes("invented seconds"))
   const searched = rows.filter((row) => !row.calledGetTime && row.toolsCalled.includes("web_search"))
   const noTool = rows.filter((row) => row.toolsCalled.length === 0)
   const luckyHits = rows.filter((row) => !row.calledGetTime && row.verdict === "correct")
@@ -1645,6 +1672,8 @@ async function verifySource(): Promise<void> {
   console.log(`  stated the real time:  ${correct.length}/${answered}${pct(correct.length)}`)
   console.log(`  RECITED a prompt time: ${recited.length}${pct(recited.length)}`)
   console.log(`  missing "oh":          ${missingOh.length}`)
+  console.log(`  SPURIOUS "oh":         ${spuriousOh.length} (an "oh" on a minute of ten or more)`)
+  console.log(`  INVENTED SECONDS:      ${invented.length}${pct(invented.length)}`)
   console.log(`  searched the web:      ${searched.length}`)
   console.log(`  no tool at all:        ${noTool.length}`)
   console.log(`  right by luck:         ${luckyHits.length} (no call, correct anyway)`)
@@ -1733,6 +1762,28 @@ const DETECTOR_CASES: Array<{
     samples: ["2026-10-06T22:03:10", "2026-10-06T22:03:14"],
     stale: [],
     expect: "correct",
+  },
+  {
+    // From the first sixty-ask baseline, where the judge scored it CORRECT.
+    what: 'spurious "oh": an "oh" on a minute of ten or more',
+    reply: "It is twelve oh eighteen in the morning.",
+    samples: ["2026-10-07T00:18:43"],
+    stale: [],
+    expect: "spurious oh",
+  },
+  {
+    what: 'the same minute said properly takes no "oh"',
+    reply: "It is twelve eighteen in the morning.",
+    samples: ["2026-10-07T00:18:43"],
+    stale: [],
+    expect: "correct",
+  },
+  {
+    what: "a two-word minute with an \"oh\" bolted on is wrong too",
+    reply: "It is ten oh fifty-three in the evening.",
+    samples: ["2026-10-06T22:53:50"],
+    stale: [],
+    expect: "spurious oh",
   },
   {
     what: "a minute crossed mid-turn is not a wrong answer",
