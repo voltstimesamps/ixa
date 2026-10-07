@@ -11,6 +11,7 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts scoreboard   # 1
 //   npx tsx dev/scripts/voice-behavior-verify.ts numbers      # 8
 //   npx tsx dev/scripts/voice-behavior-verify.ts clock        # 9
+//   npx tsx dev/scripts/voice-behavior-verify.ts detector     # 9b, offline
 //   npx tsx dev/scripts/voice-behavior-verify.ts nonsense     # 10
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
@@ -18,6 +19,16 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts priceguard   # 7
 //   npx tsx dev/scripts/voice-behavior-verify.ts tokens       # prompt cost
 //   npx tsx dev/scripts/voice-behavior-verify.ts strays       # 6, read-only
+//
+// `detector` needs none of that: it checks the clock judge offline, against the
+// replies two live failures actually produced. Run it before `clock`, because a
+// twenty-ask run costs real time and real tokens and a judge with a hole in it
+// spends both measuring nothing.
+//
+// `clock` forces each ask into a different minute, so it takes roughly as many
+// minutes as it makes asks. That is not slack: a stale value thirty seconds old
+// is still the right answer, and three of four asks in the live run were seconds
+// apart and so could not have failed detectably.
 //
 // The scoreboard is run TWICE against the same build to separate the two
 // length fixes, because the backstop can be switched off from the
@@ -50,7 +61,14 @@ import {
   synthesize,
   type Reply,
 } from "./lib/voice"
-import { episodeRows, liveSession, messagesOf, sessionRows, toolCallsInLastTurn } from "./lib/db"
+import {
+  episodeRows,
+  liveSession,
+  messagesOf,
+  sessionRows,
+  toolCallsInLastTurn,
+  toolResultsIn,
+} from "./lib/db"
 
 let failures = 0
 
@@ -653,7 +671,17 @@ function flatten(text: string): string {
     .replace(/\s+/g, " ")
 }
 
-type IdVerdict = "correct" | "mangled" | "as digits" | "not named"
+// The last three come from judgeClock only, and exist because "mangled" hides
+// the difference between a model that cannot say a time and a model that said a
+// time it could SEE instead of the one it was given. See judgeClock.
+type IdVerdict =
+  | "correct"
+  | "mangled"
+  | "as digits"
+  | "not named"
+  | "missing oh"
+  | "recited"
+  | "stale"
 
 // An identifier is only judged if the reply tried to name it. A reply about a
 // different card is not evidence either way — but a reply that writes the
@@ -685,31 +713,241 @@ const ONES_WORDS = [
 ]
 const TENS_WORDS = ["", "", "twenty", "thirty", "forty", "fifty"]
 
-function minuteWords(minute: number): string[] {
-  if (minute === 0) return ["o'clock", "oh clock"]
-  if (minute < 10) return [`oh ${ONES_WORDS[minute]}`, `zero ${ONES_WORDS[minute]}`, ONES_WORDS[minute]!]
+// A clock value as SPOKEN, on a twelve-hour face. The meridiem is kept
+// separately because a spoken reply gives it in words ("in the evening") and
+// get_time gives it as "PM": comparing the two needs them apart from the
+// digits, and an hour that is right with the wrong half of the day is its own
+// mistake rather than a wrong time.
+interface ClockValue {
+  hour: number // 1-12
+  minute: number
+  // True when a minute under ten was said without its "oh": 10:03 as "ten
+  // three". The value parses to the right minute, which is exactly why this
+  // flag has to exist — see judgeClock.
+  missingOh?: boolean
+  meridiem?: "am" | "pm"
+}
+
+const HOUR_WORDS = ONES_WORDS.slice(1, 13).join("|")
+
+// Every clock time a piece of text SAYS OUT LOUD.
+//
+// A parser rather than a pair of substring tests. The old judge looked for the
+// hour anywhere in the reply and the minute anywhere else, independently, which
+// is loose enough to pass a reply that names two different times — and it gave
+// no VALUE back, so it could not say which time had been said. Scoring a
+// recited or a stale time needs the value, not a yes/no.
+//
+// Shapes covered: "ten fifty-three in the evening", "ten oh three in the
+// morning", "ten o'clock". Hyphens are already spaces by the time flatten is
+// done with them.
+function parseSpokenTimes(text: string): ClockValue[] {
+  const flat = flatten(text)
+  const found: ClockValue[] = []
+
+  const withMinutes = new RegExp(
+    String.raw`\b(${HOUR_WORDS})\s+((?:oh\s+|zero\s+)?[a-z]+(?:\s+[a-z]+)?)\s+in the (morning|afternoon|evening)\b`,
+    "g"
+  )
+  for (const match of flat.matchAll(withMinutes)) {
+    const hour = ONES_WORDS.indexOf(match[1]!)
+    const minute = parseMinutePhrase(match[2]!)
+    if (minute === null) continue
+    found.push({
+      hour,
+      minute: minute.value,
+      missingOh: minute.missingOh,
+      meridiem: match[3] === "morning" ? "am" : "pm",
+    })
+  }
+
+  const onTheHour = new RegExp(String.raw`\b(${HOUR_WORDS})\s+o'?\s?clock\b`, "g")
+  for (const match of flat.matchAll(onTheHour)) {
+    found.push({ hour: ONES_WORDS.indexOf(match[1]!), minute: 0 })
+  }
+
+  return found
+}
+
+// "fifty three" -> 53. "oh three" -> 3. "three" -> 3, flagged: a minute under
+// ten said without its "oh" is the leading-zero bug.
+function parseMinutePhrase(phrase: string): { value: number; missingOh: boolean } | null {
+  const bare = phrase.replace(/^(?:oh|zero)\s+/, "")
+  const hadOh = bare !== phrase
+  const words = bare.split(/\s+/)
+
+  if (words.length === 1) {
+    const value = ONES_WORDS.indexOf(words[0]!)
+    if (value < 0) return null
+    if (value >= 20) return null
+    return { value, missingOh: value > 0 && value < 10 && !hadOh }
+  }
+  if (words.length === 2) {
+    const tens = TENS_WORDS.indexOf(words[0]!)
+    const ones = ONES_WORDS.indexOf(words[1]!)
+    if (tens < 2 || ones < 1 || ones > 9) return null
+    return { value: tens * 10 + ones, missingOh: false }
+  }
+  return null
+}
+
+// Every clock time a piece of text writes in DIGITS: "10:53", and get_time's
+// own "8:43:48 PM". The seconds are deliberately not kept — they are not part
+// of a spoken time and the clock rule says never to say them.
+function parseDigitTimes(text: string): ClockValue[] {
+  const found: ClockValue[] = []
+  for (const match of text.matchAll(/\b(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?/gi)) {
+    const rawHour = Number(match[1])
+    const minute = Number(match[2])
+    if (rawHour > 23 || minute > 59) continue
+    const hour = rawHour % 12 === 0 ? 12 : rawHour % 12
+    const meridiem = match[3]
+      ? (match[3].toLowerCase() as "am" | "pm")
+      : rawHour >= 12
+        ? "pm"
+        : undefined
+    found.push({ hour, minute, meridiem })
+  }
+  return found
+}
+
+function clockValueOf(at: Date): ClockValue {
+  return {
+    hour: at.getHours() % 12 === 0 ? 12 : at.getHours() % 12,
+    minute: at.getMinutes(),
+    meridiem: at.getHours() >= 12 ? "pm" : "am",
+  }
+}
+
+function sameClock(a: ClockValue, b: ClockValue): boolean {
+  return a.hour === b.hour && a.minute === b.minute
+}
+
+function minuteForms(minute: number): string[] {
+  if (minute === 0) return ["o'clock"]
+  if (minute < 10) return [`oh ${ONES_WORDS[minute]}`]
   if (minute < 20) return [ONES_WORDS[minute]!]
   const tens = TENS_WORDS[Math.floor(minute / 10)]!
   const ones = minute % 10
-  return ones === 0 ? [tens] : [`${tens}-${ONES_WORDS[ones]}`, `${tens} ${ONES_WORDS[ones]}`]
+  return ones === 0 ? [tens] : [`${tens}-${ONES_WORDS[ones]}`]
 }
 
-function judgeClock(reply: string, at: Date): { verdict: IdVerdict; detail: string } {
+function spoken(value: ClockValue): string {
+  const part = value.meridiem === "am" ? " in the morning" : value.meridiem === "pm" ? " in the evening" : ""
+  return `${ONES_WORDS[value.hour]} ${minuteForms(value.minute)[0]}${part}`
+}
+
+// The times VOICE_RESPONSE_PROMPT itself contains, read OUT OF THE PROMPT.
+//
+// Listing them by hand is how a detector goes quietly blind: the clock example
+// is the thing under change, and a hardcoded "ten fifty three" would keep
+// passing while measuring nothing at all. Parsed instead, so whatever times the
+// prompt holds are the ones checked — the spoken form and the digit form the
+// rewrite rule shows as its input.
+const PROMPT_EXAMPLE_TIMES: ClockValue[] = (() => {
+  const found = [
+    ...parseSpokenTimes(VOICE_RESPONSE_PROMPT),
+    ...parseDigitTimes(VOICE_RESPONSE_PROMPT),
+  ]
+  const unique: ClockValue[] = []
+  for (const value of found) {
+    if (!unique.some((seen) => sameClock(seen, value))) unique.push(value)
+  }
+  return unique
+})()
+
+// What the model could have said instead of the clock: the prompt's examples,
+// and every time get_time already returned in this session.
+interface ClockContext {
+  examples: ClockValue[]
+  stale: ClockValue[]
+}
+
+const NO_CLOCK_CONTEXT: ClockContext = { examples: PROMPT_EXAMPLE_TIMES, stale: [] }
+
+// Judged against the REAL CLOCK, sampled TWICE.
+//
+// Twice because one sample is not enough. askedAt is taken before STT, the LLM
+// call, the tool run and synthesis, so a turn that straddles :59 would fail a
+// correct answer — the old judge took askedAt alone and would have called that
+// reply mangled. Either minute is accepted; the reply is wrong only if it
+// matches neither.
+//
+// Three failures are named rather than lumped into "mangled", because a bare
+// correctness check cannot tell them apart from ordinary nonsense and the fix
+// for each is different:
+// - MISSING OH: the right minute said without its "oh" (10:03 as "ten three").
+//   The old minuteWords listed the bare ones-form among the ACCEPTED forms, so
+//   the judge scored that reply "correct" — it could not see the bug the clock
+//   rule was written to fix, and a passing run inside the first nine minutes of
+//   an hour meant nothing.
+// - RECITED: one of VOICE_RESPONSE_PROMPT's own example times, said over a live
+//   tool result.
+// - STALE: a time get_time returned EARLIER in this session. The value is real.
+//   It is just not the current one.
+function judgeClock(
+  reply: string,
+  samples: Date[],
+  context: ClockContext = NO_CLOCK_CONTEXT
+): { verdict: IdVerdict; detail: string } {
   const flat = flatten(reply)
-  const hour12 = at.getHours() % 12 === 0 ? 12 : at.getHours() % 12
-  const hourWord = ONES_WORDS[hour12] ?? String(hour12)
-  const minutes = minuteWords(at.getMinutes())
-  const expected = `${hourWord} ${minutes[0]}`
+  const real = samples.map(clockValueOf)
+  const expected = real
+    .map((value) => `"${spoken(value)}"`)
+    .filter((text, i, all) => all.indexOf(text) === i)
+    .join(" or ")
 
   // Invented seconds are wrong whatever the rest says.
   if (/\bseconds?\b/.test(flat)) {
-    return { verdict: "mangled", detail: `invented seconds; expected about "${expected}"` }
+    return { verdict: "mangled", detail: `invented seconds; expected ${expected}` }
   }
-  const hourOk = flat.includes(` ${hourWord} `) || flat.includes(`is ${hourWord}`) || flat.includes(`${hourWord} `)
-  const minuteOk = minutes.some((form) => flat.includes(form))
-  if (hourOk && minuteOk) return { verdict: "correct", detail: `"${expected}"` }
-  if (!hourOk && !minuteOk) return { verdict: "not named", detail: `no time said; expected about "${expected}"` }
-  return { verdict: "mangled", detail: `expected about "${expected}"` }
+
+  const said = [...parseSpokenTimes(reply), ...parseDigitTimes(reply)]
+  if (said.length === 0) {
+    return { verdict: "not named", detail: `no time said; expected ${expected}` }
+  }
+
+  const onTheClock = said.filter((value) => real.some((now) => sameClock(now, value)))
+  if (onTheClock.length > 0) {
+    const missingOh = onTheClock.find((value) => value.missingOh)
+    if (missingOh) {
+      return {
+        verdict: "missing oh",
+        detail: `said the right minute without its "oh"; expected ${expected}`,
+      }
+    }
+    const wrongHalf = onTheClock.find(
+      (value) => value.meridiem && real[0]!.meridiem && value.meridiem !== real[0]!.meridiem
+    )
+    if (wrongHalf) {
+      return { verdict: "mangled", detail: `right time, wrong half of the day; expected ${expected}` }
+    }
+    return { verdict: "correct", detail: expected }
+  }
+
+  // Not the clock. Was it something the model could SEE?
+  for (const value of said) {
+    if (context.examples.some((example) => sameClock(example, value))) {
+      return {
+        verdict: "recited",
+        detail:
+          `said "${spoken(value)}" — VOICE_RESPONSE_PROMPT's own example time, ` +
+          `over a live tool result; expected ${expected}`,
+      }
+    }
+  }
+  for (const value of said) {
+    if (context.stale.some((old) => sameClock(old, value))) {
+      return {
+        verdict: "stale",
+        detail:
+          `said "${spoken(value)}" — a time get_time returned earlier in this ` +
+          `session; expected ${expected}`,
+      }
+    }
+  }
+
+  return { verdict: "mangled", detail: `said "${spoken(said[0]!)}"; expected ${expected}` }
 }
 
 async function verifyNumbers(): Promise<void> {
@@ -748,6 +986,7 @@ async function verifyNumbers(): Promise<void> {
       check(`answered: ${item.ask.slice(0, 40)}`, false, err instanceof Error ? err.message : String(err))
       continue
     }
+    const repliedAt = new Date()
 
     // Counted exactly as the scoreboard counts: the offer the backstop appends
     // is the backstop talking, not the answer, so it is excluded from the word
@@ -760,9 +999,10 @@ async function verifyNumbers(): Promise<void> {
       item.identifiers ?? []
     ).map((check) => ({ written: check.written, verdict: judgeIdentifier(answer, check) }))
     if (item.clock) {
-      // askedAt, not now: the reply took seconds to synthesize, and a minute
-      // boundary crossed in between would fail a correct answer.
-      const clock = judgeClock(answer, askedAt)
+      // Both ends of the turn, not just askedAt: synthesis, the LLM call and
+      // the tool run all happen in between, so a minute crossed mid-turn must
+      // not fail a correct answer.
+      const clock = judgeClock(answer, [askedAt, repliedAt])
       identifiers.push({ written: "the time", verdict: clock.verdict, detail: clock.detail })
     }
 
@@ -907,38 +1147,121 @@ async function verifyNumbers(): Promise<void> {
 
 // ---------------------------------------------------------------- 9: clock
 
-// The leading-zero case: 10:03 said as "ten three in the evening" rather than
-// "ten oh three". It can only be exercised in the first nine minutes of an
-// hour, so this asks repeatedly and says plainly whether the case came up.
-// Reporting "could not be exercised" is a result; a passing run at 10:34 is
-// not evidence about 10:03 either way.
-const CLOCK_ASKS = 5
+// Does the model state the time it was GIVEN?
+//
+// Two failures seen live, both with a correct answer sitting in the tool
+// result, and neither one audible as a mistake — a wrong time is plausible, so
+// nothing about the output says it is wrong:
+//
+//   RECITED. get_time returned "8:43:48 PM". The reply was "It is ten
+//   fifty-three in the evening" — the example time written into
+//   VOICE_RESPONSE_PROMPT's clock rule, said over a live tool result.
+//
+//   STALE. Asked the time at 9:01 PM, answered "eight forty-three in the
+//   evening" — get_time's result from a turn eighteen minutes earlier, still in
+//   the context window. get_time was never called. 1 of 5 asks.
+//
+// What this run has to establish, which the old five-ask version could not:
+//
+// 1. BOTH SHAPES ARE INTERMITTENT, so a clean run proves nothing at n=5. At
+//    twenty asks a true one-in-five rate survives untouched with probability
+//    0.8^20, about one percent.
+// 2. CORRECTNESS IS NOT THE ONLY QUESTION. Live, the model skipped the call and
+//    was RIGHT BY LUCK: a correct value was twenty seconds old. Three of four
+//    trailing asks were seconds apart and so could not have failed detectably.
+//    So the tool call is evidence in its own right, read from the recorded
+//    history, and every ask is forced into a different minute from the one
+//    before it — otherwise reusing a stale value is indistinguishable from
+//    reading the clock.
+// 3. THE DENOMINATOR FOR STALENESS IS NOT TWENTY. It is the asks where a stale
+//    value was both IN the window and already wrong. That is counted, not
+//    assumed.
+const TIME_ASKS = 20
 
-// The prompt's own example times, said back in place of the real one. Measured
-// on this branch: asked at 8:43 PM, with get_time having returned "8:43:48
-// PM", the reply was "It is ten fifty-three in the evening" — the example
-// recited verbatim. judgeClock scores that "not named", which reads as "no
-// time said" and hides what happened, so it is named separately here.
-const PROMPT_EXAMPLE_TIMES = ["ten fifty three", "ten oh three"]
+// Filler between time asks. Cheap on purpose — no tool call, no web_search — so
+// the run's cost is the time asks and a little. Its job is to put other turns
+// between one time ask and the next: live, the stale value the model preferred
+// was twenty-one messages back, not the message before.
+const TIME_FILLER = [
+  "What is fifteen percent of two hundred?",
+  "How many bits are in a byte?",
+]
 
-function parrotedExample(reply: string): boolean {
-  const flat = flatten(reply)
-  return PROMPT_EXAMPLE_TIMES.some((form) => flat.includes(form))
+interface TimeAsk {
+  askedAt: Date
+  repliedAt: Date
+  text: string
+  verdict: IdVerdict
+  detail: string
+  calledGetTime: boolean
+  // What get_time returned on THIS turn, if it ran.
+  returned: string | null
+  // The newest time already in the conversation when this ask was made, and how
+  // far off the clock it was by then. The shape-2 denominator: an ask with no
+  // stale value available, or one that is still right, cannot exercise it.
+  staleAvailable: ClockValue | null
+  staleOffByMinutes: number | null
+}
+
+// Every time get_time has returned in the live session so far.
+function timesAlreadyInContext(): ClockValue[] {
+  const row = liveSession()
+  if (!row) return []
+  return toolResultsIn(row, "get_time").flatMap((result) => parseDigitTimes(result))
+}
+
+// How far apart two twelve-hour clock values are, in minutes, taking the
+// smaller way round the face. Twelve-hour because that is all a spoken reply
+// gives: "eight forty-three in the evening" and get_time's "8:43:48 PM" are the
+// same value, and the half of the day is checked separately.
+function minutesApart(a: ClockValue, b: ClockValue): number {
+  const toMinutes = (value: ClockValue): number => (value.hour % 12) * 60 + value.minute
+  const gap = Math.abs(toMinutes(a) - toMinutes(b))
+  return Math.min(gap, 720 - gap)
+}
+
+// Hold until the wall clock leaves `minute`, so the next ask cannot be answered
+// correctly from the previous ask's value. Without this the run measures
+// nothing about staleness: a value thirty seconds old is still the right
+// answer, which is how three of the four live asks "passed".
+async function waitForNewMinute(minute: number | null): Promise<number> {
+  if (minute === null) return 0
+  const startedAt = Date.now()
+  while (new Date().getMinutes() === minute) {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+  }
+  return Date.now() - startedAt
 }
 
 async function verifyClock(): Promise<void> {
-  section("9. the clock, asked repeatedly")
-  console.log(`  model:    ${config.llm.model}\n`)
+  section("9. the clock: does the model state the time it was given?")
+  console.log(`  model:    ${config.llm.model}`)
+  console.log(
+    `  prompt example times: ${
+      PROMPT_EXAMPLE_TIMES.length
+        ? PROMPT_EXAMPLE_TIMES.map((value) => `"${spoken(value)}"`).join(", ")
+        : "NONE — the prompt holds no concrete time"
+    }`
+  )
+  console.log(`  asks:     ${TIME_ASKS}, each forced into a different minute from the one before\n`)
 
-  const rows: Array<{
-    minute: number
-    text: string
-    verdict: IdVerdict
-    detail: string
-    parroted: boolean
-  }> = []
+  const rows: TimeAsk[] = []
   const client = await connect()
-  for (let i = 0; i < CLOCK_ASKS; i++) {
+  let previousMinute: number | null = null
+
+  for (let i = 0; i < TIME_ASKS; i++) {
+    // Filler first, then the wait: the turns take real seconds, so some of the
+    // minute is spent usefully rather than idling.
+    for (const filler of TIME_FILLER) {
+      try {
+        await say(client, filler)
+      } catch {
+        // A filler turn is scaffolding. Losing one costs context, not a result.
+      }
+    }
+    const waited = await waitForNewMinute(previousMinute)
+
+    const before = timesAlreadyInContext()
     const pcm = await synthesize("What time is it?")
     const askedAt = new Date()
     let reply: Reply
@@ -948,57 +1271,269 @@ async function verifyClock(): Promise<void> {
       check(`ask ${i + 1} answered`, false, err instanceof Error ? err.message : String(err))
       continue
     }
-    const clock = judgeClock(reply.text, askedAt)
-    const parroted = clock.verdict !== "correct" && parrotedExample(reply.text)
+    const repliedAt = new Date()
+    previousMinute = repliedAt.getMinutes()
+
+    // Read AFTER the reply, which is safe: the manager saves the session at the
+    // turn boundary, inside the finally that the reply promise waits on, so the
+    // row is on disk before the client is told the turn is over.
+    const row = liveSession()
+    const calledGetTime = row ? toolCallsInLastTurn(row).includes("get_time") : false
+    const after = row ? toolResultsIn(row, "get_time") : []
+    const returned = calledGetTime ? (after.at(-1) ?? null) : null
+
+    const newest = before.at(-1) ?? null
+    const staleOffByMinutes = newest ? minutesApart(newest, clockValueOf(askedAt)) : null
+
+    const clock = judgeClock(reply.text, [askedAt, repliedAt], {
+      examples: PROMPT_EXAMPLE_TIMES,
+      stale: before,
+    })
+
     rows.push({
-      minute: askedAt.getMinutes(),
+      askedAt,
+      repliedAt,
       text: reply.text,
       verdict: clock.verdict,
       detail: clock.detail,
-      parroted,
+      calledGetTime,
+      returned,
+      staleAvailable: newest,
+      staleOffByMinutes,
     })
-    console.log(`  asked at :${String(askedAt.getMinutes()).padStart(2, "0")}`)
-    console.log(`  < ${reply.text}`)
+
     console.log(
-      `    ${clock.verdict.toUpperCase()} — ${clock.detail}` +
-        `${parroted ? " — PARROTED A PROMPT EXAMPLE" : ""}\n`
+      `  ask ${String(i + 1).padStart(2)} at :${String(askedAt.getMinutes()).padStart(2, "0")}` +
+        `${waited ? ` (waited ${(waited / 1000).toFixed(0)}s for the minute to turn)` : ""}`
     )
+    console.log(
+      `    get_time: ${calledGetTime ? `called, returned ${JSON.stringify(returned)}` : "NOT CALLED"}`
+    )
+    if (newest) {
+      console.log(
+        `    in context: "${spoken(newest)}", off by ${staleOffByMinutes} minute(s) by now`
+      )
+    }
+    console.log(`    < ${reply.text}`)
+    console.log(`    ${clock.verdict.toUpperCase()} — ${clock.detail}\n`)
   }
   await client.close()
 
-  // A minute under ten is the only one that needs an "oh". Zero is its own
-  // case ("o'clock") and is not what this fix is about.
-  const leadingZero = rows.filter((row) => row.minute > 0 && row.minute < 10)
+  // ------------------------------------------------------------------ rates
+
+  const answered = rows.length
+  const called = rows.filter((row) => row.calledGetTime)
   const correct = rows.filter((row) => row.verdict === "correct")
+  const recited = rows.filter((row) => row.verdict === "recited")
+  const stale = rows.filter((row) => row.verdict === "stale")
+  const missingOh = rows.filter((row) => row.verdict === "missing oh")
+  const other = rows.filter(
+    (row) => !["correct", "recited", "stale", "missing oh"].includes(row.verdict)
+  )
 
-  const parroted = rows.filter((row) => row.parroted)
+  // Right by luck: no call, and the answer happened to be the clock anyway.
+  // Counted as its own line because a correctness check scores it a pass and it
+  // is the exact failure shape 2 is.
+  const luckyHits = rows.filter((row) => !row.calledGetTime && row.verdict === "correct")
 
-  console.log(`  answered:        ${rows.length}/${CLOCK_ASKS}`)
-  console.log(`  correct:         ${correct.length}/${rows.length}`)
-  if (parroted.length) {
-    console.log(
-      `  PARROTED:        ${parroted.length} reply/replies said a prompt example's time rather` +
-        " than the clock's"
-    )
-  }
+  // Shape 2's real denominator: a stale value was in the window AND had already
+  // gone wrong. An ask with nothing stale on offer cannot exercise it.
+  const couldHaveBeenStale = rows.filter(
+    (row) => row.staleOffByMinutes !== null && row.staleOffByMinutes >= 1
+  )
+
+  const leadingZero = rows.filter((row) => {
+    const minute = row.askedAt.getMinutes()
+    return minute > 0 && minute < 10
+  })
+
+  console.log(`  answered:              ${answered}/${TIME_ASKS}`)
+  console.log(`  called get_time:       ${called.length}/${answered}`)
+  console.log(`  stated the real time:  ${correct.length}/${answered}`)
+  console.log(`  RECITED a prompt time: ${recited.length}`)
+  console.log(`  STALE value:           ${stale.length}`)
+  console.log(`  missing "oh":          ${missingOh.length}`)
+  console.log(`  wrong some other way:  ${other.length}`)
+  console.log(
+    `  right by luck:         ${luckyHits.length}` +
+      " (no call, correct anyway — a pass only to a correctness check)"
+  )
+  console.log(
+    `  asks that could have gone stale: ${couldHaveBeenStale.length}/${answered}` +
+      " (a value in context, already off by a minute or more)"
+  )
+
   if (leadingZero.length === 0) {
-    const now = new Date().getMinutes()
     console.log(
       `\n  THE LEADING-ZERO CASE WAS NOT EXERCISED: every ask landed at :${rows
-        .map((row) => String(row.minute).padStart(2, "0"))
-        .join(" :")}, and it is :${String(now).padStart(2, "0")} now. A minute between :01 and :09` +
-        " is the only one that needs an \"oh\". Re-run inside the first nine minutes of an hour."
+        .map((row) => String(row.askedAt.getMinutes()).padStart(2, "0"))
+        .join(" :")}. A minute between :01 and :09 is the only one that needs an "oh".` +
+        " Start the run so it spans the first nine minutes of an hour."
     )
   } else {
     const ok = leadingZero.filter((row) => row.verdict === "correct")
-    console.log(`\n  leading-zero asks: ${ok.length}/${leadingZero.length} correct`)
+    console.log(`\n  leading-zero asks:     ${ok.length}/${leadingZero.length} correct`)
     for (const row of leadingZero) {
-      console.log(`    :${String(row.minute).padStart(2, "0")} ${row.verdict.toUpperCase()} — ${row.detail}`)
+      console.log(
+        `    :${String(row.askedAt.getMinutes()).padStart(2, "0")} ${row.verdict.toUpperCase()} — ${row.detail}`
+      )
     }
   }
 
-  check("every ask got a time", rows.length === CLOCK_ASKS && correct.length === rows.length,
-    `${correct.length}/${rows.length} correct`)
+  const wrong = rows.filter((row) => row.verdict !== "correct")
+  if (wrong.length) {
+    console.log("\n  every reply that was not the clock, verbatim:")
+    for (const row of wrong) {
+      console.log(
+        `\n    asked :${String(row.askedAt.getMinutes()).padStart(2, "0")}, get_time ${
+          row.calledGetTime ? JSON.stringify(row.returned) : "NOT CALLED"
+        }`
+      )
+      console.log(`    said: ${row.text}`)
+      console.log(`    ${row.verdict.toUpperCase()} — ${row.detail}`)
+    }
+  }
+
+  check(
+    "every ask called get_time",
+    called.length === answered,
+    `${called.length}/${answered}`
+  )
+  check(
+    "every ask stated the time get_time returned",
+    answered === TIME_ASKS && correct.length === answered,
+    `${correct.length}/${answered}`
+  )
+}
+
+// ------------------------------------------------- 9b: the detector itself
+
+// Does the clock detector see the failures it was written for?
+//
+// Offline — no backend, no model, no spend. It exists because the detector had
+// a hole exactly like the one it is now checked against: minuteWords listed the
+// bare ones-form among the ACCEPTED forms for a minute under ten, so "ten three
+// in the evening" at 10:03 scored CORRECT. The leading-zero rule was
+// unmeasurable, and a green run inside the first nine minutes of an hour said
+// nothing at all.
+//
+// The two live replies are quoted verbatim, curly hyphens and all, because that
+// is what came back over the wire.
+const DETECTOR_CASES: Array<{
+  what: string
+  reply: string
+  samples: string[]
+  stale: string[]
+  expect: IdVerdict
+}> = [
+  {
+    what: "recited: the prompt's example time over a live tool result (live, 8:43 PM)",
+    reply: "It is ten fifty‑three in the evening.",
+    samples: ["2026-10-06T20:43:50", "2026-10-06T20:43:56"],
+    stale: [],
+    expect: "recited",
+  },
+  {
+    what: "stale: a get_time result from eighteen minutes earlier (live, 9:01 PM)",
+    reply: "It is eight forty‑three in the evening.",
+    samples: ["2026-10-06T21:01:05", "2026-10-06T21:01:11"],
+    stale: ["8:43:48 PM"],
+    expect: "stale",
+  },
+  {
+    what: "the same reply with nothing stale on offer is just wrong, not stale",
+    reply: "It is eight forty‑three in the evening.",
+    samples: ["2026-10-06T21:01:05", "2026-10-06T21:01:11"],
+    stale: [],
+    expect: "mangled",
+  },
+  {
+    what: 'missing "oh": the leading-zero bug the old judge scored CORRECT',
+    reply: "It is ten three in the evening.",
+    samples: ["2026-10-06T22:03:10", "2026-10-06T22:03:14"],
+    stale: [],
+    expect: "missing oh",
+  },
+  {
+    what: 'the same minute said properly',
+    reply: "It is ten oh three in the evening.",
+    samples: ["2026-10-06T22:03:10", "2026-10-06T22:03:14"],
+    stale: [],
+    expect: "correct",
+  },
+  {
+    what: "a minute crossed mid-turn is not a wrong answer",
+    reply: "It is nine oh one in the evening.",
+    samples: ["2026-10-06T21:00:59", "2026-10-06T21:01:03"],
+    stale: [],
+    expect: "correct",
+  },
+  {
+    what: "a stale value that is still the current minute is not a failure",
+    reply: "It is nine oh one in the evening.",
+    samples: ["2026-10-06T21:01:05", "2026-10-06T21:01:40"],
+    stale: ["9:01:21 PM"],
+    expect: "correct",
+  },
+  {
+    what: "invented seconds",
+    reply: "It is ten fifty-three and forty-eight seconds in the evening.",
+    samples: ["2026-10-06T22:53:50"],
+    stale: [],
+    expect: "mangled",
+  },
+  {
+    what: "right time, wrong half of the day",
+    reply: "It is nine oh one in the morning.",
+    samples: ["2026-10-06T21:01:05"],
+    stale: [],
+    expect: "mangled",
+  },
+  {
+    what: "no time said at all",
+    reply: "Sorry, I did not catch that. Could you say it again?",
+    samples: ["2026-10-06T21:01:05"],
+    stale: [],
+    expect: "not named",
+  },
+]
+
+function verifyDetector(): void {
+  section("9b. the clock detector, checked offline against the recorded failures")
+
+  console.log(
+    `  prompt example times, parsed out of VOICE_RESPONSE_PROMPT: ${
+      PROMPT_EXAMPLE_TIMES.length
+        ? PROMPT_EXAMPLE_TIMES.map((value) => `${value.hour}:${String(value.minute).padStart(2, "0")}`).join(", ")
+        : "NONE"
+    }`
+  )
+  // Parsed, not listed: if the prompt stops holding a concrete time this goes
+  // empty, and a "recited" verdict stops being reachable — which is the point of
+  // the change, and has to be visible rather than silent.
+  check(
+    "the example times are read out of the prompt, not hardcoded",
+    PROMPT_EXAMPLE_TIMES.length === 0 ||
+      PROMPT_EXAMPLE_TIMES.every((value) =>
+        flatten(VOICE_RESPONSE_PROMPT).includes(flatten(`${ONES_WORDS[value.hour]} ${minuteForms(value.minute)[0]}`)) ||
+        VOICE_RESPONSE_PROMPT.includes(`${value.hour}:${String(value.minute).padStart(2, "0")}`)
+      ),
+    `${PROMPT_EXAMPLE_TIMES.length} found`
+  )
+  console.log("")
+
+  for (const item of DETECTOR_CASES) {
+    const judged = judgeClock(
+      item.reply,
+      item.samples.map((iso) => new Date(iso)),
+      { examples: PROMPT_EXAMPLE_TIMES, stale: item.stale.flatMap((raw) => parseDigitTimes(raw)) }
+    )
+    check(
+      item.what,
+      judged.verdict === item.expect,
+      `expected ${item.expect.toUpperCase()}, got ${judged.verdict.toUpperCase()} — ${judged.detail}`
+    )
+  }
 }
 
 // ------------------------------------------------------------- 10: nonsense
@@ -1130,6 +1665,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   strays: verifyStrays,
   tokens: verifyTokens,
   clock: verifyClock,
+  detector: verifyDetector,
   nonsense: verifyNonsense,
 }
 

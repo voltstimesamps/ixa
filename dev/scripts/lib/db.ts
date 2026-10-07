@@ -22,7 +22,7 @@ export interface SessionRow {
 export interface StoredMessage {
   role: string
   content: string | null
-  tool_calls?: Array<{ function?: { name?: string; arguments?: string } }>
+  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
   tool_call_id?: string
 }
 
@@ -67,6 +67,34 @@ export function toolCallsInLastTurn(row: SessionRow): string[] {
   return messages
     .slice(lastUser + 1)
     .flatMap((message) => (message.tool_calls ?? []).map((call) => call.function?.name ?? "?"))
+}
+
+// Every result one named tool returned in this session, oldest first.
+//
+// Paired by tool_call_id rather than by position: a turn can carry several
+// parallel calls, so the result that follows a call in the array is not
+// necessarily that call's.
+//
+// What this is for: a time already in the conversation is the value the model
+// preferred over a fresh one, so measuring that failure means knowing exactly
+// which values were on offer. The reply text cannot say — "eight forty-three"
+// is a real time either way, and only the recorded results show it was one
+// get_time returned eighteen minutes earlier.
+export function toolResultsIn(row: SessionRow, name: string): string[] {
+  const messages = messagesOf(row)
+  const wanted = new Set<string>()
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      if (call.function?.name === name && call.id) wanted.add(call.id)
+    }
+  }
+  const results: string[] = []
+  for (const message of messages) {
+    if (message.role !== "tool" || !message.tool_call_id) continue
+    if (!wanted.has(message.tool_call_id)) continue
+    if (typeof message.content === "string") results.push(message.content)
+  }
+  return results
 }
 
 // Every tool name the session called, in order.
