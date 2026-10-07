@@ -15,6 +15,13 @@ import type { ChatFn } from "../src/core/session"
 // under test is the transport's, and a fake connection cannot show whether a
 // socket was closed. config.ts reads the environment at import time, so
 // TTS_URL is set in `before` and the modules are imported after it.
+//
+// Every turn here arrives as TEXT — ask() sends a "user" frame — so under
+// text-in-text-out none of them is spoken. That is asserted rather than
+// assumed: a failure is the one case where a silent reply is easiest to get
+// wrong. The spoken side of these same paths lives in
+// test/text-in-text-out.test.ts, which has the STT sidecar needed to make a
+// turn arrive with origin "voice".
 
 async function freePort(): Promise<number> {
   const probe = net.createServer()
@@ -136,7 +143,7 @@ async function connect(): Promise<Client> {
   return client
 }
 
-test("a failed turn sends error AND replyEnd, speaks an apology, and keeps the socket open", async () => {
+test("a failed text turn sends error AND replyEnd, speaks nothing, and keeps the socket open", async () => {
   chatBehaviour = async () => {
     throw new Error("LLM call aborted: no chunk for 15000ms (stream inactivity)")
   }
@@ -152,10 +159,12 @@ test("a failed turn sends error AND replyEnd, speaks an apology, and keeps the s
   assert.equal(types.at(-1), "replyEnd", `replyEnd must terminate the turn: ${types.join(",")}`)
   assert.match(String(turn.find((m) => m.type === "error")?.content), /stream inactivity/)
 
-  // The apology was spoken: a fixed string, synthesized without an LLM call.
-  assert.equal(ttsRequests, before + 1, "the apology was not sent to TTS")
-  assert.ok(client.binaryFrames > 0, "no audio reached the client")
-  assert.ok(types.includes("audioStart") && types.includes("audioOutputEnd"))
+  // Nothing was spoken. The apology is for a listener, and a typed question
+  // has none: the `error` frame and the terminator are what end this turn.
+  // (A failed VOICE turn still speaks it — see text-in-text-out.test.ts.)
+  assert.equal(ttsRequests, before, "a failed text turn must not reach TTS")
+  assert.equal(client.binaryFrames, 0, "no audio for a failed text turn")
+  assert.ok(!types.includes("audioStart"))
 
   // Fast: this is a failure, not a wait.
   assert.ok(elapsed < 3000, `took ${elapsed}ms`)
@@ -234,6 +243,11 @@ test("an empty reply speaks nothing and still terminates the turn", async () => 
 })
 
 // Last, because it takes the TTS sidecar away for good.
+//
+// A text turn never contacts TTS, so an unavailable sidecar cannot reach it —
+// which is the point: the terminator does not depend on a sidecar that is not
+// in the path. The harder case, where the sidecar IS in the path and dies, is
+// a voice turn, and lives at the end of text-in-text-out.test.ts.
 test("replyEnd still arrives when TTS is unavailable", async () => {
   for (const socket of ttsSockets) socket.destroy()
   await new Promise<void>((resolve) => ttsServer.close(() => resolve()))

@@ -132,14 +132,25 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
       // survive one bad turn and the user's next sentence must land on them
       // rather than on a reconnect.
       const handleUserMessage = async (text: string, origin: MessageOrigin) => {
+        // Text in, text out: a turn that arrived as text is never spoken.
+        //
+        // Keyed off the turn's ORIGIN, not the connection. The /test page
+        // sends typed and spoken input over the same socket, so a
+        // connection-level rule would mean that typing one question silently
+        // stopped spoken questions being answered aloud for the rest of that
+        // connection's life.
+        //
+        // Audio for a turn goes only to the connection that originated it,
+        // and nothing is replayed to a client that reconnects later.
+        const speakIfSpoken = (spoken: string): Promise<void> =>
+          origin === "voice" && connection.isOpen ? speak(spoken) : Promise.resolve()
+
         try {
           // Resolved through the manager every turn — never a cached Session.
           const result = await sessions.submitTurn(text, connection, origin)
           send({ type: "assistant", content: result })
-          // Audio for a turn goes only to the connection that originated it,
-          // and nothing is replayed to a client that reconnects later.
-          if (result.trim() && connection.isOpen) {
-            await speak(result)
+          if (result.trim()) {
+            await speakIfSpoken(result)
           }
         } catch (err) {
           const content = err instanceof Error ? err.message : String(err)
@@ -151,7 +162,11 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
           // records as the assistant's reply, so what the user hears and what
           // history says they heard cannot drift. Only the bracketed reason
           // differs — that is for the model, not the speaker.
-          if (connection.isOpen) await speak(TURN_FAILURE_APOLOGY)
+          //
+          // A text turn gets no spoken apology either: the rule is about the
+          // turn, and a failed text turn is still a text turn. The `error`
+          // frame above and the terminator below are what tell the client.
+          await speakIfSpoken(TURN_FAILURE_APOLOGY)
         } finally {
           // In a finally, not at the end of each branch: if the TTS sidecar
           // is down, speaking the apology fails too, and a client left with

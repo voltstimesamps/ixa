@@ -512,6 +512,12 @@ export function renderTestClient(wsPort: number): string {
   var mode = "off";
   var speaking = false;       // assistant audio playing (client.py's isSpeaking)
   var awaitingReply = false;  // turn sent, reply not started yet
+  // Whether this turn's reply is already over, so onReplyDone runs once per
+  // turn. It is reached from two independent signals — local playback
+  // finishing and the harness's replyEnd — and which lands first depends on
+  // whether the reply had any audio at all. Same contract as
+  // client.py's finishPlayback(). True at startup: no turn is in flight.
+  var replyFinished = true;
   var timeoutId = null;
   var wakeError = null;
 
@@ -621,6 +627,7 @@ export function renderTestClient(wsPort: number): string {
     if (!turnOpen) return;
     turnOpen = false;
     awaitingReply = true;
+    replyFinished = false;
     armTimeout();
     render();
     // Worklet messages already posted are still in flight; give them a moment
@@ -649,6 +656,8 @@ export function renderTestClient(wsPort: number): string {
   }
 
   function onReplyDone() {
+    if (replyFinished) return;
+    replyFinished = true;
     speaking = false;
     if (mode === "awake") openTurn();             // conversation mode: next turn, no wake word
     else if (mode === "asleep") resumeWakeListening();
@@ -743,6 +752,10 @@ export function renderTestClient(wsPort: number): string {
     var text = inputEl.value.trim();
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
     log("user", text, "you");
+    // A typed turn is owed a reply like any other, and under text-in-text-out
+    // that reply arrives with no audio: replyEnd is the only thing that will
+    // end it.
+    replyFinished = false;
     ws.send(JSON.stringify({ type: "user", content: text }));
     inputEl.value = "";
   });
@@ -802,6 +815,17 @@ export function renderTestClient(wsPort: number): string {
           onReplyStart();
           break;
         case "audioOutputEnd":
+          whenPlaybackDone(onReplyDone);
+          break;
+        case "replyEnd":
+          // The authoritative end of the turn, sent whether or not the reply
+          // had audio. A spoken reply reaches onReplyDone from audioOutputEnd
+          // first and this is a no-op; a text-origin, empty or failed reply
+          // has no audio to wait for and this is the only signal that gets
+          // the next turn opened. Routed through whenPlaybackDone either way
+          // so a replyEnd landing on top of audio still scheduled — a TTS
+          // stall, which sends audioStart and then no audioOutputEnd — waits
+          // for the speaker rather than cutting it off.
           whenPlaybackDone(onReplyDone);
           break;
         case "confirm":
