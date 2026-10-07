@@ -82,6 +82,11 @@ const DESCRIBE_ACTION_PROMPT =
 // at all. It also reads DDR4, PCIe 4.0 and Ubuntu 24.04 correctly as written,
 // which is why the rule says to leave those alone — an instruction to convert
 // them would be churn with a chance of invention and no upside.
+//
+// The clock rule got its leading-zero example from a live reply: 10:03 was
+// spoken as "ten three in the evening". The hour and the minute were both
+// right, so no check caught it — only the "oh" was missing, and only in the
+// first nine minutes of an hour.
 export const VOICE_RESPONSE_PROMPT =
   "THIS REPLY WILL BE SPOKEN ALOUD. It is read by a speech synthesizer, not shown as text.\n" +
   "- Length: about THIRTY-FIVE WORDS in total, in one to three short sentences. That is the " +
@@ -98,7 +103,8 @@ export const VOICE_RESPONSE_PROMPT =
   "digit: \"RTX thirty ninety\" for RTX 3090, \"RTX forty seventy\" for RTX 4070, \"Ryzen " +
   "five fifty-six hundred G\" for Ryzen 5 5600G. Never \"three thousand ninety\", \"three " +
   "hundred sixty\" or \"thirty nine zero\" — those are not cards.\n" +
-  "  - A CLOCK TIME is a time: \"ten fifty-three in the evening\". Never add seconds.\n" +
+  "  - A CLOCK TIME is a time: \"ten fifty-three in the evening\", and a minute under ten takes " +
+  "an \"oh\": \"ten oh three in the evening\" for 10:03. Never add seconds.\n" +
   "  Leave standards and versions alone: DDR4, GDDR6, PCIe 4.0, Ubuntu 24.04 are already right.\n" +
   "- If the answer has several items, say the best one or two in a sentence and offer the rest: " +
   "\"there are a few more if you want them.\" Do not recite the list.\n" +

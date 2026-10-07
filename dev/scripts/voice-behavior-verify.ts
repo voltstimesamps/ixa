@@ -10,6 +10,7 @@
 //
 //   npx tsx dev/scripts/voice-behavior-verify.ts scoreboard   # 1
 //   npx tsx dev/scripts/voice-behavior-verify.ts numbers      # 8
+//   npx tsx dev/scripts/voice-behavior-verify.ts clock        # 9
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
 //   npx tsx dev/scripts/voice-behavior-verify.ts dismiss      # 5
@@ -903,6 +904,102 @@ async function verifyNumbers(): Promise<void> {
   )
 }
 
+// ---------------------------------------------------------------- 9: clock
+
+// The leading-zero case: 10:03 said as "ten three in the evening" rather than
+// "ten oh three". It can only be exercised in the first nine minutes of an
+// hour, so this asks repeatedly and says plainly whether the case came up.
+// Reporting "could not be exercised" is a result; a passing run at 10:34 is
+// not evidence about 10:03 either way.
+const CLOCK_ASKS = 5
+
+// The prompt's own example times, said back in place of the real one. Measured
+// on this branch: asked at 8:43 PM, with get_time having returned "8:43:48
+// PM", the reply was "It is ten fifty-three in the evening" — the example
+// recited verbatim. judgeClock scores that "not named", which reads as "no
+// time said" and hides what happened, so it is named separately here.
+const PROMPT_EXAMPLE_TIMES = ["ten fifty three", "ten oh three"]
+
+function parrotedExample(reply: string): boolean {
+  const flat = flatten(reply)
+  return PROMPT_EXAMPLE_TIMES.some((form) => flat.includes(form))
+}
+
+async function verifyClock(): Promise<void> {
+  section("9. the clock, asked repeatedly")
+  console.log(`  model:    ${config.llm.model}\n`)
+
+  const rows: Array<{
+    minute: number
+    text: string
+    verdict: IdVerdict
+    detail: string
+    parroted: boolean
+  }> = []
+  const client = await connect()
+  for (let i = 0; i < CLOCK_ASKS; i++) {
+    const pcm = await synthesize("What time is it?")
+    const askedAt = new Date()
+    let reply: Reply
+    try {
+      reply = await client.askAudio(pcm)
+    } catch (err) {
+      check(`ask ${i + 1} answered`, false, err instanceof Error ? err.message : String(err))
+      continue
+    }
+    const clock = judgeClock(reply.text, askedAt)
+    const parroted = clock.verdict !== "correct" && parrotedExample(reply.text)
+    rows.push({
+      minute: askedAt.getMinutes(),
+      text: reply.text,
+      verdict: clock.verdict,
+      detail: clock.detail,
+      parroted,
+    })
+    console.log(`  asked at :${String(askedAt.getMinutes()).padStart(2, "0")}`)
+    console.log(`  < ${reply.text}`)
+    console.log(
+      `    ${clock.verdict.toUpperCase()} — ${clock.detail}` +
+        `${parroted ? " — PARROTED A PROMPT EXAMPLE" : ""}\n`
+    )
+  }
+  await client.close()
+
+  // A minute under ten is the only one that needs an "oh". Zero is its own
+  // case ("o'clock") and is not what this fix is about.
+  const leadingZero = rows.filter((row) => row.minute > 0 && row.minute < 10)
+  const correct = rows.filter((row) => row.verdict === "correct")
+
+  const parroted = rows.filter((row) => row.parroted)
+
+  console.log(`  answered:        ${rows.length}/${CLOCK_ASKS}`)
+  console.log(`  correct:         ${correct.length}/${rows.length}`)
+  if (parroted.length) {
+    console.log(
+      `  PARROTED:        ${parroted.length} reply/replies said a prompt example's time rather` +
+        " than the clock's"
+    )
+  }
+  if (leadingZero.length === 0) {
+    const now = new Date().getMinutes()
+    console.log(
+      `\n  THE LEADING-ZERO CASE WAS NOT EXERCISED: every ask landed at :${rows
+        .map((row) => String(row.minute).padStart(2, "0"))
+        .join(" :")}, and it is :${String(now).padStart(2, "0")} now. A minute between :01 and :09` +
+        " is the only one that needs an \"oh\". Re-run inside the first nine minutes of an hour."
+    )
+  } else {
+    const ok = leadingZero.filter((row) => row.verdict === "correct")
+    console.log(`\n  leading-zero asks: ${ok.length}/${leadingZero.length} correct`)
+    for (const row of leadingZero) {
+      console.log(`    :${String(row.minute).padStart(2, "0")} ${row.verdict.toUpperCase()} — ${row.detail}`)
+    }
+  }
+
+  check("every ask got a time", rows.length === CLOCK_ASKS && correct.length === rows.length,
+    `${correct.length}/${rows.length} correct`)
+}
+
 // ------------------------------------------------------------------- main
 
 const commands: Record<string, () => void | Promise<void>> = {
@@ -914,6 +1011,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   priceguard: verifyPriceGuard,
   strays: verifyStrays,
   tokens: verifyTokens,
+  clock: verifyClock,
 }
 
 async function main(): Promise<void> {
