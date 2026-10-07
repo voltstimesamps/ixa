@@ -1191,6 +1191,32 @@ async function verifyNumbers(): Promise<void> {
 //    assumed.
 const TIME_ASKS = Number(process.env.IXA_TIME_ASKS ?? 20)
 
+// The asks are split across SESSIONS rather than run as one long conversation,
+// and that is not tidiness — it is what makes the number mean anything.
+//
+// Measured: a three-ask run called get_time 3/3, and a twenty-ask run on the
+// same code forty minutes later called it 0/6 through its first six asks. At
+// temperature 0.2 that is too wide a swing to be sampling alone. The failure is
+// STICKY INSIDE A SESSION: the first ask answered without get_time is precedent
+// sitting in history for every ask behind it, so twenty asks in one conversation
+// are twenty correlated observations of one draw, not twenty samples. The live
+// data says the same — the one ask that skipped the call came after a long gap,
+// and the four behind it all called it once the first of them had.
+//
+// So: a fresh session per block, and several blocks. Across blocks the first
+// ask is an independent sample of "does it reach for the tool at all". Within a
+// block the asks share a conversation, which is what the STALE shape needs —
+// there is nothing to go stale in a session with no history.
+const TIME_ASKS_PER_SESSION = Number(process.env.IXA_TIME_ASKS_PER_SESSION ?? 4)
+
+const REST_URL = process.env.IXA_REST_URL ?? "http://localhost:3000"
+
+// Ends the shared primary session, so the next ask starts a conversation with
+// no times in it. The same reset phase3a-verify and phase3b-verify use.
+async function resetSession(): Promise<void> {
+  await fetch(`${REST_URL}/reset`, { method: "POST" })
+}
+
 // Filler between time asks. Cheap on purpose — no tool call, no web_search — so
 // the run's cost is the time asks and a little. Its job is to put other turns
 // between one time ask and the next: live, the stale value the model preferred
@@ -1213,6 +1239,10 @@ interface TimeAsk {
   // that answered from nothing. It reached for the wrong tool, which is a
   // different failure with a different fix.
   toolsCalled: string[]
+  // Which block of the run, and which ask inside it. The first ask of a block
+  // starts from a conversation with no times in it; the rest can go stale.
+  block: number
+  firstInBlock: boolean
   // What get_time returned on THIS turn, if it ran.
   returned: string | null
   // The newest time already in the conversation when this ask was made, and how
@@ -1308,6 +1338,14 @@ async function verifyClock(): Promise<void> {
   let previousMinute: number | null = null
 
   for (let i = 0; i < TIME_ASKS; i++) {
+    const block = Math.floor(i / TIME_ASKS_PER_SESSION)
+    const firstInBlock = i % TIME_ASKS_PER_SESSION === 0
+    if (firstInBlock && i > 0) {
+      await resetSession()
+      console.log(`\n  --- session ${block + 1}: reset, nothing in context ---`)
+      previousMinute = null
+    }
+
     // Filler first, then the wait: the turns take real seconds, so some of the
     // minute is spent usefully rather than idling.
     for (const filler of TIME_FILLER) {
@@ -1361,13 +1399,16 @@ async function verifyClock(): Promise<void> {
       detail: clock.detail,
       calledGetTime,
       toolsCalled,
+      block,
+      firstInBlock,
       returned,
       staleAvailable: newest,
       staleOffByMinutes,
     })
 
     console.log(
-      `  ask ${String(i + 1).padStart(2)} at :${String(askedAt.getMinutes()).padStart(2, "0")}` +
+      `  ask ${String(i + 1).padStart(2)} (session ${block + 1}${firstInBlock ? ", first" : ""})` +
+        ` at :${String(askedAt.getMinutes()).padStart(2, "0")}` +
         `${waited ? ` (waited ${(waited / 1000).toFixed(0)}s for the minute to turn)` : ""}`
     )
     console.log(
@@ -1433,6 +1474,24 @@ async function verifyClock(): Promise<void> {
   console.log(
     `  asks that could have gone stale: ${couldHaveBeenStale.length}/${answered}` +
       " (a value in context, already off by a minute or more)"
+  )
+
+  // The first ask of each block is the only near-independent sample of "does it
+  // reach for the tool at all", because nothing in the conversation has set a
+  // precedent yet. Reported on its own: a run where every block's first ask
+  // calls get_time and the rest follow is a different result from one where the
+  // tool is never reached for.
+  const firstAsks = rows.filter((row) => row.firstInBlock)
+  const firstCalled = firstAsks.filter((row) => row.calledGetTime)
+  const laterAsks = rows.filter((row) => !row.firstInBlock)
+  const laterCalled = laterAsks.filter((row) => row.calledGetTime)
+  console.log(
+    `\n  first ask of each session:  ${firstCalled.length}/${firstAsks.length} called get_time` +
+      "  (the near-independent samples — no precedent in context yet)"
+  )
+  console.log(
+    `  every later ask:           ${laterCalled.length}/${laterAsks.length} called get_time` +
+      "  (these follow whatever the first one did)"
   )
 
   if (leadingZero.length === 0) {
