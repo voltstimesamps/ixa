@@ -12,6 +12,7 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts numbers      # 8
 //   npx tsx dev/scripts/voice-behavior-verify.ts clock        # 9
 //   npx tsx dev/scripts/voice-behavior-verify.ts detector     # 9b, offline
+//   npx tsx dev/scripts/voice-behavior-verify.ts source       # 9c
 //   npx tsx dev/scripts/voice-behavior-verify.ts nonsense     # 10
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
@@ -1191,22 +1192,27 @@ async function verifyNumbers(): Promise<void> {
 //    assumed.
 const TIME_ASKS = Number(process.env.IXA_TIME_ASKS ?? 20)
 
-// The asks are split across SESSIONS rather than run as one long conversation,
-// and that is not tidiness — it is what makes the number mean anything.
+// The asks are split across SESSIONS rather than run as one long conversation.
+// Across blocks the first ask starts from a conversation with no times in it;
+// within a block the asks share one, which is what the STALE shape needs —
+// nothing can go stale in a session with no history.
 //
-// Measured: a three-ask run called get_time 3/3, and a twenty-ask run on the
-// same code forty minutes later called it 0/6 through its first six asks. At
-// temperature 0.2 that is too wide a swing to be sampling alone. The failure is
-// STICKY INSIDE A SESSION: the first ask answered without get_time is precedent
-// sitting in history for every ask behind it, so twenty asks in one conversation
-// are twenty correlated observations of one draw, not twenty samples. The live
-// data says the same — the one ask that skipped the call came after a long gap,
-// and the four behind it all called it once the first of them had.
+// WHAT THIS SPLIT DOES NOT EXPLAIN. It was introduced on the theory that the
+// failure is sticky inside a session: one ask answered without get_time being
+// precedent for every ask behind it. That theory is NOT established, and the
+// data that looked like it says something else. Two runs of identical code:
+// one called get_time 8/20, the next 20/20. Their first four asks ran under
+// exactly the same conditions — the first reset does not fire until ask five —
+// and went 0/4 and 4/4. Same code, same conditions, opposite outcomes, so the
+// dominant term is RUN-TO-RUN VARIANCE, not session depth.
 //
-// So: a fresh session per block, and several blocks. Across blocks the first
-// ask is an independent sample of "does it reach for the tool at all". Within a
-// block the asks share a conversation, which is what the STALE shape needs —
-// there is nothing to go stale in a session with no history.
+// Within one run the behaviour is strikingly self-consistent, which is what the
+// stickiness story was built on and is also what makes a single twenty-ask run a
+// poor estimate: it behaves more like one draw repeated than twenty samples. The
+// split is kept because an independent first ask per block is the right design
+// either way, but the run is NOT a substitute for repeating it — and for the
+// question of whether the tool gets called at all, `source` is the instrument
+// with the power, not this one.
 const TIME_ASKS_PER_SESSION = Number(process.env.IXA_TIME_ASKS_PER_SESSION ?? 4)
 
 const REST_URL = process.env.IXA_REST_URL ?? "http://localhost:3000"
@@ -1537,6 +1543,142 @@ async function verifyClock(): Promise<void> {
   )
 }
 
+// ------------------------------------------------ 9c: where the time came from
+
+// Does the model reach for get_time at all, and does it say what get_time said?
+//
+// The companion to `clock`, and the one with the statistical power. `clock`
+// spends a minute per ask because the STALE shape needs the value in context to
+// have gone wrong, which caps it at about twenty asks an hour — and two
+// twenty-ask runs of identical code came back 8/20 and 20/20 on the tool call,
+// so twenty is not enough to say what the rate is.
+//
+// This asks in a FRESH SESSION every time, with nothing before it, so no
+// spacing is needed and sixty asks take minutes. What it gives up is staleness:
+// a session with no history has nothing to go stale. What it keeps is both of
+// the other two, at full power:
+//
+// - whether get_time is called, which the baseline runs disagreed about most.
+// - RECITED, which needs no history at all. VOICE_RESPONSE_PROMPT is appended to
+//   every single request, so the example time is in context on every ask whether
+//   the session is fresh or not. This is the right instrument for shape 1.
+//
+// Each ask is its own session, so these are as close to independent samples as
+// this setup gets.
+const SOURCE_ASKS = Number(process.env.IXA_SOURCE_ASKS ?? 60)
+
+async function verifySource(): Promise<void> {
+  section("9c. where the time came from, in a fresh session every time")
+  console.log(`  model:    ${config.llm.model}`)
+  console.log(
+    `  prompt example times: ${
+      PROMPT_EXAMPLE_TIMES.length
+        ? PROMPT_EXAMPLE_TIMES.map((value) => `"${spoken(value)}"`).join(", ")
+        : "NONE — the prompt holds no concrete time"
+    }`
+  )
+  console.log(`  asks:     ${SOURCE_ASKS}, each in a session of its own\n`)
+
+  const rows: Array<{
+    askedAt: Date
+    text: string
+    verdict: IdVerdict
+    detail: string
+    toolsCalled: string[]
+    calledGetTime: boolean
+    returned: string | null
+  }> = []
+
+  const client = await connect()
+  for (let i = 0; i < SOURCE_ASKS; i++) {
+    // Reset BEFORE each ask, including the first: a run started against a
+    // database with a session already in it would not be measuring a fresh
+    // conversation at all.
+    await resetSession()
+
+    const pcm = await synthesize("What time is it?")
+    const askedAt = new Date()
+    let reply: Reply
+    try {
+      reply = await client.askAudio(pcm)
+    } catch (err) {
+      check(`ask ${i + 1} answered`, false, err instanceof Error ? err.message : String(err))
+      continue
+    }
+    const repliedAt = new Date()
+
+    const row = liveSession()
+    const toolsCalled = row ? toolCallsInLastTurn(row) : []
+    const calledGetTime = toolsCalled.includes("get_time")
+    const returned = calledGetTime ? (toolResultsIn(row!, "get_time").at(-1) ?? null) : null
+
+    // Nothing stale is possible in a fresh session, so the stale set is empty by
+    // construction. The examples are always there.
+    const clock = judgeClock(reply.text, [askedAt, repliedAt], {
+      examples: PROMPT_EXAMPLE_TIMES,
+      stale: [],
+    })
+
+    rows.push({ askedAt, text: reply.text, verdict: clock.verdict, detail: clock.detail, toolsCalled, calledGetTime, returned })
+
+    console.log(
+      `  ${String(i + 1).padStart(2)}  ${clock.verdict.toUpperCase().padEnd(10)} ` +
+        `${calledGetTime ? `get_time ${JSON.stringify(returned)}` : `NO get_time (${toolsCalled.join(", ") || "no tool"})`}`
+    )
+    console.log(`      < ${reply.text}`)
+  }
+  await client.close()
+
+  const answered = rows.length
+  const called = rows.filter((row) => row.calledGetTime)
+  const correct = rows.filter((row) => row.verdict === "correct")
+  const recited = rows.filter((row) => row.verdict === "recited")
+  const missingOh = rows.filter((row) => row.verdict === "missing oh")
+  const searched = rows.filter((row) => !row.calledGetTime && row.toolsCalled.includes("web_search"))
+  const noTool = rows.filter((row) => row.toolsCalled.length === 0)
+  const luckyHits = rows.filter((row) => !row.calledGetTime && row.verdict === "correct")
+
+  const pct = (n: number): string => (answered ? ` (${((n / answered) * 100).toFixed(0)}%)` : "")
+
+  console.log(`\n  answered:              ${answered}/${SOURCE_ASKS}`)
+  console.log(`  called get_time:       ${called.length}/${answered}${pct(called.length)}`)
+  console.log(`  stated the real time:  ${correct.length}/${answered}${pct(correct.length)}`)
+  console.log(`  RECITED a prompt time: ${recited.length}${pct(recited.length)}`)
+  console.log(`  missing "oh":          ${missingOh.length}`)
+  console.log(`  searched the web:      ${searched.length}`)
+  console.log(`  no tool at all:        ${noTool.length}`)
+  console.log(`  right by luck:         ${luckyHits.length} (no call, correct anyway)`)
+
+  const leadingZero = rows.filter((row) => {
+    const minute = row.askedAt.getMinutes()
+    return minute > 0 && minute < 10
+  })
+  if (leadingZero.length) {
+    const ok = leadingZero.filter((row) => row.verdict === "correct")
+    console.log(`  leading-zero asks:     ${ok.length}/${leadingZero.length} correct`)
+  }
+
+  const wrong = rows.filter((row) => row.verdict !== "correct")
+  if (wrong.length) {
+    console.log("\n  every reply that was not the clock, verbatim:")
+    for (const row of wrong) {
+      console.log(
+        `\n    get_time ${row.calledGetTime ? JSON.stringify(row.returned) : "NOT CALLED"}` +
+          `, tools: ${row.toolsCalled.join(", ") || "none"}`
+      )
+      console.log(`    said: ${row.text}`)
+      console.log(`    ${row.verdict.toUpperCase()} — ${row.detail}`)
+    }
+  }
+
+  check("every ask called get_time", called.length === answered, `${called.length}/${answered}`)
+  check(
+    "every ask stated the time get_time returned",
+    answered === SOURCE_ASKS && correct.length === answered,
+    `${correct.length}/${answered}`
+  )
+}
+
 // ------------------------------------------------- 9b: the detector itself
 
 // Does the clock detector see the failures it was written for?
@@ -1797,6 +1939,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   tokens: verifyTokens,
   clock: verifyClock,
   detector: verifyDetector,
+  source: verifySource,
   nonsense: verifyNonsense,
 }
 
