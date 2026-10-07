@@ -13,6 +13,7 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts clock        # 9
 //   npx tsx dev/scripts/voice-behavior-verify.ts detector     # 9b, offline
 //   npx tsx dev/scripts/voice-behavior-verify.ts source       # 9c
+//   npx tsx dev/scripts/voice-behavior-verify.ts rejudge <log> # 9d, offline
 //   npx tsx dev/scripts/voice-behavior-verify.ts nonsense     # 10
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
@@ -795,6 +796,15 @@ function parseMinutePhrase(
   const words = bare.split(/\s+/)
 
   if (words.length === 1) {
+    // A ROUND TENS MINUTE IS ONE WORD. :20, :30, :40 and :50 are "twenty",
+    // "thirty", "forty", "fifty" — none of them in ONES_WORDS, so this returned
+    // null and the judge reported "no time said" for a perfectly correct "It is
+    // twelve thirty in the morning". Five of thirteen misses in a sixty-ask
+    // baseline were that, which UNDERSTATED the rate instead of flattering it.
+    const tensOnly = TENS_WORDS.indexOf(words[0]!)
+    if (tensOnly >= 2) {
+      return { value: tensOnly * 10, missingOh: false, spuriousOh: hadOh }
+    }
     const value = ONES_WORDS.indexOf(words[0]!)
     if (value < 0) return null
     if (value >= 20) return null
@@ -1602,7 +1612,19 @@ async function verifySource(): Promise<void> {
         : "NONE — the prompt holds no concrete time"
     }`
   )
-  console.log(`  asks:     ${SOURCE_ASKS}, each in a session of its own\n`)
+  console.log(`  asks:     ${SOURCE_ASKS}, each in a session of its own`)
+
+  // Same hold as `clock`, and for a sharper reason here: a run covers only the
+  // twelve or so minutes it takes, so WHICH minutes decides which rules it
+  // exercises at all. A before and an after must start in the same band.
+  const startMinute = process.argv[3] === undefined ? null : Number(process.argv[3])
+  if (startMinute !== null && Number.isInteger(startMinute) && startMinute >= 0 && startMinute < 60) {
+    console.log(`  holding for :${String(startMinute).padStart(2, "0")}`)
+    while (new Date().getMinutes() !== startMinute) {
+      await new Promise((resolve) => setTimeout(resolve, 10000))
+    }
+  }
+  console.log("")
 
   const rows: Array<{
     askedAt: Date
@@ -1678,14 +1700,12 @@ async function verifySource(): Promise<void> {
   console.log(`  no tool at all:        ${noTool.length}`)
   console.log(`  right by luck:         ${luckyHits.length} (no call, correct anyway)`)
 
-  const leadingZero = rows.filter((row) => {
-    const minute = row.askedAt.getMinutes()
-    return minute > 0 && minute < 10
-  })
-  if (leadingZero.length) {
-    const ok = leadingZero.filter((row) => row.verdict === "correct")
-    console.log(`  leading-zero asks:     ${ok.length}/${leadingZero.length} correct`)
-  }
+  reportBands(
+    rows.map((row) => ({
+      minute: row.askedAt.getMinutes(),
+      correct: row.verdict === "correct",
+    }))
+  )
 
   const wrong = rows.filter((row) => row.verdict !== "correct")
   if (wrong.length) {
@@ -1706,6 +1726,124 @@ async function verifySource(): Promise<void> {
     answered === SOURCE_ASKS && correct.length === answered,
     `${correct.length}/${answered}`
   )
+}
+
+// Which spoken form a minute takes. Four of them, and each one is a different
+// rule with its own way of going wrong:
+//
+//   :00      "o'clock"
+//   :01-:09  needs an "oh"           — said without it, that is the leading-zero bug
+//   :10-:19  must take NO "oh"       — said with one, that is "twelve oh eighteen"
+//   :20-:59  tens and ones
+//
+// THIS IS NOT PRESENTATION. Two sixty-ask baselines of identical code scored
+// 29/60 and 51/60, which read as wild variance until you look at what they
+// covered: the first spanned :07-:19 and the second :21-:32. Every spurious "oh"
+// in the first run was a teen minute, and the second run barely sampled a teen
+// minute at all. They were not two samples of one thing; they were one sample
+// each of two different things. A before and an after that cover different bands
+// compare nothing, so the band is reported and the run can be held to start in
+// the one being measured.
+function minuteBand(minute: number): string {
+  if (minute === 0) return ":00 o'clock"
+  if (minute < 10) return ":01-:09 needs an oh"
+  if (minute < 20) return ":10-:19 takes no oh"
+  return ":20-:59 tens and ones"
+}
+
+const MINUTE_BANDS = [":00 o'clock", ":01-:09 needs an oh", ":10-:19 takes no oh", ":20-:59 tens and ones"]
+
+function reportBands(rows: Array<{ minute: number; correct: boolean }>): void {
+  console.log("\n  by minute band — a band with no asks in it was not measured:")
+  for (const band of MINUTE_BANDS) {
+    const inBand = rows.filter((row) => minuteBand(row.minute) === band)
+    if (inBand.length === 0) {
+      console.log(`    ${band.padEnd(24)} not covered`)
+      continue
+    }
+    const ok = inBand.filter((row) => row.correct).length
+    console.log(
+      `    ${band.padEnd(24)} ${ok}/${inBand.length} correct` +
+        ` (${((ok / inBand.length) * 100).toFixed(0)}%)`
+    )
+  }
+}
+
+// ---------------------------------------------------- 9d: re-scoring a past run
+
+// Re-score a saved `source` run with the CURRENT judge.
+//
+// Why this exists: the judge was wrong three times, and each time the data
+// found it — a spurious "oh" scored correct, a round tens minute scored "no time
+// said", a stale value sourced from Ixa's own earlier reply scored "mangled".
+// Every one of those moved the baseline, and re-running to rescore costs twelve
+// minutes of model time to learn nothing new about the model.
+//
+// A `source` run's log holds everything the judge needs: the reply, and
+// get_time's own result, which IS the real clock at that ask. So the run is the
+// measurement and the scoring is separate from it, which is the only way a
+// before and an after can be compared after the judge has changed underneath
+// them both.
+//
+//   npx tsx dev/scripts/voice-behavior-verify.ts rejudge <source-run.log>
+//
+// Only `source` logs: every ask there is its own session, so the stale set is
+// empty by construction and no history has to be reconstructed to score it.
+function verifyRejudge(): void {
+  const file = process.argv[3]
+  if (!file) {
+    console.error("usage: voice-behavior-verify.ts rejudge <source-run.log>")
+    process.exit(2)
+  }
+  section(`9d. re-scoring ${file} with the current judge`)
+
+  const text = require("fs").readFileSync(file, "utf8") as string
+  // Only the per-ask lines above the verbatim section, so a reply is not scored
+  // twice: the summary repeats every miss.
+  const body = text.split("every reply that was not the clock")[0]!
+  const asks = [
+    ...body.matchAll(
+      /^ +\d+ +(?:CORRECT|MANGLED|RECITED|STALE|MISSING OH|SPURIOUS OH|NOT NAMED) +get_time "([^"]+)"\n +< (.*)$/gm
+    ),
+  ]
+  const skipped = [...body.matchAll(/^ +\d+ +\S.*NO get_time/gm)].length
+
+  if (asks.length === 0) {
+    check("the log held scoreable asks", false, "no 'get_time \"...\"' lines found")
+    return
+  }
+
+  const counts = new Map<string, number>()
+  const misses: string[] = []
+  const banded: Array<{ minute: number; correct: boolean }> = []
+  for (const ask of asks) {
+    const clock = parseDigitTimes(ask[1]!)[0]
+    if (!clock) continue
+    // get_time's result is the real clock, so one sample is exact here — there
+    // is no turn to straddle a minute boundary.
+    const at = new Date()
+    at.setHours(clock.meridiem === "pm" && clock.hour !== 12 ? clock.hour + 12 : clock.meridiem === "am" && clock.hour === 12 ? 0 : clock.hour)
+    at.setMinutes(clock.minute)
+    const judged = judgeClock(ask[2]!, [at], { examples: PROMPT_EXAMPLE_TIMES, stale: [] })
+    counts.set(judged.verdict, (counts.get(judged.verdict) ?? 0) + 1)
+    banded.push({ minute: clock.minute, correct: judged.verdict === "correct" })
+    if (judged.verdict !== "correct") {
+      misses.push(`    get_time "${ask[1]}"\n    said: ${ask[2]}\n    ${judged.verdict.toUpperCase()} — ${judged.detail}`)
+    }
+  }
+
+  const total = [...counts.values()].reduce((sum, n) => sum + n, 0)
+  const correct = counts.get("correct") ?? 0
+  console.log(`  asks re-scored:        ${total}${skipped ? ` (${skipped} with no get_time call, not scoreable from a log)` : ""}`)
+  console.log(`  stated the real time:  ${correct}/${total} (${((correct / total) * 100).toFixed(0)}%)`)
+  for (const [verdict, n] of [...counts].filter(([v]) => v !== "correct").sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${verdict}:${" ".repeat(Math.max(1, 22 - verdict.length))}${n}`)
+  }
+  reportBands(banded)
+  if (misses.length) {
+    console.log("\n  every reply that was not the clock, verbatim:\n")
+    console.log(misses.join("\n\n"))
+  }
 }
 
 // ------------------------------------------------- 9b: the detector itself
@@ -1775,6 +1913,23 @@ const DETECTOR_CASES: Array<{
     what: 'the same minute said properly takes no "oh"',
     reply: "It is twelve eighteen in the morning.",
     samples: ["2026-10-07T00:18:43"],
+    stale: [],
+    expect: "correct",
+  },
+  {
+    // Five of thirteen misses in a sixty-ask baseline were this reply, scored
+    // "no time said" because a round tens minute is a single word that is not in
+    // ONES_WORDS.
+    what: "a round tens minute is one word, and correct",
+    reply: "It is twelve thirty in the morning.",
+    samples: ["2026-10-07T00:30:10"],
+    stale: [],
+    expect: "correct",
+  },
+  {
+    what: "and :20, :40 and :50 parse the same way",
+    reply: "It is nine forty in the evening.",
+    samples: ["2026-10-07T21:40:00"],
     stale: [],
     expect: "correct",
   },
@@ -1991,6 +2146,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   clock: verifyClock,
   detector: verifyDetector,
   source: verifySource,
+  rejudge: verifyRejudge,
   nonsense: verifyNonsense,
 }
 
