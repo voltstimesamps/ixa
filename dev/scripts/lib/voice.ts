@@ -90,8 +90,12 @@ export async function connect(): Promise<Client> {
   function await_(send: () => void): Promise<Reply> {
     return new Promise<Reply>((resolve, reject) => {
       // 300s, not 180s: a turn can now be a draft, a price-guard correction,
-      // two web_searches and a final reply, and a text-origin reply has no
-      // length constraint on it. One such turn measured 124s on its own.
+      // two web_searches and a final reply before a word of it is spoken.
+      //
+      // The 124s turn that set this figure was something else — a text-origin
+      // reply, unconstrained in length, being spoken in full. Typed turns are
+      // no longer spoken at all, so that case is gone; the headroom here is
+      // for the tool calls.
       const timer = setTimeout(() => reject(new Error("timed out after 300s")), 300_000)
       pending = {
         resolve: (reply) => {
