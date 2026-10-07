@@ -11,6 +11,7 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts scoreboard   # 1
 //   npx tsx dev/scripts/voice-behavior-verify.ts numbers      # 8
 //   npx tsx dev/scripts/voice-behavior-verify.ts clock        # 9
+//   npx tsx dev/scripts/voice-behavior-verify.ts nonsense     # 10
 //   npx tsx dev/scripts/voice-behavior-verify.ts lasttime     # 2
 //   npx tsx dev/scripts/voice-behavior-verify.ts freshness    # 3
 //   npx tsx dev/scripts/voice-behavior-verify.ts dismiss      # 5
@@ -1000,6 +1001,123 @@ async function verifyClock(): Promise<void> {
     `${correct.length}/${rows.length} correct`)
 }
 
+// ------------------------------------------------------------- 10: nonsense
+
+// A badly misheard transcript is a recognition failure, not a request. Live
+// failures: "Let's cheat last here" (actually "what's two plus two") was
+// REFUSED — "I'm sorry, but I can't help with that" — and "Refita." got a
+// full GPU recommendation.
+//
+// These are spoken through the synthesizer like every other turn here, so what
+// the model sees is STT's reading of synthesized nonsense rather than the
+// string below. That is the point: the transcript the backend recorded is
+// printed alongside the reply, because that is what was actually asked.
+interface NonsenseCase {
+  sent: string
+  // Set when the transcript is NOT nonsense by the rule's test, with the
+  // reason. Reported, not scored.
+  unscored?: string
+}
+
+const NONSENSE: NonsenseCase[] = [
+  { sent: "Refita." },
+  { sent: "Let's cheat last here." },
+  { sent: "And then the of the about it." },
+  { sent: "Can you grommet the sandwich of the fourth." },
+  // Whisper's stock hallucination on near-silence, and the limit of a rule
+  // written around "does not make sense as something a person would say":
+  // this one makes perfect sense. Nothing in the transcript marks it as
+  // invented, so "you're welcome" is the right answer to what was asked. It is
+  // here to show where the rule stops, not to be scored by it.
+  { sent: "Thank you for watching.", unscored: "grammatical and meaningful — indistinguishable from a real utterance" },
+]
+
+// What Ixa said she did with it. "Did not catch" is the fix working; a refusal
+// and a confident answer are the two live failures.
+type NonsenseVerdict = "did not catch" | "refused" | "answered"
+
+const DID_NOT_CATCH =
+  /did ?n[o']?t (?:quite )?(?:catch|get|hear|follow)|(?:catch|hear|get) that|say (?:that )?again|repeat that|come again|missed that|not sure (?:what|I)|unclear/i
+const REFUSED = /can(?:no|')?t help|cannot help|unable to help|won'?t be able|not able to help/i
+
+function judgeNonsense(reply: string): NonsenseVerdict {
+  if (DID_NOT_CATCH.test(reply)) return "did not catch"
+  if (REFUSED.test(reply)) return "refused"
+  return "answered"
+}
+
+// The transcript STT produced for the turn just taken, read back from the
+// recorded history rather than from the wire: the backend does not send the
+// transcript to the client, and what it RECORDED is what the model was given.
+function lastTranscript(): string {
+  const row = liveSession()
+  if (!row) return "(no live session)"
+  const users = messagesOf(row).filter((message) => message.role === "user")
+  return users.at(-1)?.content ?? "(none)"
+}
+
+async function verifyNonsense(): Promise<void> {
+  section("10. a misheard transcript is not a request")
+  console.log(`  model:    ${config.llm.model}\n`)
+
+  const rows: Array<{
+    sent: string
+    heard: string
+    text: string
+    verdict: NonsenseVerdict
+    unscored?: string
+  }> = []
+  const client = await connect()
+  for (const item of NONSENSE) {
+    console.log(`  > (spoken) ${item.sent}`)
+    const pcm = await synthesize(item.sent)
+    let reply: Reply
+    try {
+      reply = await client.askAudio(pcm)
+    } catch (err) {
+      check(`answered: ${item.sent}`, false, err instanceof Error ? err.message : String(err))
+      continue
+    }
+    const heard = lastTranscript()
+    const verdict = judgeNonsense(reply.text)
+    rows.push({ sent: item.sent, heard, text: reply.text, verdict, unscored: item.unscored })
+    console.log(`    heard as: ${JSON.stringify(heard)}`)
+    console.log(`  < ${reply.text}`)
+    console.log(`    ${verdict.toUpperCase()}${item.unscored ? ` (unscored: ${item.unscored})` : ""}\n`)
+  }
+  await client.close()
+
+  console.log("  every reply, verbatim:")
+  for (const row of rows) {
+    console.log(`\n    sent:  ${row.sent}`)
+    console.log(`    heard: ${row.heard}`)
+    console.log(`    said:  ${row.text}`)
+    console.log(`    ${row.verdict.toUpperCase()}${row.unscored ? ` (unscored: ${row.unscored})` : ""}`)
+  }
+
+  const scored = rows.filter((row) => !row.unscored)
+  const caught = scored.filter((row) => row.verdict === "did not catch")
+  const refused = scored.filter((row) => row.verdict === "refused")
+  const answered = scored.filter((row) => row.verdict === "answered")
+  console.log(
+    `\n  answered:        ${rows.length}/${NONSENSE.length}` +
+      `\n  DID NOT CATCH:   ${caught.length}/${scored.length}` +
+      `\n  refused:         ${refused.length}` +
+      `\n  answered anyway: ${answered.length}`
+  )
+  for (const row of rows.filter((entry) => entry.unscored)) {
+    console.log(`  unscored:        ${JSON.stringify(row.sent)} — ${row.unscored}`)
+  }
+
+  // The phrase match is a proxy for a judgement a person makes by reading, so
+  // the transcript above is the evidence and this is the summary of it.
+  check(
+    "every misheard transcript was treated as a mishearing",
+    rows.length === NONSENSE.length && caught.length === scored.length,
+    `${caught.length}/${scored.length}`
+  )
+}
+
 // ------------------------------------------------------------------- main
 
 const commands: Record<string, () => void | Promise<void>> = {
@@ -1012,6 +1130,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   strays: verifyStrays,
   tokens: verifyTokens,
   clock: verifyClock,
+  nonsense: verifyNonsense,
 }
 
 async function main(): Promise<void> {

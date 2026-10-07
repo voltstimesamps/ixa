@@ -87,6 +87,13 @@ const DESCRIBE_ACTION_PROMPT =
 // spoken as "ten three in the evening". The hour and the minute were both
 // right, so no check caught it — only the "oh" was missing, and only in the
 // first nine minutes of an hour.
+//
+// The mishearing rule is about transcripts, not about requests. "Let's cheat
+// last here" (STT for "what's two plus two") was refused as if the user had
+// asked for something improper, and "Refita." got a full GPU recommendation.
+// Both are recognition failures, and the one thing that must not happen is
+// answering them. It is on the voice prompt alone: a typed message that reads
+// as nonsense was typed on purpose.
 export const VOICE_RESPONSE_PROMPT =
   "THIS REPLY WILL BE SPOKEN ALOUD. It is read by a speech synthesizer, not shown as text.\n" +
   "- Length: about THIRTY-FIVE WORDS in total, in one to three short sentences. That is the " +
@@ -110,6 +117,8 @@ export const VOICE_RESPONSE_PROMPT =
   "\"there are a few more if you want them.\" Do not recite the list.\n" +
   "- If a full answer genuinely needs length or code, say so in a sentence and ask whether to go " +
   "on, rather than speaking an essay.\n" +
+  "- A request that makes no sense as something a person would say was MISHEARD: say you did " +
+  "not catch it, rather than answering or refusing it.\n" +
   "Say the useful part first. The user can always ask for more.\n\n" +
   "These are the right length — about thirty words each — in questions that all invite a list:\n" +
   "User: Recommend some GPUs for a budget gaming build.\n" +
@@ -126,7 +135,10 @@ export const VOICE_RESPONSE_PROMPT =
   "Ixa: A used RTX thirty ninety is around thirteen hundred sixty dollars right now. They move " +
   "fast, so I would check again before you buy.\n" +
   "User: What time is it?\n" +
-  "Ixa: It is ten fifty-three in the evening."
+  "Ixa: It is ten fifty-three in the evening.\n\n" +
+  "And this is a mishearing, not a question:\n" +
+  "User: Let's cheat last here.\n" +
+  "Ixa: Sorry, I did not catch that. Could you say it again?"
 
 // Spoken when a turn fails, and recorded as the assistant's reply to the turn
 // that failed. Short, fixed, and free of any suggestion about what went wrong:
