@@ -1176,7 +1176,7 @@ async function verifyNumbers(): Promise<void> {
 // 3. THE DENOMINATOR FOR STALENESS IS NOT TWENTY. It is the asks where a stale
 //    value was both IN the window and already wrong. That is counted, not
 //    assumed.
-const TIME_ASKS = 20
+const TIME_ASKS = Number(process.env.IXA_TIME_ASKS ?? 20)
 
 // Filler between time asks. Cheap on purpose — no tool call, no web_search — so
 // the run's cost is the time asks and a little. Its job is to put other turns
@@ -1194,6 +1194,12 @@ interface TimeAsk {
   verdict: IdVerdict
   detail: string
   calledGetTime: boolean
+  // Every tool the turn called, in order. Not a yes/no on get_time: the first
+  // baseline run answered the time out of WEB_SEARCH results, which a
+  // get_time-only flag records as "no tool call" and so describes as a model
+  // that answered from nothing. It reached for the wrong tool, which is a
+  // different failure with a different fix.
+  toolsCalled: string[]
   // What get_time returned on THIS turn, if it ran.
   returned: string | null
   // The newest time already in the conversation when this ask was made, and how
@@ -1245,6 +1251,22 @@ async function verifyClock(): Promise<void> {
   )
   console.log(`  asks:     ${TIME_ASKS}, each forced into a different minute from the one before\n`)
 
+  // Optional second argument: hold until the wall clock reaches this minute
+  // before the first ask. The leading-zero case — a minute between :01 and :09,
+  // the only one that needs an "oh" — can only be exercised by a run that spans
+  // it, and twenty asks a minute apart span twenty minutes. Starting at :50
+  // covers :50 through :09, so one run covers the leading-zero case and the
+  // ordinary one both.
+  const startMinute = process.argv[3] === undefined ? null : Number(process.argv[3])
+  if (startMinute !== null && Number.isInteger(startMinute) && startMinute >= 0 && startMinute < 60) {
+    while (new Date().getMinutes() !== startMinute) {
+      console.log(
+        `  holding for :${String(startMinute).padStart(2, "0")} — it is ${new Date().toLocaleTimeString()}`
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20000))
+    }
+  }
+
   const rows: TimeAsk[] = []
   const client = await connect()
   let previousMinute: number | null = null
@@ -1254,7 +1276,11 @@ async function verifyClock(): Promise<void> {
     // minute is spent usefully rather than idling.
     for (const filler of TIME_FILLER) {
       try {
-        await say(client, filler)
+        // Spoken, not typed. A typed turn gets no VOICE_RESPONSE_PROMPT, so
+        // text filler would leave the window alternating between having the
+        // constraint and not having it — which changes the thing under test.
+        console.log(`  > (spoken) ${filler}`)
+        await client.askAudio(await synthesize(filler))
       } catch {
         // A filler turn is scaffolding. Losing one costs context, not a result.
       }
@@ -1278,7 +1304,8 @@ async function verifyClock(): Promise<void> {
     // turn boundary, inside the finally that the reply promise waits on, so the
     // row is on disk before the client is told the turn is over.
     const row = liveSession()
-    const calledGetTime = row ? toolCallsInLastTurn(row).includes("get_time") : false
+    const toolsCalled = row ? toolCallsInLastTurn(row) : []
+    const calledGetTime = toolsCalled.includes("get_time")
     const after = row ? toolResultsIn(row, "get_time") : []
     const returned = calledGetTime ? (after.at(-1) ?? null) : null
 
@@ -1297,6 +1324,7 @@ async function verifyClock(): Promise<void> {
       verdict: clock.verdict,
       detail: clock.detail,
       calledGetTime,
+      toolsCalled,
       returned,
       staleAvailable: newest,
       staleOffByMinutes,
@@ -1307,7 +1335,8 @@ async function verifyClock(): Promise<void> {
         `${waited ? ` (waited ${(waited / 1000).toFixed(0)}s for the minute to turn)` : ""}`
     )
     console.log(
-      `    get_time: ${calledGetTime ? `called, returned ${JSON.stringify(returned)}` : "NOT CALLED"}`
+      `    get_time: ${calledGetTime ? `called, returned ${JSON.stringify(returned)}` : "NOT CALLED"}` +
+        `${toolsCalled.length ? `  (tools: ${toolsCalled.join(", ")})` : "  (no tool at all)"}`
     )
     if (newest) {
       console.log(
@@ -1347,8 +1376,15 @@ async function verifyClock(): Promise<void> {
     return minute > 0 && minute < 10
   })
 
+  const searchedInstead = rows.filter(
+    (row) => !row.calledGetTime && row.toolsCalled.includes("web_search")
+  )
+  const noToolAtAll = rows.filter((row) => row.toolsCalled.length === 0)
+
   console.log(`  answered:              ${answered}/${TIME_ASKS}`)
   console.log(`  called get_time:       ${called.length}/${answered}`)
+  console.log(`  SEARCHED THE WEB:      ${searchedInstead.length} (reached for web_search instead)`)
+  console.log(`  no tool at all:        ${noToolAtAll.length}`)
   console.log(`  stated the real time:  ${correct.length}/${answered}`)
   console.log(`  RECITED a prompt time: ${recited.length}`)
   console.log(`  STALE value:           ${stale.length}`)
@@ -1387,7 +1423,7 @@ async function verifyClock(): Promise<void> {
       console.log(
         `\n    asked :${String(row.askedAt.getMinutes()).padStart(2, "0")}, get_time ${
           row.calledGetTime ? JSON.stringify(row.returned) : "NOT CALLED"
-        }`
+        }, tools: ${row.toolsCalled.join(", ") || "none"}`
       )
       console.log(`    said: ${row.text}`)
       console.log(`    ${row.verdict.toUpperCase()} — ${row.detail}`)
