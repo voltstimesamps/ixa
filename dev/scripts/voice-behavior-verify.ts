@@ -51,6 +51,7 @@ import "../../src/tools/register"
 import { registry } from "../../src/tools/registry"
 import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
 import { shortenForSpeech, CONTINUE_OFFER } from "../../src/voice/shorten"
+import { sanitizeForSpeech } from "../../src/voice/sanitize"
 import { parseDismiss } from "../../src/voice/dismiss"
 import { findCurrencyAmounts } from "../../src/core/prices"
 import { getPreferenceStore } from "../../src/memory/preferences"
@@ -557,10 +558,16 @@ async function verifyTokens(): Promise<void> {
 //
 // `identifiers` lists what the reply has to get right if it names the thing at
 // all. `accept` is how a person says it; `reject` is a form seen coming back
-// from a live run. Letter-suffixed part numbers (12400, 7700X, 13700K) carry
-// no expected form on purpose: Kokoro itself is inconsistent on them and human
-// convention is unsettled, so there is no correct answer to score against.
-// They are reported unscored.
+// from a live run.
+//
+// Letter-suffixed part numbers used to carry no expected form, on the grounds
+// that Kokoro was inconsistent on them and human convention unsettled. Both
+// halves of that have been measured since and neither holds: Kokoro is
+// consistent once the Unicode spaces are folded, and the inconsistency was the
+// separator. "RX 7800 XT" reads "seventy eight hundred ex-tee" and
+// "i5-12400" is rendered by src/voice/partnumbers.ts, so both are scored here
+// now. What stays unscored is a question whose answer names a part we did not
+// choose — there is no identifier to check against, whatever the spoken form.
 interface IdentifierCheck {
   written: string
   accept: string[]
@@ -591,10 +598,27 @@ const GPU_4070: IdentifierCheck = {
   reject: ["four thousand seventy", "four hundred seventy", "forty seven zero", "four zero seven zero", "four seventy"],
 }
 
+// The two the old judge waved through as having no checkable spoken form. Both
+// are checkable now, and they are the two cases this branch exists for: the
+// AMD hundred-form, which the space fold alone fixes, and the Intel form, which
+// src/voice/partnumbers.ts renders.
+const GPU_7800_XT: IdentifierCheck = {
+  written: "RX 7800 XT",
+  accept: ["seventy-eight hundred", "seventy eight hundred", "7800"],
+  reject: ["seven thousand eight hundred", "seventy eight zero zero", "seventy eight hundreds"],
+}
+const CPU_12400: IdentifierCheck = {
+  written: "i5-12400",
+  accept: ["i five twelve four hundred", "twelve four hundred"],
+  reject: ["twelve thousand four hundred", "one two four zero zero", "twelve four zero zero"],
+}
+
 const NUMBER_QUESTIONS: NumberQuestion[] = [
   { ask: "How much is a used RTX 3090 right now?", identifiers: [GPU_3090] },
   { ask: "What GPU should I get for local AI?" },
-  { ask: "What CPU should I get for local AI?", unscored: "CPU part numbers have no agreed spoken form" },
+  // Still unscored, but not for the reason it used to be: the reply picks the
+  // CPU, so there is no identifier to score it against.
+  { ask: "What CPU should I get for local AI?", unscored: "the reply chooses the part, so there is nothing to check it against" },
   { ask: "How much VRAM does a 3060 have?", identifiers: [GPU_3060] },
   { ask: "How much RAM do I need to run a 7B model?" },
   { ask: "How fast is a 4070 compared to a 3060?", identifiers: [GPU_4070, GPU_3060] },
@@ -626,8 +650,8 @@ const NUMBER_QUESTIONS: NumberQuestion[] = [
       },
     ],
   },
-  { ask: "Is an i5-12400 enough for local AI?", unscored: "12400 has no agreed spoken form" },
-  { ask: "Is the RX 7800 XT good for local AI?", unscored: "7800 takes the hundred-form, which the pairs rule does not cover" },
+  { ask: "Is an i5-12400 enough for local AI?", identifiers: [CPU_12400] },
+  { ask: "Is the RX 7800 XT good for local AI?", identifiers: [GPU_7800_XT] },
 ]
 
 // A compliant spoken reply has no digit and no currency or percent sign in it.
@@ -679,30 +703,78 @@ function flatten(text: string): string {
 type IdVerdict =
   | "correct"
   | "mangled"
-  | "as digits"
+  | "as written"
   | "not named"
   | "missing oh"
   | "spurious oh"
   | "recited"
   | "stale"
 
-// An identifier is only judged if the reply tried to name it. A reply about a
-// different card is not evidence either way — but a reply that writes the
-// identifier in DIGITS is not "not named", it is the original failure: Kokoro
-// reads "RTX 3060" as "three thousand sixty". Scoring that as absent is what
-// made the baseline look as accurate as the new prompt, when in fact it had
-// simply left seven identifiers in digits for the synthesizer to mangle.
+// What changed here, and why the old version could not measure the thing it
+// was built to measure.
 //
-// Accept is tested before digits, because for a standard or a version the digit
-// form IS the correct answer ("DDR4", "Ubuntu 24.04") and is listed in accept.
-function judgeIdentifier(reply: string, check: IdentifierCheck): IdVerdict {
-  const flat = flatten(reply)
-  if (check.reject.some((form) => flat.includes(flatten(form)))) return "mangled"
-  if (check.accept.some((form) => flat.includes(flatten(form)))) return "correct"
-  // The bare number out of the written form: "RTX 3060" -> "3060".
-  const digits = check.written.match(/\d[\d.]*/g) ?? []
-  if (digits.some((run) => new RegExp(`(?:^|[^\\d.])${run.replace(/\./g, "\\.")}(?:[^\\d]|$)`).test(reply))) {
-    return "as digits"
+// 1. IT JUDGES WHAT IS SPOKEN, NOT THE DRAFT. The caller passes the reply
+//    through sanitizeForSpeech, so this sees the string the sidecar gets.
+//
+// 2. "AS DIGITS" IS NO LONGER A FAILURE, AND IS RENAMED "AS WRITTEN". It used
+//    to be the original failure, because "RTX 3060" with the model's U+202F in
+//    front of the number read as "three thousand sixty". Folding the Unicode
+//    spaces (src/voice/sanitize.ts) fixed that: the digit form is now read
+//    correctly for every current GPU and AMD CPU, measured over 31 of 31
+//    strings. The model writing digits is the EXPECTED state from here, so
+//    scoring it as a failure would report a regression on the one path that
+//    now works.
+//
+// 3. A FORM ONLY COUNTS NEXT TO THE FAMILY NAME. Both lists used to be tested
+//    as bare substrings of the whole reply, which made two mistakes possible
+//    in opposite directions, and the recorded history has an example of each:
+//
+//      - a spoken PRICE scoring the card as correctly named. "around thirteen
+//        hundred sixty dollars" contains "thirty sixty" nowhere, but "fifty-six
+//        hundred" and friends do collide, and the prompt example that was
+//        removed for carrying an identifier number was exactly this shape.
+//      - a spoken price scoring the card as MANGLED. "three hundred ninety" is
+//        a reject form for the 3090 and also what "$390" sounds like.
+//
+//    So a form has to sit just after the family word to count. A form that
+//    already carries the family word ("pcie four") is matched as it stands,
+//    and a one-token name ("DDR4") has no family word to anchor to.
+//
+// An identifier is still only judged if the reply named it at all: a reply
+// about a different card is evidence neither way.
+function escapeForRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+// The leading word of a multi-token name: "RTX 3090" -> "rtx", "Ryzen 5 5600G"
+// -> "ryzen". Null for a name that is one token, which has nothing to anchor on.
+function familyWord(written: string): string | null {
+  if (!/\s/.test(written)) return null
+  return /^([A-Za-z]+)/.exec(written)?.[1]?.toLowerCase() ?? null
+}
+
+// Up to 16 characters of slack between the family word and the form, so the
+// tier digit in "Ryzen 5 fifty-six hundred G" does not break the anchor, and
+// no sentence boundary inside it, so the two have to be the same phrase.
+function namesIt(flat: string, family: string | null, form: string): boolean {
+  const wanted = flatten(form)
+  if (!family || wanted.startsWith(family)) return flat.includes(wanted)
+  return new RegExp(`\\b${escapeForRegExp(family)}\\b[^.!?]{0,16}${escapeForRegExp(wanted)}`).test(flat)
+}
+
+function judgeIdentifier(spoken: string, check: IdentifierCheck): IdVerdict {
+  const flat = flatten(spoken)
+  const family = familyWord(check.written)
+  if (check.reject.some((form) => namesIt(flat, family, form))) return "mangled"
+  if (check.accept.some((form) => namesIt(flat, family, form))) return "correct"
+  // The bare number out of the written form: "RTX 3060" -> "3060". Read
+  // correctly by the synthesizer now, so this is a pass — see note 2 above.
+  //
+  // Runs of three or more digits only. "i5-12400" also contains the tier digit
+  // "5", and matching that would score "it has 5 cores" as naming the chip.
+  const digits = check.written.match(/\d[\d.]{2,}/g) ?? []
+  if (digits.some((run) => new RegExp(`(?:^|[^\\d.])${run.replace(/\./g, "\\.")}(?:[^\\d]|$)`).test(spoken))) {
+    return "as written"
   }
   return "not named"
 }
@@ -1042,9 +1114,15 @@ async function verifyNumbers(): Promise<void> {
     const answer = trimmed ? reply.text.trimEnd().slice(0, -CONTINUE_OFFER.length).trimEnd() : reply.text
     const counted = shortenForSpeech(answer, { maxUnits: 0, maxWords: 0 })
 
+    // The string the sidecar actually receives, not the draft. The two differ
+    // now: sanitizeForSpeech folds the Unicode spaces and renders the Intel and
+    // Ti forms, and all three of those decide how a part number is read. The
+    // numeral scan below deliberately keeps reading the DRAFT, because whether
+    // the model wrote digits is a question about the prompt, not about speech.
+    const spoken = sanitizeForSpeech(answer)
     const identifiers: Array<{ written: string; verdict: IdVerdict; detail?: string }> = (
       item.identifiers ?? []
-    ).map((check) => ({ written: check.written, verdict: judgeIdentifier(answer, check) }))
+    ).map((check) => ({ written: check.written, verdict: judgeIdentifier(spoken, check) }))
     if (item.clock) {
       // Both ends of the turn, not just askedAt: synthesis, the LLM call and
       // the tool run all happen in between, so a minute crossed mid-turn must
@@ -1113,16 +1191,21 @@ async function verifyNumbers(): Promise<void> {
   const judged = spoke.flatMap((row) => row.identifiers)
   const idCorrect = judged.filter((id) => id.verdict === "correct")
   const idMangled = judged.filter((id) => id.verdict === "mangled")
-  const idDigits = judged.filter((id) => id.verdict === "as digits")
+  // "As written" counts with "correct": the digit form is read correctly now,
+  // and the two are both passes that differ only in who did the work — the
+  // model spelling it out, or the synthesizer reading it right.
+  const idAsWritten = judged.filter((id) => id.verdict === "as written")
   const idAbsent = judged.filter((id) => id.verdict === "not named")
-  const idScored = idCorrect.length + idMangled.length + idDigits.length
+  const idScored = idCorrect.length + idMangled.length + idAsWritten.length
+  const idRight = idCorrect.length + idAsWritten.length
 
   console.log(`\n  answered:        ${answered}/${NUMBER_QUESTIONS.length}`)
   if (empty.length) console.log(`  EMPTY replies:   ${empty.length} (excluded from the rates below)`)
   console.log(
-    `  IDENTIFIERS:     ${idCorrect.length}/${idScored} correct` +
-      `${idScored ? ` (${((idCorrect.length / idScored) * 100).toFixed(0)}%)` : ""}` +
-      `, ${idMangled.length} mangled, ${idDigits.length} left as digits, ${idAbsent.length} not named`
+    `  IDENTIFIERS:     ${idRight}/${idScored} will survive the synthesizer` +
+      `${idScored ? ` (${((idRight / idScored) * 100).toFixed(0)}%)` : ""}` +
+      `, of which ${idCorrect.length} spelled out and ${idAsWritten.length} left as written` +
+      `; ${idMangled.length} mangled, ${idAbsent.length} not named`
   )
   console.log(`  compliant:       ${compliant.length}/${spoke.length} (no digits or currency symbols)`)
   console.log(`  mean words:      ${meanWords.toFixed(1)}`)
@@ -1137,15 +1220,13 @@ async function verifyNumbers(): Promise<void> {
     }
   }
 
-  const badRows = spoke.filter((row) =>
-    row.identifiers.some((id) => id.verdict === "mangled" || id.verdict === "as digits")
-  )
+  // Only "mangled" lands here now. A digit form is no longer a mangling
+  // waiting to happen, so listing it would report a failure that is not one.
+  const badRows = spoke.filter((row) => row.identifiers.some((id) => id.verdict === "mangled"))
   if (badRows.length) {
     console.log("\n  identifiers that will not survive the synthesizer:")
     for (const row of badRows) {
-      for (const id of row.identifiers.filter(
-        (entry) => entry.verdict === "mangled" || entry.verdict === "as digits"
-      )) {
+      for (const id of row.identifiers.filter((entry) => entry.verdict === "mangled")) {
         console.log(
           `    ${id.written}: ${id.verdict}${id.detail ? ` — ${id.detail}` : ""}  <- ${row.question}`
         )
@@ -1978,7 +2059,7 @@ const DETECTOR_CASES: Array<{
 ]
 
 function verifyDetector(): void {
-  section("9b. the clock detector, checked offline against the recorded failures")
+  section("9b. the identifier and clock judges, checked offline against the recorded failures")
 
   console.log(
     `  prompt example times, parsed out of VOICE_RESPONSE_PROMPT: ${
@@ -2001,6 +2082,12 @@ function verifyDetector(): void {
   )
   console.log("")
 
+  for (const item of IDENTIFIER_CASES) {
+    const verdict = judgeIdentifier(sanitizeForSpeech(item.reply), item.check)
+    check(item.what, verdict === item.expect, `expected ${item.expect.toUpperCase()}, got ${verdict.toUpperCase()}`)
+  }
+  console.log("")
+
   for (const item of DETECTOR_CASES) {
     const judged = judgeClock(
       item.reply,
@@ -2014,6 +2101,117 @@ function verifyDetector(): void {
     )
   }
 }
+
+// The identifier judge's own cases, for the same reason as DETECTOR_CASES
+// below: a judge with a false positive in it reports a compliance the model has
+// not got, and the only way that stays fixed is a case that fails if it comes
+// back.
+//
+// Each reply here is run through sanitizeForSpeech first, exactly as the live
+// path runs it, so these also cover the space fold and the Intel rendering.
+const IDENTIFIER_CASES: Array<{
+  what: string
+  reply: string
+  check: IdentifierCheck
+  expect: IdVerdict
+}> = [
+  {
+    what: "a spelled-out card next to its family name is correct",
+    reply: "The RTX thirty ninety is around thirteen hundred dollars used.",
+    check: GPU_3090,
+    expect: "correct",
+  },
+  {
+    what: "THE FALSE POSITIVE: a price carrying the identifier number does not name the card",
+    reply: "A used one goes for about fifty-six hundred G of nothing, roughly thirty sixty dollars.",
+    check: { written: "RTX 9999", accept: ["thirty sixty"], reject: [] },
+    expect: "not named",
+  },
+  {
+    what: "THE FALSE NEGATIVE: a price that sounds like a reject form is not a mangling",
+    reply: "I would not pay three hundred ninety dollars for that cooler.",
+    check: GPU_3090,
+    expect: "not named",
+  },
+  {
+    what: "a reject form next to the family name is still a mangling",
+    reply: "The RTX three thousand ninety is a good card.",
+    check: GPU_3090,
+    expect: "mangled",
+  },
+  {
+    what: "digits are a PASS now: the fold makes the synthesizer read them right",
+    reply: "The RTX 3090 is around thirteen hundred dollars used.",
+    check: GPU_3090,
+    expect: "as written",
+  },
+  {
+    what: "a reply about a different card is evidence neither way",
+    reply: "The RTX forty seventy is the better buy.",
+    check: GPU_3090,
+    expect: "not named",
+  },
+  {
+    what: "a tier digit between the family name and the form does not break the anchor",
+    reply: "A Ryzen 5 fifty-six hundred G takes DDR4.",
+    check: {
+      written: "Ryzen 5 5600G",
+      accept: ["fifty-six hundred g", "fifty six hundred g", "5600g"],
+      reject: ["five thousand six hundred", "five six hundred g"],
+    },
+    expect: "correct",
+  },
+  {
+    // Two things at once, and both are deliberate: a one-token name has no
+    // family word to anchor to, so it matches as a bare substring; and for a
+    // standard the digit form is itself an ACCEPTED form, which is why accept
+    // is tested before the digit branch.
+    what: "a one-token name matches as a bare substring, and its digit form is an accepted form",
+    reply: "It takes DDR4 memory.",
+    check: { written: "DDR4", accept: ["ddr4", "ddr four"], reject: ["ddr for"] },
+    expect: "correct",
+  },
+  {
+    what: "a form that already carries the family word is matched as written",
+    reply: "It uses PCIe four.",
+    check: {
+      written: "PCIe 4.0",
+      accept: ["pcie 4", "pcie four", "pci express four"],
+      reject: ["pcie forty", "pcie four thousand"],
+    },
+    expect: "correct",
+  },
+  {
+    what: "the Intel rendering reaches the judge, so a draft written in digits scores correct",
+    reply: "An i5-12400 is plenty for that.",
+    check: CPU_12400,
+    expect: "correct",
+  },
+  {
+    what: "the Intel rendering survives the model's non-breaking hyphen too",
+    reply: "An i5\u201112400 is plenty for that.",
+    check: CPU_12400,
+    expect: "correct",
+  },
+  {
+    what: "a model that writes the Intel number out wrongly is still mangled",
+    reply: "An i five twelve thousand four hundred is plenty.",
+    check: CPU_12400,
+    expect: "mangled",
+  },
+  {
+    what: "the AMD hundred-form needs no rendering, only the space fold",
+    reply: "The RX 7800 XT is a good buy.",
+    check: GPU_7800_XT,
+    expect: "correct",
+  },
+  {
+    what: "the same card written with the model's narrow space",
+    reply: "The RX\u202F7800 XT is a good buy.",
+    check: GPU_7800_XT,
+    expect: "correct",
+  },
+]
 
 // ------------------------------------------------------------- 10: nonsense
 
