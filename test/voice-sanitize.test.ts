@@ -141,8 +141,8 @@ test("empty and whitespace-only input produce nothing to speak", () => {
 // synthesizer does with the result is measured in Ixa-Tests/tts.
 
 test("a narrow no-break space between a name and its number becomes a plain space", () => {
-  assert.equal(sanitizeForSpeech("A used RTX 3090 is fine."), "A used RTX 3090 is fine.")
-  assert.equal(sanitizeForSpeech("It has 16 GB of VRAM."), "It has 16 GB of VRAM.")
+  assert.equal(sanitizeForSpeech("A used RTX\u202F3090 is fine."), "A used RTX 3090 is fine.")
+  assert.equal(sanitizeForSpeech("It has 16\u202FGB of VRAM."), "It has 16 GB of VRAM.")
 })
 
 test("every Unicode space separator is folded, not just the narrow one", () => {
@@ -150,31 +150,34 @@ test("every Unicode space separator is folded, not just the narrow one", () => {
   // mathematical, U+3000 ideographic. All of them are spaces to a reader and
   // none of them is a space to the G2P.
   assert.equal(
-    sanitizeForSpeech("RTX 3060 RTX 3070 RTX 3080 RTX 3090 RTX　4090."),
+    sanitizeForSpeech("RTX\u00A03060 RTX\u20093070 RTX\u202F3080 RTX\u205F3090 RTX\u30004090."),
     "RTX 3060 RTX 3070 RTX 3080 RTX 3090 RTX 4090."
   )
 })
 
 test("folded spaces collapse like ASCII ones rather than stacking up", () => {
-  assert.equal(sanitizeForSpeech("The   RTX 3060 is fine."), "The RTX 3060 is fine.")
+  assert.equal(sanitizeForSpeech("The\u202F \u202FRTX 3060 is fine."), "The RTX 3060 is fine.")
 })
 
 test("a non-breaking hyphen is left alone", () => {
   // Folding it to an ASCII hyphen makes "i5-12400" read as "one two four zero
-  // zero"; src/voice/partnumbers.ts renders that family explicitly instead.
-  assert.equal(sanitizeForSpeech("An Intel i5‑12400 build."), "An Intel i5‑12400 build.")
-  assert.equal(sanitizeForSpeech("A 12‑GB card."), "A 12‑GB card.")
+  // zero", which is worse than what it does now. Instead of choosing between
+  // two wrong readings, src/voice/partnumbers.ts renders that family
+  // explicitly \u2014 so the hyphen's survival is asserted on compounds here, and
+  // the Intel case is asserted in test/voice-partnumbers.test.ts.
+  assert.equal(sanitizeForSpeech("A 12\u2011GB card."), "A 12\u2011GB card.")
+  assert.equal(sanitizeForSpeech("A pre\u2011built with a 7\u2011B model."), "A pre\u2011built with a 7\u2011B model.")
 })
 
 test("a price range separated by narrow spaces keeps its two amounts apart", () => {
   // Verbatim from a recorded reply. With the narrow spaces in place Kokoro read
   // the whole range as one fused number — "one-three-hundred-dash-one".
   assert.equal(
-    sanitizeForSpeech("Roughly $1,300 – $1,400 today."),
+    sanitizeForSpeech("Roughly $1,300\u202F–\u202F$1,400 today."),
     "Roughly $1,300 – $1,400 today."
   )
 })
 
 test("a narrow space does not hide a list marker from the stripper", () => {
-  assert.equal(sanitizeForSpeech("- The RTX 3060\n- The RX 6600"), "The RTX 3060. The RX 6600.")
+  assert.equal(sanitizeForSpeech("-\u202FThe RTX 3060\n-\u202FThe RX 6600"), "The RTX 3060. The RX 6600.")
 })

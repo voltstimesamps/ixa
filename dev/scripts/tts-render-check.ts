@@ -272,6 +272,66 @@ const BASE: Fixture[] = [
     raw: "Use a smaller model, e.g. a 7B, for quick replies.",
     note: "KNOWN QUIRK, not a bug: same early split — expect 2 chunks",
   },
+
+  // ----- part numbers -------------------------------------------------------
+  //
+  // Composed rather than copied: the corpus has the GPU shapes (01a, 05, 09a,
+  // 13, 14) but no four-digit Intel number, no KS suffix and no laptop chip,
+  // so those are stated as invented rather than implied to be real.
+  //
+  // What each one is for is in its note. The GPU and AMD fixtures should need
+  // nothing from src/voice/partnumbers.ts at all — they are here to show that
+  // folding the Unicode spaces was the whole fix, and to catch it if a later
+  // change to the renderer starts touching them.
+  {
+    id: "28",
+    slug: "part-gpu-nvidia",
+    source: "invented",
+    raw: "The RTX\u202F5090, the RTX 4060 Ti and the GTX 1650 are all current.",
+    note: "three NVIDIA families plus the Ti suffix, which is the one rendering the space fold made worse",
+  },
+  {
+    id: "29",
+    slug: "part-gpu-amd",
+    source: "invented",
+    raw: "An RX\u202F7800 XT or an RX 9070 XT would do.",
+    note: "AMD reads as \"seventy eight hundred\" and \"ninety seventy\" with no table — expect no change from the renderer",
+  },
+  {
+    id: "30",
+    slug: "part-cpu-intel-four-digit",
+    source: "invented",
+    raw: "An i7-8700K or an i9-14900KS will do.",
+    note: "four-digit Intel (right with an ASCII hyphen, wrong with U+2011) and the KS suffix, which reads as the plural \"kays\" unless spaced",
+  },
+  {
+    id: "31",
+    slug: "part-cpu-intel-laptop",
+    source: "invented",
+    raw: "An i5-12450H laptop chip is fine.",
+    note: "a model number NOT ending in double zero: expect \"twelve four fifty\", not \"four hundred fifty\"",
+  },
+  {
+    id: "32",
+    slug: "part-cpu-amd",
+    source: "invented",
+    raw: "A Ryzen\u202F7 7800X3D with an RTX\u202F4070 Ti Super.",
+    note: "AMD CPU including X3D, already correct once the spaces are folded",
+  },
+  {
+    id: "33",
+    slug: "part-not-covered",
+    source: "invented",
+    raw: "The Core Ultra 7 265K, and gaming PCs with RTX 3060/3070/3080.",
+    note: "STATED NOT COVERED: a three-digit SKU reads \"two hundred sixty five\", and a slash run reads every number right with the slash now silent rather than spoken",
+  },
+  {
+    id: "34",
+    slug: "part-not-a-card",
+    source: "invented",
+    raw: "The RTX 390 is not a card.",
+    note: "STATED NOT COVERED: this layer renders names, it does not check them — expect \"three hundred ninety\"",
+  },
 ]
 
 // --------------------------------------------------------------------- twins

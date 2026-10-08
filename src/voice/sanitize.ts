@@ -20,6 +20,20 @@
 //
 // Deliberately out of scope: markdown tables. A spoken table is unsalvageable
 // whatever we do to the pipes, and the fix is the model not writing one.
+//
+// TWO STAGES, one entry point. The markdown stripping is here; the part-number
+// rendering that follows it is in src/voice/partnumbers.ts, called from the
+// bottom of sanitizeForSpeech. They are composed rather than called separately
+// because there are two callers — speak() in src/api/websocket.ts and
+// dev/scripts/tts-render-check.ts — and the harness's guarantee that what is
+// measured is what runs would otherwise depend on remembering to update both.
+//
+// The order is not a preference. The rendering has to see text with the
+// markup already gone: a leaked asterisk fuses into the token after it, which
+// is measurable in the phonemes, and a part number with "**" against it is not
+// a part number any pattern will match.
+
+import { renderPartNumbers } from "./partnumbers"
 
 // Every Unicode space separator (category Zs) folded to a plain ASCII space.
 //
@@ -48,6 +62,15 @@
 // "twenty four zero four", "$500 12 GB" fused into one number, "LM Studio" and
 // "Raspberry". Sixteen of the nineteen change, and exactly one rendering got
 // worse — "Ti", handled in src/voice/partnumbers.ts.
+//
+// Two things the fold does NOT do, measured over the same fixtures so that
+// neither is mistaken for a fix:
+//   - "$1<U+202F>200", where the model used U+202F as a THOUSANDS separator
+//     rather than before a unit, still reads "one two hundred dollars". It
+//     gains the missing "dollars" and keeps the wrong amount. See
+//     src/core/prices.ts, which documents that live shape.
+//   - "PCIe<U+202F>4.0" read "four dot zero" fused and now reads "PCIe four":
+//     the natural spoken form, but the ".0" is silent rather than spoken.
 //
 // U+2011 NON-BREAKING HYPHEN is deliberately NOT normalized alongside it.
 // Folding it to an ASCII hyphen makes an Intel part number worse, not better:
@@ -133,5 +156,8 @@ export function sanitizeForSpeech(text: string): string {
 
   // Single spaces throughout: the sidecar splits on sentence endings, and a
   // stray newline would split a chunk at a place with no pause in it.
-  return blocks.join(" ").replace(/[ \t]{2,}/g, " ").trim()
+  const stripped = blocks.join(" ").replace(/[ \t]{2,}/g, " ").trim()
+
+  // Last, on the finished prose. See the note on the two stages above.
+  return renderPartNumbers(stripped)
 }
