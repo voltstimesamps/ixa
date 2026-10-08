@@ -21,6 +21,41 @@
 // Deliberately out of scope: markdown tables. A spoken table is unsalvageable
 // whatever we do to the pipes, and the fix is the model not writing one.
 
+// Every Unicode space separator (category Zs) folded to a plain ASCII space.
+//
+// This is the single highest-value line in the speech path, and it is here
+// rather than in a part-number table because the SEPARATOR, not the digits, is
+// what decides how Kokoro reads a model number. Measured through misaki's
+// G2P — the one KPipeline calls — on the same card with four separators:
+//
+//   "RTX 3090"       (ASCII space)  -> "thirty ninety"          correct
+//   "RTX\u202f3090"  (U+202F)       -> "three thousand ninety"  wrong
+//   "RTX-3090"                      -> "thirty ninety"          correct
+//   "RTX3090"                       -> "thirty ninety"          correct
+//
+// The model writes U+202F NARROW NO-BREAK SPACE between a name and the number
+// that follows it constantly — 127 occurrences across the recorded replies in
+// data/ixa.db — and it is invisible in every terminal and every log line. With
+// it gone, Kokoro reads every current GPU and AMD CPU number correctly on its
+// own: 31 of 31 GPU strings probed, 50/40/30/20/16/10 series, RX 9070 XT
+// through RX 6600, and Ryzen 5600G through 9950X3D. No table of cards is
+// needed for any of them, and none is needed for a generation not yet
+// released: "RTX 6090" already reads "sixty ninety".
+//
+// What U+202F costs is not only model numbers. Over the 19 recorded replies
+// that contain one, folding it fixes a price range read as a different number
+// ("$1,300 – $1,400" was "one-three-hundred-dash-one"), "Ubuntu 24.04" read as
+// "twenty four zero four", "$500 12 GB" fused into one number, "LM Studio" and
+// "Raspberry". Sixteen of the nineteen change, and exactly one rendering got
+// worse — "Ti", handled in src/voice/partnumbers.ts.
+//
+// U+2011 NON-BREAKING HYPHEN is deliberately NOT normalized alongside it.
+// Folding it to an ASCII hyphen makes an Intel part number worse, not better:
+// "i5\u201112400" reads "twelve thousand four hundred", while "i5-12400"
+// reads "one two four zero zero". Neither is right, and partnumbers.ts renders
+// that family explicitly instead of choosing between two wrong readings.
+const UNICODE_SPACES = /\p{Zs}/gu
+
 // A block that already ends in punctuation is left alone; one that does not
 // gets a period, so it reads as a sentence and chunks like one.
 function asSentence(text: string): string {
@@ -64,7 +99,13 @@ export function sanitizeForSpeech(text: string): string {
   // Code fences first, before anything inspects line starts: the content of a
   // fenced block is kept but must not be read as markdown, and a "```" line
   // is itself never speakable.
-  let working = text.replace(/\r\n/g, "\n").replace(/^[ \t]*```+[^\n]*$/gm, "")
+  // Space folding comes first, so every rule below — the line-start markers,
+  // the inline strippers and the final whitespace collapse, all of which are
+  // written for an ASCII space — sees one.
+  let working = text
+    .replace(/\r\n/g, "\n")
+    .replace(UNICODE_SPACES, " ")
+    .replace(/^[ \t]*```+[^\n]*$/gm, "")
 
   const blocks: string[] = []
 

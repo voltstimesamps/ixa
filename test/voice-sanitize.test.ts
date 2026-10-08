@@ -131,3 +131,50 @@ test("empty and whitespace-only input produce nothing to speak", () => {
   assert.equal(sanitizeForSpeech("   \n\n  "), "")
   assert.equal(sanitizeForSpeech("```\n```"), "")
 })
+
+// ------------------------------------------------- Unicode space separators
+//
+// The model writes U+202F NARROW NO-BREAK SPACE between a name and the number
+// after it — 127 occurrences in the recorded replies. It is invisible, and it
+// was deciding whether Kokoro read "RTX 3090" as "thirty ninety" or as "three
+// thousand ninety". These assert the fold, not the rendering: what the
+// synthesizer does with the result is measured in Ixa-Tests/tts.
+
+test("a narrow no-break space between a name and its number becomes a plain space", () => {
+  assert.equal(sanitizeForSpeech("A used RTX 3090 is fine."), "A used RTX 3090 is fine.")
+  assert.equal(sanitizeForSpeech("It has 16 GB of VRAM."), "It has 16 GB of VRAM.")
+})
+
+test("every Unicode space separator is folded, not just the narrow one", () => {
+  // U+00A0 no-break, U+2009 thin, U+202F narrow no-break, U+205F medium
+  // mathematical, U+3000 ideographic. All of them are spaces to a reader and
+  // none of them is a space to the G2P.
+  assert.equal(
+    sanitizeForSpeech("RTX 3060 RTX 3070 RTX 3080 RTX 3090 RTX　4090."),
+    "RTX 3060 RTX 3070 RTX 3080 RTX 3090 RTX 4090."
+  )
+})
+
+test("folded spaces collapse like ASCII ones rather than stacking up", () => {
+  assert.equal(sanitizeForSpeech("The   RTX 3060 is fine."), "The RTX 3060 is fine.")
+})
+
+test("a non-breaking hyphen is left alone", () => {
+  // Folding it to an ASCII hyphen makes "i5-12400" read as "one two four zero
+  // zero"; src/voice/partnumbers.ts renders that family explicitly instead.
+  assert.equal(sanitizeForSpeech("An Intel i5‑12400 build."), "An Intel i5‑12400 build.")
+  assert.equal(sanitizeForSpeech("A 12‑GB card."), "A 12‑GB card.")
+})
+
+test("a price range separated by narrow spaces keeps its two amounts apart", () => {
+  // Verbatim from a recorded reply. With the narrow spaces in place Kokoro read
+  // the whole range as one fused number — "one-three-hundred-dash-one".
+  assert.equal(
+    sanitizeForSpeech("Roughly $1,300 – $1,400 today."),
+    "Roughly $1,300 – $1,400 today."
+  )
+})
+
+test("a narrow space does not hide a list marker from the stripper", () => {
+  assert.equal(sanitizeForSpeech("- The RTX 3060\n- The RX 6600"), "The RTX 3060. The RX 6600.")
+})

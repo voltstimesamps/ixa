@@ -55,8 +55,12 @@ const fixturesPath = path.join(outDir, "fixtures.json")
 // is under test and must not be retyped: the model writes U+202F NARROW
 // NO-BREAK SPACE between a number and its unit ("32 GB", "RTX 3080" — 127
 // occurrences) and U+2011 NON-BREAKING HYPHEN inside compounds ("12‑GB",
-// "7‑B", "pre‑built" — 72 occurrences). Neither is touched by the sanitizer,
-// whose whitespace collapse is ASCII-only, so both reach Kokoro intact.
+// "7‑B", "pre‑built" — 72 occurrences). The U+202F is now folded to an ASCII
+// space by the sanitizer, which is the whole point of measuring it here: that
+// one character was deciding whether "RTX 3090" read as "thirty ninety" or as
+// "three thousand ninety". U+2011 is still passed through untouched and still
+// reaches Kokoro intact — see src/voice/sanitize.ts for why folding it would
+// make an Intel part number worse.
 //
 // INVENTED strings exist only where the corpus has no real example. Those gaps
 // are stated rather than papered over: there are no snake_case or dotted
