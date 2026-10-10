@@ -15,9 +15,18 @@
 //
 // Two things the space fold does not fix, and they are all that is here:
 //
-//   1. "Ti". Measured: with U+202F in place, "RTX 4060 Ti" read as "tie",
-//      which is right. With the space folded it reads "tee", which is the one
-//      rendering the fold made worse. "Tie" restores it.
+//   1. "Ti", which is spoken as the two LETTERS. Measured: with U+202F in
+//      place, "RTX 4060 Ti" read as "tie"; with the space folded it reads
+//      "tee", which is the one rendering the fold made worse. Rendering it
+//      "T I" reads "tee eye", which is how the suffix is said aloud and what
+//      the user asked for — "sixteen sixty tee eye".
+//
+//      Three renderings produce the two letters and the choice between them is
+//      not arbitrary: "T I" -> "tˈi ˌI", "T i" and the spelled-out "tee eye"
+//      both -> "tˈi ˈI". The difference is only which letter carries the main
+//      stress, and the spaced-capitals form is what suffix() below already
+//      does to "KF" and "KS", so "T I" is the existing rule rather than a
+//      second convention for the same job.
 //
 //   2. Intel's iN part numbers, which are wrong in EVERY separator form, so
 //      there is no separator to normalize towards:
@@ -128,13 +137,22 @@ const INTEL =
 //
 // The attached form is matched too: "4060Ti" reads "tee" exactly as the spaced
 // form does.
+//
+// Measured in every position it occurs in: before a quantity ("4060 T I 16
+// GB"), before "or" ("3070 T I or RTX 3080"), before a comma and at the end of
+// a sentence. All read the two letters. The one cost, stated because it is
+// real and small: at the very end of a sentence the trailing period is taken
+// as an abbreviation's and drops out of the phonemes, so "the 4060 T I." ends
+// without a falling intonation. Chunking is unaffected — the sidecar splits on
+// the text, where the period is still there — so this is prosody, not a lost
+// sentence boundary.
 const GPU_TI = /(\d{4}) ?Ti\b/g
 
 export function renderPartNumbers(text: string): string {
   if (!text) return ""
 
   return text
-    .replace(GPU_TI, "$1 Tie")
+    .replace(GPU_TI, "$1 T I")
     .replace(INTEL, (_match, tier: string, digits: string, tail?: string) => {
       const number = digits.length === 4 ? fourDigits(digits) : fiveDigits(digits)
       const spoken = `i ${ONES[Number(tier)]!} ${number}`

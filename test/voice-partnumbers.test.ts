@@ -75,17 +75,32 @@ test("a tier with no part number after it is left alone", () => {
 
 // --------------------------------------------------------------------- Ti
 
-test("Ti after a model number becomes Tie", () => {
+test("Ti after a model number is spoken as its two letters", () => {
   // The one rendering the space fold made worse: with U+202F in place it read
-  // "tie", with a plain space it reads "tee".
-  assert.equal(renderPartNumbers("The RTX 4060 Ti is fine."), "The RTX 4060 Tie is fine.")
-  assert.equal(renderPartNumbers("The RTX 4070 Ti Super is fine."), "The RTX 4070 Tie Super is fine.")
-  assert.equal(renderPartNumbers("The GTX 1050 Ti is fine."), "The GTX 1050 Tie is fine.")
-  assert.equal(renderPartNumbers("A 3090 Ti, used."), "A 3090 Tie, used.")
+  // "tie", with a plain space it reads "tee". Spaced capitals read "tee eye",
+  // which is how the suffix is said, and it is the same shape suffix() gives
+  // "KF" and "KS" rather than a second convention for the same job.
+  assert.equal(renderPartNumbers("The RTX 4060 Ti is fine."), "The RTX 4060 T I is fine.")
+  assert.equal(renderPartNumbers("The RTX 4070 Ti Super is fine."), "The RTX 4070 T I Super is fine.")
+  assert.equal(renderPartNumbers("The GTX 1050 Ti is fine."), "The GTX 1050 T I is fine.")
+  assert.equal(renderPartNumbers("A 3090 Ti, used."), "A 3090 T I, used.")
 })
 
 test("Ti attached to the number is matched too", () => {
-  assert.equal(renderPartNumbers("The RTX 4060Ti is fine."), "The RTX 4060 Tie is fine.")
+  assert.equal(renderPartNumbers("The RTX 4060Ti is fine."), "The RTX 4060 T I is fine.")
+})
+
+test("the rendered Ti does not become an Intel tier", () => {
+  // The letter the suffix leaves behind sits next to a number, which is the
+  // shape the Intel rule matches on. It must not: the tier letter has to be
+  // followed IMMEDIATELY by 3, 5, 7 or 9, and a quantity after the suffix is
+  // separated from it by a space. Verbatim corpus shape, which pairs Ti with a
+  // VRAM figure.
+  assert.equal(
+    renderPartNumbers("Used RTX 4060 Ti 16 GB, about $420."),
+    "Used RTX 4060 T I 16 GB, about $420."
+  )
+  assert.equal(renderPartNumbers("RTX 3070 Ti or RTX 3080."), "RTX 3070 T I or RTX 3080.")
 })
 
 test("Ti that is not a model suffix is left alone", () => {
@@ -140,6 +155,8 @@ test("a part number the renderer does not cover is unchanged", () => {
 })
 
 test("rendering twice changes nothing the first pass did not", () => {
+  // "T I" contains no "Ti" for the GPU rule to find on a second pass, and no
+  // "i" followed by a tier digit for the Intel rule.
   for (const text of [
     "An Intel i5-12400 and an RTX 4060 Ti.",
     "The i9-14900KS is fine.",
@@ -161,7 +178,7 @@ test("the sanitizer applies the rendering last, after the markdown is gone", () 
   // part number for the pattern to match.
   assert.equal(
     sanitizeForSpeech("**Best value:** the *i5-12400* with an RTX\u202F4060 Ti."),
-    "Best value: the i five twelve four hundred with an RTX 4060 Tie."
+    "Best value: the i five twelve four hundred with an RTX 4060 T I."
   )
 })
 
