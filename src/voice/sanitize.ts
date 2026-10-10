@@ -21,19 +21,27 @@
 // Deliberately out of scope: markdown tables. A spoken table is unsalvageable
 // whatever we do to the pipes, and the fix is the model not writing one.
 //
-// TWO STAGES, one entry point. The markdown stripping is here; the part-number
-// rendering that follows it is in src/voice/partnumbers.ts, called from the
-// bottom of sanitizeForSpeech. They are composed rather than called separately
-// because there are two callers — speak() in src/api/websocket.ts and
+// SEVERAL STAGES, one entry point. The markdown stripping is here; the
+// part-number rendering is in src/voice/partnumbers.ts and the two currency
+// renderings are in src/voice/prices.ts, all called from inside
+// sanitizeForSpeech. They are composed rather than called separately because
+// there are two callers — speak() in src/api/websocket.ts and
 // dev/scripts/tts-render-check.ts — and the harness's guarantee that what is
 // measured is what runs would otherwise depend on remembering to update both.
 //
-// The order is not a preference. The rendering has to see text with the
-// markup already gone: a leaked asterisk fuses into the token after it, which
-// is measurable in the phonemes, and a part number with "**" against it is not
-// a part number any pattern will match.
+// The order is not a preference. Two constraints fix it:
+//
+//   1. Everything that matches a written form has to see text with the markup
+//      already gone. A leaked asterisk fuses into the token after it, which is
+//      measurable in the phonemes, and a part number or a price with "**"
+//      against it is not one any pattern will match. So the part-number and
+//      price-range renderings run LAST, on the finished prose.
+//   2. joinThousandsSeparators runs FIRST, before the space fold below,
+//      because the fold is what destroys the evidence it reads. It is the one
+//      stage that needs the model's invisible characters still in place.
 
 import { renderPartNumbers } from "./partnumbers"
+import { joinThousandsSeparators, renderPriceRanges } from "./prices"
 
 // Every Unicode space separator (category Zs) folded to a plain ASCII space.
 //
@@ -63,14 +71,17 @@ import { renderPartNumbers } from "./partnumbers"
 // "Raspberry". Sixteen of the nineteen change, and exactly one rendering got
 // worse — "Ti", handled in src/voice/partnumbers.ts.
 //
-// Two things the fold does NOT do, measured over the same fixtures so that
-// neither is mistaken for a fix:
-//   - "$1<U+202F>200", where the model used U+202F as a THOUSANDS separator
-//     rather than before a unit, still reads "one two hundred dollars". It
-//     gains the missing "dollars" and keeps the wrong amount. See
-//     src/core/prices.ts, which documents that live shape.
+// What the fold does NOT do, measured over the same fixtures so that it is not
+// mistaken for a fix:
 //   - "PCIe<U+202F>4.0" read "four dot zero" fused and now reads "PCIe four":
 //     the natural spoken form, but the ".0" is silent rather than spoken.
+//
+// And the one case where the fold is itself the problem rather than the fix:
+// "$1<U+202F>200", where the model used U+202F as a THOUSANDS separator rather than
+// before a unit. Folded, it gained the missing "dollars" and kept reading as
+// the wrong amount — "one two hundred dollars". That separator is now resolved
+// BEFORE this line runs, by joinThousandsSeparators in src/voice/prices.ts,
+// which is the only stage that has to see a narrow space to do its job.
 //
 // U+2011 NON-BREAKING HYPHEN is deliberately NOT normalized alongside it.
 // Folding it to an ASCII hyphen makes an Intel part number worse, not better:
@@ -125,8 +136,10 @@ export function sanitizeForSpeech(text: string): string {
   // Space folding comes first, so every rule below — the line-start markers,
   // the inline strippers and the final whitespace collapse, all of which are
   // written for an ASCII space — sees one.
-  let working = text
-    .replace(/\r\n/g, "\n")
+  // The thousands separator is resolved before the fold, which is the only
+  // ordering constraint in this function that is not about markdown. See
+  // src/voice/prices.ts.
+  let working = joinThousandsSeparators(text.replace(/\r\n/g, "\n"))
     .replace(UNICODE_SPACES, " ")
     .replace(/^[ \t]*```+[^\n]*$/gm, "")
 
@@ -158,6 +171,8 @@ export function sanitizeForSpeech(text: string): string {
   // stray newline would split a chunk at a place with no pause in it.
   const stripped = blocks.join(" ").replace(/[ \t]{2,}/g, " ").trim()
 
-  // Last, on the finished prose. See the note on the two stages above.
-  return renderPartNumbers(stripped)
+  // Last, on the finished prose. See the note on the stages above. The two are
+  // independent — one matches a currency amount, the other a part number — so
+  // the nesting is for readability and not an ordering constraint.
+  return renderPartNumbers(renderPriceRanges(stripped))
 }

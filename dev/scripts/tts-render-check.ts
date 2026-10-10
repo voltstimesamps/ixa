@@ -256,7 +256,7 @@ const BASE: Fixture[] = [
     slug: "gap-nnbsp-separator",
     source: "invented",
     raw: "Expect to pay $1\u202F200 to $1\u202F500 for a used one.",
-    note: "GAP here, but real live shape: src/core/prices.ts documents replies containing \"$1 200–$1 500\" with U+202F as the thousands separator",
+    note: "GAP here, but real live shape: src/core/prices.ts documents replies containing \"$1 200–$1 500\" with U+202F as the thousands separator. Its twin 25b now reports IDENTICAL phonemes, and for this pair that is the SUCCESS condition rather than a null result: joinThousandsSeparators (src/voice/prices.ts) deletes the separator, so the two strings reach Kokoro as the same text and the character has stopped deciding the amount",
   },
   {
     id: "26",
@@ -288,7 +288,7 @@ const BASE: Fixture[] = [
     slug: "part-gpu-nvidia",
     source: "invented",
     raw: "The RTX\u202F5090, the RTX 4060 Ti and the GTX 1650 are all current.",
-    note: "three NVIDIA families plus the Ti suffix, which is the one rendering the space fold made worse",
+    note: "three NVIDIA families plus the Ti suffix, which is the one rendering the space fold made worse. Now rendered \"T I\" and spoken as the two letters, \"tee eye\"",
   },
   {
     id: "29",

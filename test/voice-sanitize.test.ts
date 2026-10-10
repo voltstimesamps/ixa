@@ -172,9 +172,14 @@ test("a non-breaking hyphen is left alone", () => {
 test("a price range separated by narrow spaces keeps its two amounts apart", () => {
   // Verbatim from a recorded reply. With the narrow spaces in place Kokoro read
   // the whole range as one fused number — "one-three-hundred-dash-one".
+  //
+  // The dash itself is now the spoken word "to" rather than a silent character
+  // between the two amounts: see src/voice/prices.ts. What this asserts is
+  // still the fold — that the two amounts survive as two amounts — which is
+  // the precondition for the range rule having anything to match.
   assert.equal(
     sanitizeForSpeech("Roughly $1,300\u202F–\u202F$1,400 today."),
-    "Roughly $1,300 – $1,400 today."
+    "Roughly $1,300 to $1,400 today."
   )
 })
 
