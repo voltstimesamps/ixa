@@ -31,12 +31,19 @@ const MAX_BUFFER = 1024 * 1024
 // nothing is wrong with the tool, and three narrower commands to reach for.
 // Not phrased as a bare failure — an unexplained failure is retried verbatim,
 // which is what happened live.
+// The search_notes pointer is the last sentence, and it is here because the
+// live turns kept reaching for this message when what they actually needed was
+// a LOCATION. Three turns in a row started by listing a whole home directory
+// to find a project whose path was written down: twice nothing in the notebook
+// was consulted, and once the path was sitting in a saved preference. A
+// narrower command does not help a model that does not know where to point it.
 const OUTPUT_TOO_LARGE =
   "Output too large to return: the command produced more than 1 MB before it was stopped, " +
   "so none of it is available. Nothing is wrong with the command or the tool — it is the " +
   "SIZE. Ask a narrower question instead: name a subdirectory rather than a whole tree, " +
   "use find with -iname and a name pattern to look for one thing, or read a bounded number " +
-  "of lines with head -n."
+  "of lines with head -n. If you are looking for where a project or a file lives, " +
+  "search_notes may already say — look there before listing a whole tree."
 
 // What successful output of nothing says. An empty string is indistinguishable
 // from a tool that broke, and live that ambiguity cost two calls: `find` with

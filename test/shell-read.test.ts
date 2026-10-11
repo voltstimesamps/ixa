@@ -62,7 +62,12 @@ test("a listing too large for the buffer says what to do instead", async () => {
     assert.match(out, /Output too large/)
     assert.match(out, /Nothing is wrong with the command or the tool/)
     assert.match(out, /-iname/, "and it names a narrower command to try")
-    assert.ok(out.length < 600, "the message is a message, not a dump")
+    // All three live turns began by listing a whole home directory to find a
+    // path that was already written down, and search_notes was never called
+    // in any of them. A narrower command does not help a model that does not
+    // know where to point it.
+    assert.match(out, /search_notes may already say/)
+    assert.ok(out.length < 700, "the message is a message, not a dump")
   } finally {
     await rm(big, { recursive: true, force: true })
   }
@@ -151,6 +156,9 @@ test("every call is told the working directory", async () => {
   assert.ok(line, "the working directory is named on the call")
   assert.match(String(line!.content), new RegExp(`run in ${session.workingDirectory}\\b`))
   assert.match(String(line!.content), /relative paths are resolved from there/)
+  // Same pointer as the oversized-output result, for the same reason: the
+  // cheapest fix for a turn that starts by listing a whole home directory.
+  assert.match(String(line!.content), /locations may be in search_notes/)
 
   // A statement about this call, not something that was said: never stored.
   assert.equal(

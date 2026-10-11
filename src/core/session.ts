@@ -313,7 +313,55 @@ const NOT_EXECUTED_OVER_BUDGET =
 // on purpose — it is on every call of every turn — and naming both tools,
 // because the directory is what `cd` through shell_write changes.
 function workingDirectoryLine(cwd: string): string {
-  return `shell_read and shell_write run in ${cwd}; relative paths are resolved from there.`
+  return (
+    `shell_read and shell_write run in ${cwd}; relative paths are resolved from there. ` +
+    // The second sentence is the cheapest fix for the failure all three live
+    // turns began with: a whole-home-directory listing to find a path that was
+    // already written down. search_notes was never called in any of them.
+    `Project and file locations may be in search_notes.`
+  )
+}
+
+// A tool call's identity, for "has this exact call already failed this turn?".
+//
+// Normalized rather than compared raw, because the model writes the same call
+// with its keys in a different order — {"command":"ls","args":["-R"]} and
+// {"args":["-R"],"command":"ls"} are one call, and a string comparison would
+// call them two. Falls back to the raw string when the arguments do not parse,
+// which is the honest answer: unparseable arguments are handled elsewhere and
+// are not something to be clever about here.
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null"
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0
+  )
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`
+}
+
+function callSignature(name: string, args: string): string {
+  let normalized = args
+  try {
+    normalized = stableStringify(JSON.parse(args || "{}"))
+  } catch {
+    // raw it is
+  }
+  return `${name}\u0000${normalized}`
+}
+
+// What a repeat of an already-failed call is told. Short, because the original
+// result is a few messages above it and saying the whole thing twice wastes
+// the budget it is trying to protect — but it carries the first line, because
+// the window may have evicted the original by now.
+//
+// "Try a different command" rather than "do not try again": the model has a
+// goal it has not reached, and a refusal with no next move is how a turn ends
+// up spending fifteen calls on nothing.
+function repeatedFailureResult(reason: string): string {
+  return (
+    `Not run: this exact call already failed this turn (${reason}). Running it again gives ` +
+    `the same result. Try a different command or a different approach.`
+  )
 }
 
 // Injected for ONE call when the tool-call budget is spent, and never stored:
@@ -850,6 +898,10 @@ export class Session {
     let toolCallsThisTurn = 0
     const callBudget = config.tools.maxToolCallsPerTurn
     let budgetNoticeLogged = false
+    // Calls that ran this turn and failed, by signature, with the first line
+    // of what they returned. Per TURN, not per session: a command that failed
+    // because a file was missing may well work after the next one creates it.
+    const failedCalls = new Map<string, string>()
 
     // AN ITERATION IS NOT A CALL, which is why this is no longer the limit.
     //
@@ -1132,9 +1184,32 @@ export class Session {
             }
           }
 
+          // Computed AFTER the cwd injection above: the same command in a
+          // different directory is a different call, and the directory is part
+          // of the arguments by the time anything runs.
+          const signature = callSignature(tc.name, tc.arguments)
+          const alreadyFailed = failedCalls.get(signature)
+
           if (!tool) {
             result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
             logToolCall(tc.name, "unknown", Date.now(), tc.arguments)
+          } else if (tool.isFailure && alreadyFailed !== undefined) {
+            // The same call, byte for byte, that already failed this turn.
+            //
+            // Measured: one live turn ran `ls -R` in $HOME FOUR times, each
+            // time getting the same "output too large" result, and another
+            // re-sent nine identical piped commands. A result that explains
+            // itself is not enough — the model re-reads its own history, sees
+            // a command it believes in, and tries it again.
+            //
+            // Only calls that actually RAN and FAILED are remembered, and only
+            // for tools that can say which of their results are failures, so
+            // this can never block a call that worked or one whose outcome is
+            // not knowable. It still costs a tool call: the budget is there to
+            // bound the turn, and a repeat is still the model choosing to
+            // spend one.
+            result = repeatedFailureResult(alreadyFailed)
+            logToolCall(tool.name, "repeat", Date.now(), tc.arguments, "identical call already failed")
           } else if (
             tool.name === "web_search" &&
             config.tools.maxSearchesPerTurn > 0 &&
@@ -1179,6 +1254,14 @@ export class Session {
           } else {
             result = await this.executeTool(tool, tc)
             ran = true
+          }
+
+          // Remembered only for a call that RAN and that the tool itself
+          // calls a failure. A declined, cancelled, capped or over-budget call
+          // did not fail — it did not happen — and a tool with no isFailure
+          // has no opinion, so nothing it returns is ever remembered.
+          if (ran && tool?.isFailure?.(result)) {
+            failedCalls.set(signature, firstLine(result))
           }
 
           if (ran && tc.name === "web_search") {
