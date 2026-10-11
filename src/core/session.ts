@@ -186,6 +186,19 @@ export const VOICE_RESPONSE_PROMPT =
 export const TURN_FAILURE_APOLOGY =
   "Sorry, something went wrong on my end. Could you try that again?"
 
+// Spoken when the model returns a reply with nothing in it, and recorded as
+// the assistant's reply to that turn. Same contract as TURN_FAILURE_APOLOGY,
+// and here for the same reason: one constant, so the words the user hears and
+// the words history says they heard are the same words.
+//
+// Worded as a lost thought rather than a fault, because that is what it is:
+// nothing failed, no tool broke and no deadline fired — the model was asked a
+// question and produced no text. Deliberately not the mishearing line ("I did
+// not catch that"), which would blame the user's microphone for the model's
+// silence.
+export const EMPTY_REPLY_FALLBACK =
+  "Sorry, I lost my train of thought there. Could you ask me again?"
+
 // A voice reply with no sentence boundary in it cannot be trimmed, so past
 // this length it is logged instead. Only diagnostics: nothing branches on it.
 const UNBROKEN_REPLY_CHARS = 400
@@ -215,6 +228,24 @@ export function turnFailureReply(err: unknown): string {
     reason = `${reason.slice(0, FAILURE_REASON_MAX - 1).trimEnd()}…`
   }
   return `${TURN_FAILURE_APOLOGY} [turn failed: ${reason || "unknown error"}]`
+}
+
+// The assistant message recorded for a turn the model answered with nothing.
+//
+// Until this existed, the empty branch recorded NOTHING: stored history held
+// the user's question, the tool calls underneath it, and no reply — the exact
+// shape turnFailureReply was written to prevent, and found three times in the
+// live database (two of them the context-budget case buildWindow now handles,
+// one a nine-tool-call turn where the window was only 9165 of 24000 chars).
+// An unanswered question in history is one the model answers again later, and
+// a user who heard silence is not told they heard anything.
+//
+// The bracketed note is for the model, like the one in turnFailureReply: a
+// turn that ran ten tool calls and then said nothing reads differently from
+// one that said nothing straight away.
+export function emptyReplyRecord(toolCalls: number): string {
+  const calls = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`
+  return `${EMPTY_REPLY_FALLBACK} [no reply was produced after ${calls}]`
 }
 
 // What a tool result says when the turn failed before that call ever ran.
@@ -651,6 +682,12 @@ export class Session {
     // twice is not going to stop on the third ask, and a loop here would spend
     // the turn's budget arguing with it.
     let priceGuardUsed = false
+    // The empty-reply retry, once per turn for the same reason.
+    let emptyRetryUsed = false
+    // Tool calls issued this turn, parallel ones counted individually. Read by
+    // the empty-reply record, so a turn that said nothing after nine calls
+    // says so.
+    let toolCallsThisTurn = 0
 
     for (let i = 0; i < 10; i++) {
       // On retry after a malformed tool call, pass no tools — forces a plain text response
@@ -710,24 +747,47 @@ export class Session {
           return spoken.text
         }
 
-        // The model returned a text response with nothing in it. Logged
-        // rather than papered over: the transport already handles it
-        // correctly — speak() is never reached with an empty string, and
-        // replyEnd still fires — and a stand-in apology would put words in
-        // history the user never heard.
+        // The model returned a text response with nothing in it.
         //
         // What the line says is how much conversation the call carried,
         // because that is what distinguishes the two causes. A call that
         // carried the conversation and still came back empty is the model. A
         // call that carried only system prompts was starved by the context
         // budget, which is the shape buildWindow used to produce from four
-        // parallel web_search results.
+        // parallel web_search results. finish_reason and whether reasoning
+        // tokens arrived tell apart a model that stopped from one that was cut
+        // off or spent the completion where this code cannot see it.
         console.warn(
           `empty reply: the model returned no content on call ${i + 1} of this turn — ` +
             `the call carried ${sent.length} messages ` +
-            `(${sent.filter((m) => m.role !== "system").length} of them conversation)`
+            `(${sent.filter((m) => m.role !== "system").length} of them conversation), ` +
+            `finish_reason=${response.finishReason ?? "unknown"}, ` +
+            `reasoning tokens ${response.reasoning ? "arrived" : "did not arrive"}`
         )
-        return response.content
+
+        // Asked again once, with no tools, which is the lever the malformed
+        // tool call path already pulls: with nothing to call, a reply can only
+        // be text. Measured at roughly one empty attempt in three against
+        // openai/gpt-oss-20b when the window was starved, so a second sample
+        // is worth one call.
+        //
+        // Not retried when `retrying` is already set: the call that just came
+        // back empty was itself a no-tools call, and issuing the identical
+        // request again would spend a call to ask the same question twice.
+        if (!emptyRetryUsed && !retrying) {
+          emptyRetryUsed = true
+          retrying = true
+          console.log("llm retry without tools: the reply was empty")
+          continue
+        }
+
+        // Twice is not a fluke. The user has heard nothing and is waiting, so
+        // they get something short and true, and history records the same
+        // words — see emptyReplyRecord for why recording nothing was worse.
+        const record = emptyReplyRecord(toolCallsThisTurn)
+        this.messages.push({ role: "assistant", content: record })
+        console.warn(`empty reply: delivering the fallback after ${toolCallsThisTurn} tool calls`)
+        return EMPTY_REPLY_FALLBACK
       }
 
       // Validate argument JSON for every call before touching message history.
@@ -758,6 +818,12 @@ export class Session {
           function: { name: tc.name, arguments: tc.arguments },
         })),
       })
+      // Counted here rather than per execution: a call the user declined, one
+      // the cap refused and one that timed out were all still calls the model
+      // chose to make. A discarded iteration (unparseable arguments, above)
+      // never reaches this line and is not counted, because none of its calls
+      // is in history.
+      toolCallsThisTurn += response.calls.length
 
       // Which calls in this group already have their result in history. The
       // group is only valid once every call does — see completeToolGroup.

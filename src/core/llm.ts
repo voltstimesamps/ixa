@@ -81,8 +81,13 @@ export type ToolCall = {
   arguments: string
 }
 
+// The two diagnostic fields on a text reply exist for ONE question: when the
+// content comes back empty, was the completion spent somewhere the harness
+// cannot see? They are optional because every test that builds a reply by
+// hand predates them, and nothing branches on either — they are logged and
+// nothing more.
 export type LLMResponse =
-  | { type: "text"; content: string }
+  | { type: "text"; content: string; finishReason?: string | null; reasoning?: boolean }
   | { type: "tool_calls"; calls: ToolCall[] }
 
 // Thrown when one of our own deadlines fires. Distinct from a transport error
@@ -198,6 +203,18 @@ async function attempt(
   let textContent = ""
   const toolCallMap = new Map<number, ToolCall>()
 
+  // Why these are tracked at all: a live turn ended with no content and no
+  // error, and nothing logged could say whether the model stopped, was cut
+  // off, or spent the whole completion on a channel this code never reads.
+  //
+  // `reasoning` is NOT in the OpenAI schema — it is what Groq returns for
+  // openai/gpt-oss-* under its parsed reasoning format, so the SDK does not
+  // type it and it has to be read off the delta by hand. A reply whose
+  // reasoning arrived and whose content did not is a different fault from one
+  // where neither did, and only this tells them apart.
+  let finishReason: string | null = null
+  let reasoning = false
+
   try {
     const stream = await client.chat.completions.create(
       {
@@ -231,8 +248,16 @@ async function attempt(
       }
       if (next.done) break
 
+      // Read before the delta guard: the chunk that carries finish_reason
+      // often carries an empty delta, and that is the one chunk worth reading.
+      finishReason = next.value.choices[0]?.finish_reason ?? finishReason
+
       const delta = next.value.choices[0]?.delta
       if (!delta) continue
+
+      if ((delta as { reasoning?: unknown }).reasoning) {
+        reasoning = true
+      }
 
       if (delta.content) {
         textContent += delta.content
@@ -274,8 +299,21 @@ async function attempt(
     throw new Error("malformed tool call in text content")
   }
 
+  // Only the endings nobody can currently see. "stop" is an ordinary reply and
+  // a line per turn saying so is noise; "length" is a reply the provider cut
+  // off mid-sentence, which has never been visible here and is indistinguishable
+  // from a short answer by reading the text. The empty-content case gets its
+  // line from the tool loop, which can also say how much conversation the call
+  // carried — see the empty-reply warning in session.ts.
+  if (finishReason && finishReason !== "stop" && finishReason !== "tool_calls") {
+    console.log(
+      `llm finish_reason=${finishReason} (${textContent.length} chars of content` +
+        `${reasoning ? ", reasoning tokens arrived" : ""})`
+    )
+  }
+
   if (!options?.silent) {
     process.stdout.write(`Ixa: ${textContent}\n\n`)
   }
-  return { type: "text", content: textContent }
+  return { type: "text", content: textContent, finishReason, reasoning }
 }

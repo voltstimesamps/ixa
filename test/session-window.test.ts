@@ -96,6 +96,10 @@ test("the voice constraint survives windowing", async () => {
 // one attempt in three against openai/gpt-oss-20b, a generic "what would you
 // like help with?" the rest of the time.
 //
+// Windowing is the FIRST line of defence and the one tested here. What
+// happens when an empty reply gets out anyway is the test below this one: it
+// is no longer silence.
+//
 // Driven here through a generic large-output tool rather than web_search,
 // because web_search is now additionally capped at 3 calls per turn (see
 // test/search-cap.test.ts), which makes the original four-search shape
@@ -174,6 +178,116 @@ test("a turn whose tool results exceed the budget still sends the conversation",
     second.some((m) => m.role === "user"),
     false,
     "recency still binds behind the newest group; only the empty window was broken",
+  )
+
+  sessions.shutdown()
+})
+
+// What an empty reply does now, at the session layer: asked again once with
+// no tools, then answered with a fixed fallback that history records.
+//
+// CHANGED BEHAVIOUR. The empty string used to be returned as-is and NOTHING
+// was recorded, on the reasoning that a stand-in apology would put words in
+// history the user never heard. Live evidence said that was the wrong trade:
+// three turns in the database have a user question, tool calls under it, and
+// no reply at all — and an unanswered question in history is one the model
+// answers again later (the same drift turnFailureReply exists to prevent).
+// The fallback is what the user actually hears, so recording it is accurate.
+test("an empty reply is asked again once, then recorded as the fallback", async () => {
+  const { EMPTY_REPLY_FALLBACK } = await import("../src/core/session.js")
+
+  const sentArrays: Message[][] = []
+  const chat: ChatFn = async (messages, tools) => {
+    sentArrays.push(messages)
+    void tools
+    return { type: "text", content: "" }
+  }
+
+  const sessions = new SessionManager({
+    idleTimeoutMs: 60_000,
+    limits: { maxMessages: 40, budgetChars: 24_000 },
+    chat,
+  })
+
+  const reply = await sessions.submitTurn(
+    "read your architecture doc",
+    makeConnection({ id: "conn-empty" }),
+    "text",
+  )
+
+  assert.equal(reply, EMPTY_REPLY_FALLBACK, "the user is answered, not left in silence")
+  assert.equal(sentArrays.length, 2, "exactly one retry, never a loop of them")
+
+  // The retry is the malformed-tool-call lever: no tools, so the only thing
+  // the model can return is text.
+  const session = sessions.primarySession()
+  const history = session.history()
+  const last = history.at(-1)!
+  assert.equal(last.role, "assistant")
+  assert.ok(
+    String(last.content).startsWith(EMPTY_REPLY_FALLBACK),
+    `history records what was heard, got: ${String(last.content)}`,
+  )
+  assert.match(
+    String(last.content),
+    /\[no reply was produced after 0 tool calls\]/,
+    "the bracketed note is for the model, and names how many calls preceded the silence",
+  )
+
+  // The question is answered exactly once in the record: a user message with
+  // no assistant message after it is the shape this fixes.
+  const userIndex = history.findIndex((m) => m.content === "read your architecture doc")
+  assert.ok(userIndex >= 0)
+  assert.ok(
+    history.slice(userIndex + 1).some((m) => m.role === "assistant"),
+    "the user's question is never left unanswered in stored history",
+  )
+
+  sessions.shutdown()
+})
+
+// The same path with tool calls behind it, because the bracketed note has to
+// be true: the live turn made nine calls before the silence, and "no reply was
+// produced after 0 tool calls" would misreport it as an instant stop.
+test("the empty-reply note counts the tool calls that preceded it", async () => {
+  const { registry } = await import("../src/tools/registry.js")
+  registry.register({
+    name: "count_probe",
+    description: "A probe that returns nothing useful.",
+    inputSchema: { type: "object", properties: {} },
+    requiresConfirmation: false,
+    execute: async () => "",
+  })
+
+  let call = 0
+  const chat: ChatFn = async () => {
+    call++
+    // Two iterations of two parallel calls each, then silence twice.
+    if (call <= 2) {
+      return {
+        type: "tool_calls",
+        calls: [
+          { id: `a${call}`, name: "count_probe", arguments: "{}" },
+          { id: `b${call}`, name: "count_probe", arguments: "{}" },
+        ],
+      }
+    }
+    return { type: "text", content: "" }
+  }
+
+  const sessions = new SessionManager({
+    idleTimeoutMs: 60_000,
+    limits: { maxMessages: 40, budgetChars: 24_000 },
+    chat,
+  })
+
+  await sessions.submitTurn("find the doc", makeConnection({ id: "conn-empty-tools" }), "text")
+
+  const last = sessions.primarySession().history().at(-1)!
+  assert.match(
+    String(last.content),
+    /\[no reply was produced after 4 tool calls\]/,
+    `parallel calls are counted individually, got: ${String(last.content)}`,
   )
 
   sessions.shutdown()

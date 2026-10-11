@@ -53,10 +53,19 @@ let wss: WebSocketServer
 let wsPort: number
 let chatBehaviour: ChatFn
 
+// Imported in `before` with everything else, for the same reason: config.ts
+// reads the environment at import time.
+let EMPTY_REPLY_FALLBACK: string
+let TURN_FAILURE_APOLOGY: string
+
 before(async () => {
   await new Promise<void>((resolve) => ttsServer.listen(0, "127.0.0.1", resolve))
   process.env.TTS_URL = `http://127.0.0.1:${(ttsServer.address() as AddressInfo).port}`
   process.env.LLM_API_KEY = "test-key"
+
+  const session = await import("../src/core/session.js")
+  EMPTY_REPLY_FALLBACK = session.EMPTY_REPLY_FALLBACK
+  TURN_FAILURE_APOLOGY = session.TURN_FAILURE_APOLOGY
 
   const { SessionManager } = await import("../src/core/session-manager.js")
   const { createWsServer } = await import("../src/api/websocket.js")
@@ -207,30 +216,45 @@ test("a malformed frame does not close the socket", async () => {
 // The empty reply, as the protocol sees it.
 //
 // A live voice session produced a turn with no text at all — "Ixa:" and
-// nothing after it — after four web_search calls succeeded. The cause was the
-// context budget handing the model a window with no conversation in it (see
-// buildWindow and test/session-window.test.ts). This is the other half of the
-// question: what the client is told when it happens. Nothing is spoken, and
-// the turn still terminates — so a voice client, which stops its own
-// conversation timer for the duration of a turn, gets the microphone back
-// instead of waiting out its safety net.
-test("an empty reply speaks nothing and still terminates the turn", async () => {
-  chatBehaviour = async () => ({ type: "text", content: "" })
+// nothing after it. Twice: once from the context budget handing the model a
+// window with no conversation in it (see buildWindow and
+// test/session-window.test.ts), and once on a nine-tool-call turn where the
+// window was fine and the model simply produced nothing. This is the other
+// half of the question: what the client is told when it happens.
+//
+// CHANGED BEHAVIOUR. This test used to assert the empty string reached the
+// client and nothing was spoken, on the reasoning that a stand-in apology
+// would put words in history the user never heard. That was the wrong trade:
+// the user heard silence and the record said they were never answered at all,
+// which is the drift turnFailureReply exists to prevent, and it was found
+// three times in the live database. An empty reply is now asked again once
+// with no tools, and a second empty reply delivers EMPTY_REPLY_FALLBACK —
+// which IS what the user hears, so recording it is accurate.
+test("an empty reply is asked again, then falls back, and still terminates the turn", async () => {
+  let calls = 0
+  chatBehaviour = async () => {
+    calls++
+    return { type: "text", content: "" }
+  }
 
   const client = await connect()
-  const before = ttsRequests
   const framesBefore = client.binaryFrames
   const turn = await client.ask("how much is a used 3090 going for")
   const types = turn.map((m) => m.type)
 
   assert.deepEqual(types, ["assistant", "replyEnd"], `unexpected turn: ${types.join(",")}`)
-  assert.equal(turn.find((m) => m.type === "assistant")?.content, "")
+  assert.equal(calls, 2, "the first empty reply is asked again exactly once")
 
-  // speak() is never reached with an empty string: nothing was synthesized
-  // and no audio frames were sent.
-  assert.equal(ttsRequests, before, "an empty reply must not reach TTS")
-  assert.equal(client.binaryFrames, framesBefore, "no audio for a reply with no words in it")
+  // The fallback, not the empty string — and not the failure apology either:
+  // nothing failed, so the user is not told something went wrong.
+  assert.equal(turn.find((m) => m.type === "assistant")?.content, EMPTY_REPLY_FALLBACK)
+  assert.notEqual(turn.find((m) => m.type === "assistant")?.content, TURN_FAILURE_APOLOGY)
+
+  // Still a text turn, so still nothing spoken: text in, text out. The
+  // terminator is what tells this client the turn is over.
+  assert.equal(client.binaryFrames, framesBefore, "a text turn is never spoken")
   assert.ok(!types.includes("audioStart"))
+  assert.ok(!types.includes("error"), "an empty reply is not a failed turn")
 
   // The session survives it, which is what the live log showed: the turn
   // after the empty one was normal.
