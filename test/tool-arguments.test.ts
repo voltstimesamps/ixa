@@ -1,5 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import fs from "fs"
 import { makeMemory, makeNotebook, withTurn } from "./memory-helpers"
 import { openDatabase } from "../src/memory/db"
 import { setEpisodicMemory } from "../src/memory/episodic-memory"
@@ -209,7 +210,9 @@ test("a wrong note type is a correction, not a dead turn", async (t) => {
   )
 
   assert.match(output, /'type' must be one of decision, project, reference/)
-  assert.equal(h.store.count(), 0, "and nothing was written")
+  assert.ok(output.startsWith("Nothing was saved"), "and it says so first, not in passing")
+  assert.equal(h.store.count(), 0, "no row")
+  assert.deepEqual(fs.readdirSync(h.vault), [], "and no file: the vault is untouched")
 })
 
 test("save_note's type carries no enum, so the model can be told instead", () => {

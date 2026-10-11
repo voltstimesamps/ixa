@@ -209,7 +209,7 @@ export class Notebook {
       id = this.freeId(id)
     }
 
-    const path = buildPath(input.type, id)
+    const path = buildPath(id)
 
     // Resolved BEFORE the new note is written, so that a bad reference is
     // reported rather than leaving a half-applied supersede behind.

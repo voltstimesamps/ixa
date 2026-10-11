@@ -11,8 +11,8 @@ import path from "path"
 // Obsidian renders, what Syncthing replicates, and what survives the database
 // being deleted. So it is written first, and written atomically.
 //
-// THE MODEL NEVER SUPPLIES A PATH. buildPath derives one from the type, the
-// title and the date, and nothing in the tool schema accepts a filename. That
+// THE MODEL NEVER SUPPLIES A PATH. buildPath derives one from the id, which is
+// the date and the title, and nothing in the tool schema accepts a filename. That
 // is the whole reason save_note can be ungated while shell_write confirms:
 // not "we trust it with files" but "it cannot name one". assertInsideVault is
 // the backstop in case a future caller forgets.
@@ -44,13 +44,6 @@ export interface NoteMeta {
   sessionId?: string
 }
 
-// One directory per type, so the vault reads as a tree in Obsidian's sidebar.
-const DIRECTORIES: Record<NoteType, string> = {
-  decision: "decisions",
-  project: "projects",
-  reference: "references",
-}
-
 // A title is a sentence, so a slug from it needs a length cap: without one,
 // "Notes are written by Ixa and the user never hand-edits them" becomes a
 // 58-character filename for no benefit.
@@ -73,16 +66,27 @@ export function slugify(title: string): string {
 }
 
 // "2026-10-10-tavily-replaced-brave". Dated so that two notes on one subject
-// months apart cannot collide, and so the vault sorts chronologically inside
-// each type directory.
+// months apart cannot collide, and so the vault sorts chronologically — which
+// is the whole sort order now that the vault is flat.
 export function buildId(date: string, title: string): string {
   return `${date}-${slugify(title)}`
 }
 
+// THE VAULT IS FLAT: every note is `<id>.md` in the vault root, with no type
+// subdirectories. The type lives in the frontmatter (and in the Qdrant
+// payload, where it can be filtered on) and nowhere in the path.
+//
+// An earlier version wrote `decisions/`, `projects/` and `references/`. The
+// directories are gone because they put the same fact in two places: a note
+// whose type changed would have to move files to stay consistent, which is a
+// rename Syncthing replicates as a delete plus a create and Obsidian sees as
+// a broken link. One directory and one id means the path is a pure function
+// of the id, so `search_notes` returning an id is enough to find the file.
+//
 // Relative to the vault root, always with forward slashes: it is stored in
 // SQLite and read back on another machine later.
-export function buildPath(type: NoteType, id: string): string {
-  return `${DIRECTORIES[type]}/${id}.md`
+export function buildPath(id: string): string {
+  return `${id}.md`
 }
 
 // ---------------------------------------------------------------- the format

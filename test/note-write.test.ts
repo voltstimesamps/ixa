@@ -22,14 +22,18 @@ const BASE = {
   date: "2026-10-10",
 }
 
-test("the path is built from type, title and date, and the note is on disk", async (t) => {
+test("the path is built from the title and date, and the note is on disk", async (t) => {
   const h = makeNotebook()
   t.after(h.cleanup)
 
   const result = await h.notebook.save(BASE)
 
   assert.equal(result.note.id, "2026-10-10-tavily-replaced-brave-for-search")
-  assert.equal(result.note.path, "decisions/2026-10-10-tavily-replaced-brave-for-search.md")
+  assert.equal(
+    result.note.path,
+    "2026-10-10-tavily-replaced-brave-for-search.md",
+    "flat: the path is the id, with no type directory"
+  )
 
   const absolute = path.join(h.vault, result.note.path)
   assert.ok(fs.existsSync(absolute), "the markdown file exists")
@@ -39,6 +43,36 @@ test("the path is built from type, title and date, and the note is on disk", asy
   assert.equal(parsed.meta.title, BASE.title)
   assert.equal(parsed.meta.status, "active")
   assert.deepEqual(parsed.sections, BASE.sections)
+})
+
+test("every type lands in one flat directory, with the type in the frontmatter", async (t) => {
+  const h = makeNotebook()
+  t.after(h.cleanup)
+
+  for (const type of ["decision", "project", "reference"] as const) {
+    await h.notebook.save({ ...BASE, type, title: `A ${type} note`, date: "2026-10-10" })
+  }
+
+  const entries = fs.readdirSync(h.vault, { withFileTypes: true })
+  assert.deepEqual(
+    entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name),
+    [],
+    "no decisions/, projects/ or references/ — the type is not part of the path"
+  )
+  assert.deepEqual(
+    entries.map((entry) => entry.name).sort(),
+    [
+      "2026-10-10-a-decision-note.md",
+      "2026-10-10-a-project-note.md",
+      "2026-10-10-a-reference-note.md",
+    ],
+    "<id>.md, in the vault root"
+  )
+
+  // The type is still recorded — it moved to the frontmatter, it did not go
+  // away, and search filters on it through the Qdrant payload.
+  const parsed = parseNote(fs.readFileSync(path.join(h.vault, "2026-10-10-a-project-note.md"), "utf8"))
+  assert.equal(parsed?.meta.type, "project")
 })
 
 test("provenance on disk comes from the harness, not from the caller's text", async (t) => {
@@ -78,7 +112,7 @@ test("the write leaves no temp file behind", async (t) => {
 
   await h.notebook.save(BASE)
 
-  const files = fs.readdirSync(path.join(h.vault, "decisions"))
+  const files = fs.readdirSync(h.vault)
   assert.deepEqual(files, ["2026-10-10-tavily-replaced-brave-for-search.md"])
   assert.ok(
     !files.some((name) => name.includes(".tmp-")),
@@ -91,21 +125,21 @@ test("a failed write leaves neither a temp file nor a half-written note", async 
   t.after(h.cleanup)
 
   await h.notebook.save(BASE)
-  const absolute = path.join(h.vault, "decisions/2026-10-10-tavily-replaced-brave-for-search.md")
+  const absolute = path.join(h.vault, "2026-10-10-tavily-replaced-brave-for-search.md")
   const before = fs.readFileSync(absolute, "utf8")
 
-  // A directory where the temp file wants to go: writeFileSync throws.
-  const decisions = path.join(h.vault, "decisions")
-  fs.chmodSync(decisions, 0o500)
+  // A read-only vault root: writeFileSync throws where the temp file wants to
+  // go, which is the vault itself now that the layout is flat.
+  fs.chmodSync(h.vault, 0o500)
   try {
     await assert.rejects(() => h.notebook.save({ ...BASE, summary: "a different summary" }))
   } finally {
-    fs.chmodSync(decisions, 0o700)
+    fs.chmodSync(h.vault, 0o700)
   }
 
   assert.equal(fs.readFileSync(absolute, "utf8"), before, "the old note is untouched")
   assert.ok(
-    !fs.readdirSync(decisions).some((name) => name.includes(".tmp-")),
+    !fs.readdirSync(h.vault).some((name) => name.includes(".tmp-")),
     "the temp file is cleaned up on failure"
   )
 })

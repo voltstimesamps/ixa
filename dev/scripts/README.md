@@ -37,6 +37,14 @@ Run them against a backend already started with `npm run dev`.
   so the supersede and duplicate probes can actually fail. Writes
   `notes-verify-report.md`; `--cleanup` drops the collection and the temp vault. Needs
   Ollama, Qdrant and Groq, not the backend.
+
+  Run `--cleanup` **between** runs that are meant to be compared: without it the next
+  run starts on the previous run's vault, which changes every duplicate advisory and
+  every search result. `notes-verify-report-routing-clause.md` beside it is the same
+  script's output for a description change that was measured and reverted — kept because
+  it is the only run in which the "remember that \<fact>" case routed correctly, and
+  because it shows what that cost. Routing is noisy: expect one run per state to be
+  suggestive and not conclusive.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping

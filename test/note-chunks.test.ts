@@ -154,12 +154,12 @@ test("a slug comes from the title and is bounded", () => {
   assert.equal(slugify("???"), "note", "a note with an unslugglable title still gets a path")
 })
 
-test("the id carries the date and the path carries the type", () => {
+test("the id carries the date, and the path is the id — the vault is flat", () => {
   const id = buildId("2026-10-10", "Tavily replaced Brave")
   assert.equal(id, "2026-10-10-tavily-replaced-brave")
-  assert.equal(buildPath("decision", id), `decisions/${id}.md`)
-  assert.equal(buildPath("project", id), `projects/${id}.md`)
-  assert.equal(buildPath("reference", id), `references/${id}.md`)
+  // No type anywhere in the path, for any type: the type is frontmatter.
+  assert.equal(buildPath(id), `${id}.md`)
+  assert.ok(!buildPath(id).includes("/"), "no subdirectory, now or by accident later")
 })
 
 // ------------------------------------------------------------ the format

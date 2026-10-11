@@ -95,6 +95,66 @@ export class LLMDeadlineError extends Error {
   }
 }
 
+// ---------------------------------------------- argument-level rejections
+//
+// A DIFFERENT CATEGORY FROM THE SDK'S RETRIES, and the reason there is a
+// hand-rolled retry here at all when loggingFetch above explains why there is
+// not one for transport failures.
+//
+// The SDK retries the TRANSPORT: a 429, a 5xx, a dropped connection — requests
+// that were never answered, where sending the same bytes again is the whole
+// fix. It honours retry-after and backs off, and nothing here touches that.
+//
+// This retries the MODEL'S OUTPUT. Groq validates the tool call the model
+// produced against the tool schema and rejects the request if it does not fit,
+// which arrives as a 400: the request was fine, the sampled tokens were not.
+// Two were measured in verification, both fatal to the turn:
+//
+//   parameters for tool search_memory did not match schema: errors:
+//   [`/query`: expected string, but got null]
+//   Failed to parse tool call arguments as JSON
+//
+// Nothing in the turn can correct either one, because no tool call reaches the
+// harness: the user gets an apology and has to ask again. Both were sampling
+// flukes rather than anything deterministic — the same request succeeded on
+// the next run — so the same call is issued ONCE more and the model gets
+// another sample. Permissive schemas (see OPTIONAL_STRING in the tool
+// registry) are the first line and they remove the whole class where the
+// deviation is predictable; this catches what is left.
+//
+// ONCE, and never more: a second rejection is a signal that something about
+// the request is wrong rather than unlucky, and a loop of 400s burns the
+// token budget to no purpose while the user waits.
+const ARGUMENT_REJECTION = /did not match schema|failed to parse tool call arguments/i
+
+export function isArgumentRejection(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  // Our own deadline, and the raw-text tool call the session retries WITHOUT
+  // tools, are both handled elsewhere and must not be re-sampled here.
+  if (err instanceof LLMDeadlineError) return false
+  const status = (err as { status?: unknown }).status
+  // A rejection of the model's output is a 400. Anything with another status
+  // belongs to the SDK's policy (429, 5xx) or to the caller (401, 404), and a
+  // transport failure carries no status and no matching message.
+  if (typeof status === "number" && status !== 400 && status !== 422) return false
+  return ARGUMENT_REJECTION.test(err.message)
+}
+
+// Exported for the tests: the retry has to be provable without a network.
+export async function withArgumentRetry<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run()
+  } catch (err) {
+    if (!isArgumentRejection(err)) throw err
+    // One line per retry, naming what was rejected.
+    console.log(
+      `llm retrying once: the provider rejected the model's tool call ` +
+        `(${err instanceof Error ? err.message : String(err)})`
+    )
+    return await run()
+  }
+}
+
 // Races a promise against a deadline. Used per chunk, not per call: the point
 // is to notice that the stream went quiet, which only a per-chunk deadline can
 // see. Promise.race attaches handlers to both, so the loser rejecting later is
@@ -108,6 +168,14 @@ function withDeadline<T>(promise: Promise<T>, ms: number, reason: string): Promi
 }
 
 export async function chat(
+  messages: Message[],
+  tools?: OpenAI.Chat.ChatCompletionTool[],
+  options?: { silent?: boolean }
+): Promise<LLMResponse> {
+  return withArgumentRetry(() => attempt(messages, tools, options))
+}
+
+async function attempt(
   messages: Message[],
   tools?: OpenAI.Chat.ChatCompletionTool[],
   options?: { silent?: boolean }
