@@ -1,7 +1,14 @@
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { chat as defaultChat, LLMDeadlineError, type LLMResponse, type Message, type ToolCall } from "./llm"
+import {
+  chat as defaultChat,
+  isToolChoiceRejection,
+  LLMDeadlineError,
+  type LLMResponse,
+  type Message,
+  type ToolCall,
+} from "./llm"
 import { registry, type Tool } from "../tools/registry"
 import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
@@ -199,6 +206,18 @@ export const TURN_FAILURE_APOLOGY =
 export const EMPTY_REPLY_FALLBACK =
   "Sorry, I lost my train of thought there. Could you ask me again?"
 
+// Spoken when the tool-call budget ran out and the wind-up could not get an
+// answer out of the model either, and recorded as the reply to that turn. Same
+// one-constant contract as the two above.
+//
+// It offers to continue because that is the truthful next step: the work is
+// not wrong, it is unfinished, and the user's "yes" starts a fresh turn with a
+// fresh budget. It does not name the limit — "fifteen tool calls" is an
+// implementation detail the user did not ask about — and it does not apologise
+// for a fault, because there was none.
+export const BUDGET_EXHAUSTED_FALLBACK =
+  "I ran out of tool calls before I could finish that one. Want me to keep going?"
+
 // A voice reply with no sentence boundary in it cannot be trimmed, so past
 // this length it is logged instead. Only diagnostics: nothing branches on it.
 const UNBROKEN_REPLY_CHARS = 400
@@ -248,6 +267,14 @@ export function emptyReplyRecord(toolCalls: number): string {
   return `${EMPTY_REPLY_FALLBACK} [no reply was produced after ${calls}]`
 }
 
+// The same, for a turn whose budget ran out and whose wind-up call could not
+// be made to answer. The bracketed note is for the model: restored into this
+// history it can see that the work stopped on a limit rather than finishing,
+// which is what makes "yes, keep going" answerable.
+export function budgetExhaustedRecord(toolCalls: number): string {
+  return `${BUDGET_EXHAUSTED_FALLBACK} [tool budget spent after ${toolCalls} calls; no answer produced]`
+}
+
 // What a tool result says when the turn failed before that call ever ran.
 // Truthful on purpose: the model is told nothing happened, not handed a
 // vague error it might read as "the action may have gone through".
@@ -281,6 +308,21 @@ function toolBudgetSpentPrompt(limit: number): string {
     `say plainly what you could not find out.`
   )
 }
+
+// The firmer version, injected after a call made with NO tools came back
+// holding a tool call anyway and was rejected by the provider before it ran
+// (see isToolChoiceRejection). Re-sending the same request would earn the same
+// rejection, so what changes is the request: the instruction above says what
+// to do and this one says what cannot be done and why.
+//
+// "Rejected before it runs" is in there deliberately. A model told merely that
+// tools are unavailable can read that as a reason to try a different tool; a
+// model told the attempt is refused outright has nothing to aim at.
+const NO_TOOL_CALL_CORRECTION =
+  "Your last reply tried to call a tool. No tools are available to you on this call, and " +
+  "an attempted call is rejected before it runs, so it cannot work however it is written. " +
+  "Reply in words only. Say what you found and what you could not find out, and do not " +
+  "call a tool."
 
 // What a tool result says when the per-turn search cap is reached.
 //
@@ -434,6 +476,11 @@ export class Session {
   // Same single-field, never-stored reasoning as priceCorrection.
   private toolBudgetNotice: string | null = null
 
+  // The firm "do not call a tool" correction, set once a no-tools call has
+  // been rejected for calling one. Same reasoning again: a statement about the
+  // calls that follow, never a thing that was said.
+  private noToolCallNotice: string | null = null
+
   // Set when a tool asked for this conversation to end (start_new_conversation).
   // Read and cleared by the manager at the turn boundary: ending the session
   // mid-turn would pull the history out from under the tool loop that is still
@@ -514,6 +561,7 @@ export class Session {
             this.recalled = null
             this.priceCorrection = null
             this.toolBudgetNotice = null
+            this.noToolCallNotice = null
           }
         }
       )
@@ -626,6 +674,12 @@ export class Session {
 
     if (this.toolBudgetNotice) {
       messages = [...messages, { role: "system", content: this.toolBudgetNotice }]
+    }
+
+    // Right behind the budget notice, because the two are a pair: that one
+    // says what to do, this one says what cannot be done.
+    if (this.noToolCallNotice) {
+      messages = [...messages, { role: "system", content: this.noToolCallNotice }]
     }
 
     // Last, so it is the most recent thing the model is told: it is a
@@ -760,6 +814,10 @@ export class Session {
     let priceGuardUsed = false
     // The empty-reply retry, once per turn for the same reason.
     let emptyRetryUsed = false
+    // The "do not call a tool" retry, once per turn for the same reason: a
+    // model that calls a tool on a call that has none, twice, having been told
+    // plainly that the attempt is rejected, is not going to stop on the third.
+    let noToolCallRetryUsed = false
     // Tool calls spent against the per-turn budget, parallel ones counted
     // individually. A call the user declined, one the search cap refused and
     // one that timed out all count — each reached the registry or the user.
@@ -809,6 +867,47 @@ export class Session {
         // tools would just spend the budget twice.
         if (err instanceof LLMDeadlineError) throw err
         const msg = err instanceof Error ? err.message : String(err)
+
+        // A call made with NO tools whose reply held a tool call anyway, which
+        // the provider rejects before anything runs: "Tool choice is none, but
+        // model called a tool". Measured live on the budget wind-up — the one
+        // call in the turn that was meant to produce the answer — and it was
+        // fatal, because it matches neither the patterns below nor
+        // isArgumentRejection in llm.ts, so it propagated and the turn died in
+        // the apology with fifteen calls of work on the floor.
+        //
+        // All FOUR no-tools paths are exposed to it, not just the wind-up: the
+        // malformed-tool-call retry, the unparseable-arguments retry, the
+        // empty-reply retry and the budget wind-up all send `tools: []`. They
+        // are handled here together, because the fix does not depend on which
+        // one withheld the tools.
+        //
+        // Re-sending the same request would earn the same rejection, so what
+        // changes is the request: the correction is injected and the call goes
+        // again. Once. Then a fallback, chosen by WHY the tools were withheld
+        // — a spent budget is a different thing to tell the user from a model
+        // that would not answer.
+        if (isToolChoiceRejection(err)) {
+          if (!noToolCallRetryUsed) {
+            noToolCallRetryUsed = true
+            this.noToolCallNotice = NO_TOOL_CALL_CORRECTION
+            console.log(
+              `llm retry: a call made with no tools produced a tool call anyway ` +
+                `(${msg}) — asking again, firmly`
+            )
+            continue
+          }
+          const record = budgetSpent
+            ? budgetExhaustedRecord(toolCallsThisTurn)
+            : emptyReplyRecord(toolCallsThisTurn)
+          this.messages.push({ role: "assistant", content: record })
+          console.warn(
+            `tool choice rejected twice after ${toolCallsThisTurn} tool calls — ` +
+              `delivering the ${budgetSpent ? "budget" : "empty reply"} fallback`
+          )
+          return budgetSpent ? BUDGET_EXHAUSTED_FALLBACK : EMPTY_REPLY_FALLBACK
+        }
+
         if (!retrying && (
           msg.toLowerCase().includes("failed to call a function") ||
           msg.toLowerCase().includes("tool call validation failed") ||

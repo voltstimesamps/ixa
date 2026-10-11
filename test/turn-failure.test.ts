@@ -266,6 +266,50 @@ test("an empty reply is asked again, then falls back, and still terminates the t
   client.close()
 })
 
+// A rejection that is NOT a failed turn.
+//
+// Every path that passes no tools — the malformed-tool-call retry, the
+// unparseable-arguments retry, the empty-reply retry and the tool-budget
+// wind-up — sends `tools: undefined`, and Groq reads that as tool_choice
+// "none". A model that emits a tool call anyway gets the request rejected
+// before anything runs: "Tool choice is none, but model called a tool".
+//
+// Live, that killed a turn on the budget wind-up — the one call meant to
+// produce the answer, with fifteen calls of work already done — because the
+// message matched no retry predicate anywhere and propagated straight out.
+//
+// Driven here through the empty-reply retry, which needs no tools and no
+// budget to reach: what is being tested is the TRANSPORT contract, which is
+// the same whichever path withheld the tools. The turn must end in an answer,
+// not an `error` frame.
+test("a no-tools call rejected for calling a tool still ends the turn cleanly", async () => {
+  let calls = 0
+  chatBehaviour = async () => {
+    calls++
+    // Empty first, which triggers the retry with no tools. That retry — and
+    // the one firm re-ask behind it — are both rejected.
+    if (calls === 1) return { type: "text", content: "" }
+    const err = new Error("Tool choice is none, but model called a tool") as Error & {
+      status?: number
+    }
+    err.status = 400
+    throw err
+  }
+
+  const client = await connect()
+  const turn = await client.ask("find the biggest python file")
+  const types = turn.map((m) => m.type)
+
+  assert.deepEqual(types, ["assistant", "replyEnd"], `unexpected turn: ${types.join(",")}`)
+  assert.ok(!types.includes("error"), "a provider rejection handled in the loop is not a failed turn")
+  assert.equal(turn.find((m) => m.type === "assistant")?.content, EMPTY_REPLY_FALLBACK)
+  assert.notEqual(turn.find((m) => m.type === "assistant")?.content, TURN_FAILURE_APOLOGY)
+  assert.equal(calls, 3, "one empty reply, one rejected retry, one rejected re-ask")
+  assert.equal(client.socket.readyState, WebSocket.OPEN)
+
+  client.close()
+})
+
 // Last, because it takes the TTS sidecar away for good.
 //
 // A text turn never contacts TTS, so an unavailable sidecar cannot reach it —

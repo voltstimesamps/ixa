@@ -145,6 +145,33 @@ export function isArgumentRejection(err: unknown): boolean {
   return ARGUMENT_REJECTION.test(err.message)
 }
 
+// A THIRD rejection of the model's output, and the one with no retry of its
+// own here, because fixing it needs the conversation and this layer does not
+// have it.
+//
+// Every path that passes no tools — the malformed-tool-call retry, the
+// unparseable-arguments retry, the empty-reply retry and the tool-budget
+// wind-up — sends `tools: undefined`, and Groq reads a request with no tools
+// as `tool_choice: "none"`. If the model emits a tool call anyway, the request
+// is rejected before anything runs:
+//
+//   Tool choice is none, but model called a tool
+//
+// Measured live, and fatal: it matched neither isArgumentRejection above nor
+// the malformed-tool-call patterns in the session, so it propagated out of the
+// tool loop and the turn died in the apology on the very call that was meant
+// to produce the answer. Re-issuing the same request would get the same
+// rejection, so the session handles it by changing the REQUEST — a firm
+// instruction not to call a tool — and then falls back. See
+// NO_TOOL_CALL_CORRECTION in session.ts.
+const TOOL_CHOICE_REJECTION = /tool choice is none|tool_choice is none|but model called a tool/i
+
+export function isToolChoiceRejection(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  if (err instanceof LLMDeadlineError) return false
+  return TOOL_CHOICE_REJECTION.test(err.message)
+}
+
 // Exported for the tests: the retry has to be provable without a network.
 export async function withArgumentRetry<T>(run: () => Promise<T>): Promise<T> {
   try {

@@ -3,7 +3,11 @@ import assert from "node:assert/strict"
 import { SessionManager } from "../src/core/session-manager"
 import { registry } from "../src/tools/registry"
 import { config } from "../src/config"
-import { TURN_FAILURE_APOLOGY, type ChatFn } from "../src/core/session"
+import {
+  BUDGET_EXHAUSTED_FALLBACK,
+  TURN_FAILURE_APOLOGY,
+  type ChatFn,
+} from "../src/core/session"
 import type { LLMResponse, Message } from "../src/core/llm"
 import { makeConnection, TEST_LIMITS } from "./helpers"
 
@@ -226,6 +230,139 @@ test("a model that never answers is bounded, and that one IS a failed turn", asy
     "every call in every group is answered",
   )
   assert.ok(String(history.at(-1)!.content).startsWith(TURN_FAILURE_APOLOGY))
+
+  manager.shutdown()
+})
+
+// ------------------------------------------------- the wind-up's own failure
+
+// The budget wind-up passes NO tools, and Groq reads a request with no tools
+// as tool_choice "none". If the model emits a tool call anyway the request is
+// rejected before anything runs:
+//
+//   Tool choice is none, but model called a tool
+//
+// Measured live, and fatal. It matches neither isArgumentRejection in llm.ts
+// nor the malformed-tool-call patterns in the tool loop, so it propagated out
+// and the turn died in TURN_FAILURE_APOLOGY — on the one call that was meant
+// to produce the answer, with fifteen calls of work already done.
+function toolChoiceRejection(): Error {
+  const err = new Error("Tool choice is none, but model called a tool") as Error & {
+    status?: number
+  }
+  err.status = 400
+  return err
+}
+
+test("a wind-up call that still produces a tool call is asked again, firmly", async () => {
+  probesRun = 0
+  let call = 0
+  const sent: Message[][] = []
+  const chat: ChatFn = async (messages, tools) => {
+    sent.push(messages)
+    call++
+    if (tools && tools.length > 0) return parallelProbes(1, call)
+    // First no-tools call: reject it the way the provider did.
+    if (!sent.some((m) => m.some((x) => /do not\s+call a tool/i.test(String(x.content ?? ""))))) {
+      throw toolChoiceRejection()
+    }
+    // Asked again with the correction present, it answers.
+    return { type: "text", content: "The biggest one is main.py." }
+  }
+
+  const manager = sessions(chat)
+  const reply = await manager.submitTurn("find the biggest python file", makeConnection(), "text")
+
+  assert.equal(reply, "The biggest one is main.py.", "one firm retry rescues the turn")
+  assert.equal(probesRun, LIMIT)
+
+  // The correction says what cannot be done and why, alongside the notice that
+  // says what to do instead.
+  const correction = sent.at(-1)!.filter((m) => m.role === "system").at(-1)!
+  assert.match(String(correction.content), /No tools are available to you on this call/)
+  assert.match(String(correction.content), /rejected before it runs/)
+  assert.match(String(correction.content), /do not\s+call a tool/i)
+
+  // Injected per call, never stored — like the budget notice and the price
+  // correction before it.
+  const history = manager.primarySession().history()
+  assert.equal(
+    history.some((m) => String(m.content ?? "").includes("No tools are available")),
+    false,
+    "the correction is never written to history",
+  )
+
+  manager.shutdown()
+})
+
+test("a wind-up rejected twice falls back, and the turn does not fail", async () => {
+  probesRun = 0
+  let call = 0
+  const chat: ChatFn = async (_messages, tools) => {
+    call++
+    if (tools && tools.length > 0) return parallelProbes(1, call)
+    // Never gives up on calling a tool, however firmly it is told.
+    throw toolChoiceRejection()
+  }
+
+  const manager = sessions(chat)
+  // Does not reject: the turn is finished, just not finished well.
+  const reply = await manager.submitTurn("find the biggest python file", makeConnection(), "text")
+
+  assert.equal(reply, BUDGET_EXHAUSTED_FALLBACK)
+  assert.notEqual(reply, TURN_FAILURE_APOLOGY, "nothing failed; the budget ran out")
+  assert.match(reply, /keep going/, "and it offers to continue, which is the truthful next step")
+
+  const history = manager.primarySession().history()
+  const last = history.at(-1)!
+  assert.equal(last.role, "assistant")
+  assert.ok(String(last.content).startsWith(BUDGET_EXHAUSTED_FALLBACK))
+  assert.match(
+    String(last.content),
+    new RegExp(`\\[tool budget spent after ${LIMIT} calls; no answer produced\\]`),
+    `the bracketed note is for the model, got: ${String(last.content)}`,
+  )
+
+  // History stays valid: the rejection happens at the LLM call, before any
+  // group is pushed, so every tool_calls message still has all its results.
+  const groups = history.filter((m) => m.role === "assistant" && "tool_calls" in m)
+  const calls = groups.reduce(
+    (n, m) => n + ((m as { tool_calls: unknown[] }).tool_calls?.length ?? 0),
+    0,
+  )
+  assert.equal(
+    history.filter((m) => m.role === "tool").length,
+    calls,
+    "a tool-call group is never persisted incomplete",
+  )
+
+  manager.shutdown()
+})
+
+// The same 400 reaches three other no-tools paths. The empty-reply retry is
+// the one worth proving, because its fallback is the OTHER one: no budget was
+// spent, so telling the user tool calls ran out would be a lie.
+test("the empty-reply retry hits the same rejection and falls back as an empty reply", async () => {
+  probesRun = 0
+  let call = 0
+  const chat: ChatFn = async () => {
+    call++
+    // First call: empty, which triggers the no-tools retry. That retry is then
+    // rejected for calling a tool, twice.
+    if (call === 1) return { type: "text", content: "" }
+    throw toolChoiceRejection()
+  }
+
+  const manager = sessions(chat)
+  const reply = await manager.submitTurn("say something", makeConnection(), "text")
+
+  assert.match(reply, /lost my train of thought/, "no budget was spent, so it is not that story")
+  assert.notEqual(reply, BUDGET_EXHAUSTED_FALLBACK)
+  assert.notEqual(reply, TURN_FAILURE_APOLOGY)
+  assert.match(
+    String(manager.primarySession().history().at(-1)!.content),
+    /\[no reply was produced after 0 tool calls\]/,
+  )
 
   manager.shutdown()
 })
