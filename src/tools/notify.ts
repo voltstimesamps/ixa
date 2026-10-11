@@ -1,5 +1,5 @@
 import { notify } from "../proactive/notifier"
-import type { Tool } from "./registry"
+import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 type Priority = "min" | "low" | "default" | "high" | "urgent"
 
@@ -8,7 +8,10 @@ const VALID_PRIORITIES = new Set<string>(["min", "low", "default", "high", "urge
 interface NotifyInput {
   title: string
   message: string
-  priority?: string
+  // Nullable: the model writes `priority: null` rather than omitting it, and
+  // a bare "string" schema turns that into a hard turn failure before the
+  // tool is reached. See OPTIONAL_STRING in registry.ts.
+  priority?: string | null
 }
 
 function isNotifyInput(value: unknown): value is NotifyInput {
@@ -33,7 +36,7 @@ export const notifyTool: Tool = {
         description: "Notification body",
       },
       priority: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description: "Priority level: min, low, default, high, urgent",
       },
     },
@@ -45,10 +48,8 @@ export const notifyTool: Tool = {
       return "Notify failed: invalid input"
     }
 
-    const priority =
-      input.priority && VALID_PRIORITIES.has(input.priority)
-        ? (input.priority as Priority)
-        : "default"
+    const given = optionalString(input.priority)
+    const priority = given && VALID_PRIORITIES.has(given) ? (given as Priority) : "default"
 
     await notify(input.title, input.message, priority)
     return `Notification sent: ${input.title}`

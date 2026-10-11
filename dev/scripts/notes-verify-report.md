@@ -1,33 +1,33 @@
 # Phase 3d step 2 — verification against the real tools
 
-Generated 2026-10-11T00:09:03.961Z by `dev/scripts/notes-verify.ts`. 34 LLM calls. web_search stubbed. Throwaway vault, database and collection.
+Generated 2026-10-11T02:18:47.125Z by `dev/scripts/notes-verify.ts`. 38 LLM calls. web_search stubbed. Throwaway vault, database and collection.
 
 ## Routing
 
 | # | what it tests | tools called, in order | note written | expected |
 |---|---|---|---|---|
-| 1 | a clear new decision: right type, specific title, searched first, nothing invented | save_note | 2026-10-10-search-engine-preference | search_notes then save_note, type decision |
-| 2 | a decision that changes an existing note: must supersede, not fork | search_notes → save_note | 2026-10-10-search-engine-preference-2 | search_notes then save_note with supersedes set to the tavily note |
+| 1 | a clear new decision: right type, specific title, searched first, nothing invented | search_notes → save_note | 2026-10-10-tavily-search-provider-decision | search_notes then save_note, type decision |
+| 2 | a decision that changes an existing note: must supersede, not fork | search_notes → save_note | 2026-10-10-tavily-search-provider-decision-updated | search_notes then save_note with supersedes set to the tavily note |
 | 3 | a vague request: must ask rather than write a note about nothing | **(no tool call)** | — | no save_note; ask what to write |
-| 4 | a price the USER stated: recording it is faithful, sharpening it is not | search_notes → save_note | 2026-10-10-used-3090-price-for-homelab | save_note; the figure matches what the user said; a dated caveat is added by code |
+| 4 | a price the USER stated: recording it is faithful, sharpening it is not | search_notes → save_note | 2026-10-10-homelab-gpu-budget | save_note; the figure matches what the user said; a dated caveat is added by code |
 | 5 | really a preference: must route to remember_preference, not save_note | remember_preference | — | remember_preference only |
-| 6 | a duplicate of a note already written: must not write a second one | save_note | 2026-10-10-groq-dev-tier-status | search_notes; then either no write or a supersede, never a second active note |
-| 7 | a reference fact not in the notebook: right type and a retrievable title | save_note | 2026-10-10-backend-environment | save_note, type reference |
-| 8 | a project fact with a vague cost claim and no number: must not supply a number | save_note | 2026-10-10-homelab-gpu-plan | save_note with NO invented figure |
-| 9 | mis-heard model names: must not write 'quadrant' and 'alama' into the notebook | save_note | 2026-10-10-vector-and-embedding-libraries | the correct spellings, or a question — not the mis-heard ones |
-| 10 | a price with NO number given: must search before recording a figure | web_search → save_note | 2026-10-10-used-rtx-3090-price-note | web_search before save_note; only searched figures in the note |
+| 6 | a duplicate of a note already written: must not write a second one | save_note → save_note → save_note | 2026-10-10-groq-dev-tier-status | search_notes; then either no write or a supersede, never a second active note |
+| 7 | a reference fact not in the notebook: right type and a retrievable title | save_note → save_note | 2026-10-10-backend-environment | save_note, type reference |
+| 8 | a project fact with a vague cost claim and no number: must not supply a number | save_note → save_note | 2026-10-10-homelab-gpu-plan | save_note with NO invented figure |
+| 9 | mis-heard model names: must not write 'quadrant' and 'alama' into the notebook | save_note | — | the correct spellings, or a question — not the mis-heard ones |
+| 10 | a price with NO number given: must search before recording a figure | web_search → save_note → save_note | 2026-10-10-used-rtx-3090-price | web_search before save_note; only searched figures in the note |
 | 11 | ROUTING: a genuine preference must still reach remember_preference | remember_preference | — | remember_preference |
-| 12 | ROUTING: 'remember' plus a FACT must reach save_note | search_notes → search_notes → search_notes → remember_preference | — | save_note |
-| 13 | ROUTING: a question about a past CONVERSATION must reach search_memory | **(no tool call)** | — | search_memory with no query |
+| 12 | ROUTING: 'remember' plus a FACT must reach save_note | remember_preference | — | save_note |
+| 13 | ROUTING: a question about a past CONVERSATION must reach search_memory | search_memory | — | search_memory with no query |
 | 14 | ROUTING: a question about something written down must reach search_notes | search_notes | — | search_notes |
 | 15 | ROUTING: a behaviour instruction phrased as a note must stay a preference | remember_preference | — | remember_preference, not save_note |
 
 ## Preferences actually stored
 
-- `answer_length`: keep answers to two sentences max
+- `answer_length`: keep answers short, two sentences max
 - `coffee`: black
-- `stt sidecar model`: uses base.en, not small
-- `units`: Always answer in metric units
+- `stt_sidecar_model`: base.en
+- `unit system`: Always answer in metric units
 
 ## Every request, verbatim
 
@@ -39,41 +39,74 @@ Generated 2026-10-11T00:09:03.961Z by `dev/scripts/notes-verify.ts`. 34 LLM call
 
 > so we decided we're going with tavily for search instead of brave, write that down somewhere
 
-1. `save_note`
+1. `search_notes`
 
 ```json
-{"sections":[{"body":"We decided to use Tavily for search instead of Brave.","heading":"Search Engine Decision"}],"summary":"We decided to use Tavily for search instead of Brave.","title":"Search Engine Preference","type":"decision"}
+{"query":"tavily search instead of brave"}
 ```
 
 ```
-Saved decision note "Search Engine Preference" (id 2026-10-10-search-engine-preference).
-Summary on disk: We decided to use Tavily for search instead of Brave.
+2 note(s) closest to that, best first:
+1. [decision] "Tavily is the search provider" — id 2026-09-01-tavily-is-the-search-provider, 2026-09-01 (The choice + Why not Brave)
+   Web search goes through Tavily. Brave was evaluated and never wired in.
+   ---
+## The choice
+
+Tavily returns extracted content rather than links.
+
+## Why not Brave
+
+It was evaluated and dropped before any code shipped.
+
+2. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
+   Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+   ---
+## The decision
+
+The paid Dev tier was chosen over migrating to a local LLM for now.
+
+These are the closest matches by meaning, not necessarily answers — a note may be here only because it is the nearest thing you have written. Use one only if it actually addresses the question, and say you ha
+```
+
+2. `save_note`
+
+```json
+{"sections":[{"body":"We decided to use Tavily for search instead of Brave.","heading":"Decision"}],"summary":"Decision to use Tavily for search instead of Brave.","supersedes":"2026-09-01-tavily-is-the-search-provider","title":"Tavily search provider decision","type":"decision"}
+```
+
+```
+Saved decision note "Tavily search provider decision" (id 2026-10-10-tavily-search-provider-decision).
+Summary on disk: Decision to use Tavily for search instead of Brave.
+Superseded "Tavily is the search provider" (id 2026-09-01-tavily-is-the-search-provider); its text is kept and marked superseded.
+You already have 1 note(s) that may cover this subject:
+  - id 2026-09-15-ixa-is-on-the-groq-dev-tier — "Ixa is on the Groq Dev tier": Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 Tell the user in one short sentence what you saved, using the title above.
 ```
 
 **What it said to the user:**
 
-> Saved decision note “Search Engine Preference”.
+> I’ve saved the decision as “Tavily search provider decision.”
 
-**Note written — `2026-10-10-search-engine-preference`:**
+**Note written — `2026-10-10-tavily-search-provider-decision`:**
 
 ```markdown
 ---
-id: "2026-10-10-search-engine-preference-2"
+id: "2026-10-10-tavily-search-provider-decision-updated"
 type: "decision"
-title: "Search Engine Preference"
-summary: "Switch search engine from Tavily to self-hosted Searx."
+title: "Tavily search provider decision updated"
+summary: "Decision to switch from Tavily to self-hosted Searx for search."
 date: "2026-10-10"
 status: "active"
 source: "voice"
 session: "verify-2"
 ---
 
-# Search Engine Preference
+# Tavily search provider decision updated
 
-## Search Engine Preference
+## Decision
 
-We are moving from Tavily to a self-hosted Searx instance for web search.
+We are moving from Tavily to a self-hosted Searx instance for search queries. This replaces the previous decision to use Tavily.
 
 ```
 
@@ -92,70 +125,63 @@ We are moving from Tavily to a self-hosted Searx instance for web search.
 ```
 
 ```
-3 note(s) closest to that, best first:
-1. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference, 2026-10-10 (Search Engine Decision)
-   We decided to use Tavily for search instead of Brave.
+2 note(s) closest to that, best first:
+1. [decision] "Tavily search provider decision" — id 2026-10-10-tavily-search-provider-decision, 2026-10-10 (Decision)
+   Decision to use Tavily for search instead of Brave.
    ---
-## Search Engine Decision
+## Decision
 
 We decided to use Tavily for search instead of Brave.
 
-2. [decision] "Tavily is the search provider" — id 2026-09-01-tavily-is-the-search-provider, 2026-09-01 (The choice + Why not Brave)
-   Web search goes through Tavily. Brave was evaluated and never wired in.
-   ---
-## The choice
-
-Tavily returns extracted content rather than links.
-
-## Why not Brave
-
-It was evaluated and dropped before any code shipped.
-
-3. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
+2. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
    Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
    ---
 ## The decision
 
-The paid Dev
+The paid Dev tier was chosen over migrating to a local LLM for now.
+
+These are the closest matches by meaning, not necessarily answers — a note may be here only because it is the nearest thing you have written. Use one only if it actually addresses the question, and say you have nothing written down if none of them do.
 ```
 
 2. `save_note`
 
 ```json
-{"sections":[{"body":"We are moving from Tavily to a self-hosted Searx instance for web search.","heading":"Search Engine Preference"}],"summary":"Switch search engine from Tavily to self-hosted Searx.","supersedes":"2026-10-10-search-engine-preference","title":"Search Engine Preference","type":"decision"}
+{"sections":[{"body":"We are moving from Tavily to a self-hosted Searx instance for search queries. This replaces the previous decision to use Tavily.","heading":"Decision"}],"summary":"Decision to switch from Tavily to self-hosted Searx for search.","supersedes":"2026-10-10-tavily-search-provider-decision","title":"Tavily search provider decision updated","type":"decision"}
 ```
 
 ```
-Saved decision note "Search Engine Preference" (id 2026-10-10-search-engine-preference-2).
-Summary on disk: Switch search engine from Tavily to self-hosted Searx.
-Superseded "Search Engine Preference" (id 2026-10-10-search-engine-preference); its text is kept and marked superseded.
-Note that "Search Engine Preference" (id 2026-10-10-search-engine-preference) already existed with different content, so this was saved as a separate note rather than written over it. If it was meant to replace that one, call save_note again with supersedes="2026-10-10-search-engine-preference".
-Tell the user in one short sentence what you saved, using the title above.
+Saved decision note "Tavily search provider decision updated" (id 2026-10-10-tavily-search-provider-decision-updated).
+Summary on disk: Decision to switch from Tavily to self-hosted Searx for search.
+Superseded "Tavily search provider decision" (id 2026-10-10-tavily-search-provider-decision); its text is kept and marked superseded.
+You already have 1 note(s) that may cover this subject:
+  - id 2026-09-15-ixa-is-on-the-groq-dev-tier — "Ixa is on the Groq Dev tier": Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
+Tell the user in one short sentence what you saved, using 
 ```
 
 **What it said to the user:**
 
-> Saved decision note “Search Engine Preference”.
+> Saved decision note “Tavily search provider decision updated”.
 
-**Note written — `2026-10-10-search-engine-preference-2`:**
+**Note written — `2026-10-10-tavily-search-provider-decision-updated`:**
 
 ```markdown
 ---
-id: "2026-10-10-search-engine-preference-2"
+id: "2026-10-10-tavily-search-provider-decision-updated"
 type: "decision"
-title: "Search Engine Preference"
-summary: "Switch search engine from Tavily to self-hosted Searx."
+title: "Tavily search provider decision updated"
+summary: "Decision to switch from Tavily to self-hosted Searx for search."
 date: "2026-10-10"
 status: "active"
 source: "voice"
 session: "verify-2"
 ---
 
-# Search Engine Preference
+# Tavily search provider decision updated
 
-## Search Engine Preference
+## Decision
 
-We are moving from Tavily to a self-hosted Searx instance for web search.
+We are moving from Tavily to a self-hosted Searx instance for search queries. This replaces the previous decision to use Tavily.
 
 ```
 
@@ -171,7 +197,7 @@ We are moving from Tavily to a self-hosted Searx instance for web search.
 
 **What it said to the user:**
 
-> Sure—what would you like me to note down?
+> Sure! What would you like me to note down?
 
 ### Request 4
 
@@ -188,69 +214,64 @@ We are moving from Tavily to a self-hosted Searx instance for web search.
 ```
 
 ```
-3 note(s) closest to that, best first:
-1. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
+2 note(s) closest to that, best first:
+1. [decision] "Tavily search provider decision updated" — id 2026-10-10-tavily-search-provider-decision-updated, 2026-10-10 (Decision)
+   Decision to switch from Tavily to self-hosted Searx for search.
+   ---
+## Decision
+
+We are moving from Tavily to a self-hosted Searx instance for search queries. This replaces the previous decision to use Tavily.
+
+2. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
    Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
    ---
 ## The decision
 
 The paid Dev tier was chosen over migrating to a local LLM for now.
 
-2. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference-2, 2026-10-10 (Search Engine Preference)
-   Switch search engine from Tavily to self-hosted Searx.
-   ---
-## Search Engine Preference
-
-We are moving from Tavily to a self-hosted Searx instance for web search.
-
-3. [decision] "Tavily is the search provider" — id 2026-09-01-tavily-is-the-search-provider, 2026-09-01 (The choice + Why not Brave)
-   Web search goes through Tavily. Brave was evaluated and never wired in.
-   ---
-## The choice
-
-Tavily returns extracted content rather th
+These are the closest matches by meaning, not necessarily answers — a note may be here only because it is the nearest thing you have written. Use one only if it actually addresses the question, and say you have n
 ```
 
 2. `save_note`
 
 ```json
-{"sections":[{"body":"A used RTX 3090 is currently listed for approximately $600.","heading":"Price"},{"body":"This price aligns with the budget for the homelab GPU.","heading":"Plan"}],"summary":"Used 3090 price is about $600, plan to purchase for homelab.","title":"Used 3090 price for homelab","type":"decision"}
+{"sections":[{"body":"A used RTX 3090 is currently priced around $600. This will be the GPU for the homelab.","heading":"Homelab GPU Budget"}],"summary":"Used RTX 3090 price ~600 USD for homelab GPU","title":"Homelab GPU budget","type":"decision"}
 ```
 
 ```
-Saved decision note "Used 3090 price for homelab" (id 2026-10-10-used-3090-price-for-homelab).
-Summary on disk: Used 3090 price is about $600, plan to purchase for homelab.
+Saved decision note "Homelab GPU budget" (id 2026-10-10-homelab-gpu-budget).
+Summary on disk: Used RTX 3090 price ~600 USD for homelab GPU
+You already have 2 note(s) that may cover this subject:
+  - id 2026-10-10-tavily-search-provider-decision-updated — "Tavily search provider decision updated": Decision to switch from Tavily to self-hosted Searx for search.
+  - id 2026-09-15-ixa-is-on-the-groq-dev-tier — "Ixa is on the Groq Dev tier": Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 A dated price caveat was added to the note automatically.
-Tell the user in one short sentence what you saved, using the title above.
+Tell the user in one short s
 ```
 
 **What it said to the user:**
 
-> Saved note "Used 3090 price for homelab".
+> I’ve saved the decision note “Homelab GPU budget.”
 
-**Note written — `2026-10-10-used-3090-price-for-homelab`:**
+**Note written — `2026-10-10-homelab-gpu-budget`:**
 
 ```markdown
 ---
-id: "2026-10-10-used-3090-price-for-homelab"
+id: "2026-10-10-homelab-gpu-budget"
 type: "decision"
-title: "Used 3090 price for homelab"
-summary: "Used 3090 price is about $600, plan to purchase for homelab."
+title: "Homelab GPU budget"
+summary: "Used RTX 3090 price ~600 USD for homelab GPU"
 date: "2026-10-10"
 status: "active"
 source: "voice"
 session: "verify-4"
 ---
 
-# Used 3090 price for homelab
+# Homelab GPU budget
 
-## Price
+## Homelab GPU Budget
 
-A used RTX 3090 is currently listed for approximately $600.
-
-## Plan
-
-This price aligns with the budget for the homelab GPU.
+A used RTX 3090 is currently priced around $600. This will be the GPU for the homelab.
 
 _Prices as stated on 2026-10-10; they may be out of date._
 
@@ -267,16 +288,16 @@ _Prices as stated on 2026-10-10; they may be out of date._
 1. `remember_preference`
 
 ```json
-{"category":"general","topic":"answer_length","value":"keep answers to two sentences max"}
+{"category":"communication","topic":"answer_length","value":"keep answers short, two sentences max"}
 ```
 
 ```
-Saved new preference [general] answer_length: keep answers to two sentences max.
+Saved new preference [communication] answer_length: keep answers short, two sentences max.
 ```
 
 **What it said to the user:**
 
-> Got it—I'll keep my responses to two sentences or fewer.
+> Got it. I'll keep my responses to two sentences or fewer.
 
 ### Request 6
 
@@ -289,38 +310,69 @@ Saved new preference [general] answer_length: keep answers to two sentences max.
 1. `save_note`
 
 ```json
-{"sections":[{"body":"We are currently on the Groq dev tier.","heading":"Groq Dev Tier"}],"summary":"Groq dev tier usage","title":"Groq Dev Tier Status","type":"project"}
+{"sections":[{"body":"We are currently using the Groq dev tier.","heading":"Groq Dev Tier"}],"summary":"User is on Groq dev tier.","title":"Groq dev tier status","type":"FACT"}
 ```
 
 ```
-Saved project note "Groq Dev Tier Status" (id 2026-10-10-groq-dev-tier-status).
-Summary on disk: Groq dev tier usage
+Nothing was saved: 'type' must be one of decision, project, reference.
+```
+
+2. `save_note`
+
+```json
+{"sections":[{"body":"We are currently using the Groq dev tier.","heading":"Groq Dev Tier"}],"summary":"User is on Groq dev tier.","title":"Groq dev tier status","type":"reference"}
+```
+
+```
+Saved reference note "Groq dev tier status" (id 2026-10-10-groq-dev-tier-status).
+Summary on disk: User is on Groq dev tier.
+You already have 2 note(s) that may cover this subject:
+  - id 2026-09-15-ixa-is-on-the-groq-dev-tier — "Ixa is on the Groq Dev tier": Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+  - id 2026-10-10-tavily-search-provider-decision-updated — "Tavily search provider decision updated": Decision to switch from Tavily to self-hosted Searx for search.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 Tell the user in one short sentence what you saved, using the title above.
+```
+
+3. `save_note`
+
+```json
+{"sections":[{"body":"We are currently using the Groq dev tier.","heading":"Groq Dev Tier"}],"summary":"User is on Groq dev tier.","supersedes":"2026-09-15-ixa-is-on-the-groq-dev-tier","title":"Groq dev tier status","type":"reference"}
+```
+
+```
+Saved reference note "Groq dev tier status" (id 2026-10-10-groq-dev-tier-status).
+Summary on disk: User is on Groq dev tier.
+Superseded "Ixa is on the Groq Dev tier" (id 2026-09-15-ixa-is-on-the-groq-dev-tier); its text is kept and marked superseded.
+You already have 2 note(s) that may cover this subject:
+  - id 2026-10-10-tavily-search-provider-decision-updated — "Tavily search provider decision updated": Decision to switch from Tavily to self-hosted Searx for search.
+  - id 2026-10-10-homelab-gpu-budget — "Homelab GPU budget": Used RTX 3090 price ~600 USD for homelab GPU
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
+Tell the user in one short senten
 ```
 
 **What it said to the user:**
 
-> Saved project note “Groq Dev Tier Status”.
+> Saved reference note "Groq dev tier status".
 
 **Note written — `2026-10-10-groq-dev-tier-status`:**
 
 ```markdown
 ---
 id: "2026-10-10-groq-dev-tier-status"
-type: "project"
-title: "Groq Dev Tier Status"
-summary: "Groq dev tier usage"
+type: "reference"
+title: "Groq dev tier status"
+summary: "User is on Groq dev tier."
 date: "2026-10-10"
 status: "active"
 source: "voice"
 session: "verify-6"
 ---
 
-# Groq Dev Tier Status
+# Groq dev tier status
 
 ## Groq Dev Tier
 
-We are currently on the Groq dev tier.
+We are currently using the Groq dev tier.
 
 ```
 
@@ -335,18 +387,32 @@ We are currently on the Groq dev tier.
 1. `save_note`
 
 ```json
-{"sections":[{"body":"The backend runs inside WSL2 on the gaming PC. The Windows side does not run any services.","heading":"Backend Environment"}],"summary":"Backend runs in WSL2 on gaming PC; Windows side idle.","title":"Backend environment","type":"reference"}
+{"sections":[{"body":"The backend runs in WSL2 on the gaming PC. The Windows side does not run any services.","heading":"Backend Environment"}],"summary":"Backend runs in WSL2 on gaming PC; Windows side idle.","title":"Backend environment","type":"FACT"}
+```
+
+```
+Nothing was saved: 'type' must be one of decision, project, reference.
+```
+
+2. `save_note`
+
+```json
+{"sections":[{"body":"The backend runs in WSL2 on the gaming PC. The Windows side does not run any services.","heading":"Backend Environment"}],"summary":"Backend runs in WSL2 on gaming PC; Windows side idle.","title":"Backend environment","type":"reference"}
 ```
 
 ```
 Saved reference note "Backend environment" (id 2026-10-10-backend-environment).
 Summary on disk: Backend runs in WSL2 on gaming PC; Windows side idle.
+You already have 2 note(s) that may cover this subject:
+  - id 2026-10-10-tavily-search-provider-decision-updated — "Tavily search provider decision updated": Decision to switch from Tavily to self-hosted Searx for search.
+  - id 2026-10-10-groq-dev-tier-status — "Groq dev tier status": User is on Groq dev tier.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 Tell the user in one short sentence what you saved, using the title above.
 ```
 
 **What it said to the user:**
 
-> Saved reference note “Backend environment”.
+> Saved reference note “Backend environment.”
 
 **Note written — `2026-10-10-backend-environment`:**
 
@@ -366,7 +432,7 @@ session: "verify-7"
 
 ## Backend Environment
 
-The backend runs inside WSL2 on the gaming PC. The Windows side does not run any services.
+The backend runs in WSL2 on the gaming PC. The Windows side does not run any services.
 
 ```
 
@@ -381,18 +447,32 @@ The backend runs inside WSL2 on the gaming PC. The Windows side does not run any
 1. `save_note`
 
 ```json
-{"sections":[{"body":"Plan to eventually use a 24GB GPU, expected to be expensive.","heading":"GPU plan"}],"summary":"Plan to eventually use a 24GB GPU, expected to be expensive.","title":"Homelab GPU plan","type":"project"}
+{"sections":[{"body":"The plan is to eventually use a 24 GB GPU for the homelab. This will be expensive.","heading":"Homelab GPU plan"}],"summary":"Plan to eventually use a 24 GB GPU, which will be expensive.","title":"Homelab GPU plan","type":"note"}
+```
+
+```
+Nothing was saved: 'type' must be one of decision, project, reference.
+```
+
+2. `save_note`
+
+```json
+{"sections":[{"body":"The plan is to eventually use a 24 GB GPU for the homelab. This will be expensive.","heading":"Homelab GPU plan"}],"summary":"Plan to eventually use a 24 GB GPU, which will be expensive.","title":"Homelab GPU plan","type":"project"}
 ```
 
 ```
 Saved project note "Homelab GPU plan" (id 2026-10-10-homelab-gpu-plan).
-Summary on disk: Plan to eventually use a 24GB GPU, expected to be expensive.
+Summary on disk: Plan to eventually use a 24 GB GPU, which will be expensive.
+You already have 2 note(s) that may cover this subject:
+  - id 2026-10-10-homelab-gpu-budget — "Homelab GPU budget": Used RTX 3090 price ~600 USD for homelab GPU
+  - id 2026-10-10-tavily-search-provider-decision-updated — "Tavily search provider decision updated": Decision to switch from Tavily to self-hosted Searx for search.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 Tell the user in one short sentence what you saved, using the title above.
 ```
 
 **What it said to the user:**
 
-> Saved project note "Homelab GPU plan".
+> (nothing)
 
 **Note written — `2026-10-10-homelab-gpu-plan`:**
 
@@ -401,7 +481,7 @@ Tell the user in one short sentence what you saved, using the title above.
 id: "2026-10-10-homelab-gpu-plan"
 type: "project"
 title: "Homelab GPU plan"
-summary: "Plan to eventually use a 24GB GPU, expected to be expensive."
+summary: "Plan to eventually use a 24 GB GPU, which will be expensive."
 date: "2026-10-10"
 status: "active"
 source: "voice"
@@ -410,9 +490,9 @@ session: "verify-8"
 
 # Homelab GPU plan
 
-## GPU plan
+## Homelab GPU plan
 
-Plan to eventually use a 24GB GPU, expected to be expensive.
+The plan is to eventually use a 24 GB GPU for the homelab. This will be expensive.
 
 ```
 
@@ -424,43 +504,21 @@ Plan to eventually use a 24GB GPU, expected to be expensive.
 
 > note down that we're using quadrant for the vectors and alama for the embeddings
 
+**ERROR:** Failed to parse tool call arguments as JSON
+
 1. `save_note`
 
 ```json
-{"sections":[{"body":"We are using Quadrant for vector operations and Alama for embeddings.","heading":"Vector and Embedding Libraries"}],"summary":"Using Quadrant for vectors and Alama for embeddings.","title":"Vector and Embedding Libraries","type":"project"}
+{"sections":[{"body":"We are using Quadrant for vector operations and Alama for embeddings.","heading":"Vector and Embedding Libraries"}],"summary":"Quadrant for vectors, Alama for embeddings.","title":"Vector and Embedding Libraries","type":"fact"}
 ```
 
 ```
-Saved project note "Vector and Embedding Libraries" (id 2026-10-10-vector-and-embedding-libraries).
-Summary on disk: Using Quadrant for vectors and Alama for embeddings.
-Tell the user in one short sentence what you saved, using the title above.
+Nothing was saved: 'type' must be one of decision, project, reference.
 ```
 
 **What it said to the user:**
 
-> Saved project note “Vector and Embedding Libraries”.
-
-**Note written — `2026-10-10-vector-and-embedding-libraries`:**
-
-```markdown
----
-id: "2026-10-10-vector-and-embedding-libraries"
-type: "project"
-title: "Vector and Embedding Libraries"
-summary: "Using Quadrant for vectors and Alama for embeddings."
-date: "2026-10-10"
-status: "active"
-source: "voice"
-session: "verify-9"
----
-
-# Vector and Embedding Libraries
-
-## Vector and Embedding Libraries
-
-We are using Quadrant for vector operations and Alama for embeddings.
-
-```
+> (nothing)
 
 ### Request 10
 
@@ -486,39 +544,53 @@ Search results for used RTX 3090 pricing:
 2. `save_note`
 
 ```json
-{"sections":[{"body":"Current used RTX 3090 GPUs are selling for approximately $1,250 to $1,420, based on recent eBay and Reddit listings. The price can vary depending on condition and seller.","heading":"Used RTX 3090 Price"}],"summary":"Used RTX 3090 price range $1,250-$1,420","title":"Used RTX 3090 Price Note","type":"project"}
+{"sections":[{"body":"Current market data shows used RTX 3090 GPUs are selling for approximately $1,250 to $1,420 USD, based on recent eBay and Reddit hardwareswap listings. Refurbished units on Newegg are listed around $1,499 USD.","heading":"Used RTX 3090 Price"}],"summary":"Used RTX 3090 GPUs currently sell for $1,250–$1,420 USD.","title":"Used RTX 3090 Price","type":"FACT"}
 ```
 
 ```
-Saved project note "Used RTX 3090 Price Note" (id 2026-10-10-used-rtx-3090-price-note).
-Summary on disk: Used RTX 3090 price range $1,250-$1,420
+Nothing was saved: 'type' must be one of decision, project, reference.
+```
+
+3. `save_note`
+
+```json
+{"sections":[{"body":"Current market data shows used RTX 3090 GPUs are selling for approximately $1,250 to $1,420 USD, based on recent eBay and Reddit hardwareswap listings. Refurbished units on Newegg are listed around $1,499 USD.","heading":"Used RTX 3090 Price"}],"summary":"Used RTX 3090 GPUs currently sell for $1,250–$1,420 USD.","title":"Used RTX 3090 Price","type":"reference"}
+```
+
+```
+Saved reference note "Used RTX 3090 Price" (id 2026-10-10-used-rtx-3090-price).
+Summary on disk: Used RTX 3090 GPUs currently sell for $1,250–$1,420 USD.
+You already have 2 note(s) that may cover this subject:
+  - id 2026-10-10-homelab-gpu-budget — "Homelab GPU budget": Used RTX 3090 price ~600 USD for homelab GPU
+  - id 2026-10-10-homelab-gpu-plan — "Homelab GPU plan": Plan to eventually use a 24 GB GPU, which will be expensive.
+If one of them is about the same thing as what you just saved, the two will disagree later. Call save_note again with the same content and supersedes set to that id, which marks the old one superseded instead of leaving both active. If none of them is about the same thing, ignore this.
 A dated price caveat was added to the note automatically.
 Tell the user in one short sentence what you saved, using the title above.
 ```
 
 **What it said to the user:**
 
-> Saved project note "Used RTX 3090 Price Note".
+> Used RTX 3090 GPUs currently sell for about $1,250 – $1,420 USD. I’ve saved this as a reference note titled “Used RTX 3090 Price.”
 
-**Note written — `2026-10-10-used-rtx-3090-price-note`:**
+**Note written — `2026-10-10-used-rtx-3090-price`:**
 
 ```markdown
 ---
-id: "2026-10-10-used-rtx-3090-price-note"
-type: "project"
-title: "Used RTX 3090 Price Note"
-summary: "Used RTX 3090 price range $1,250-$1,420"
+id: "2026-10-10-used-rtx-3090-price"
+type: "reference"
+title: "Used RTX 3090 Price"
+summary: "Used RTX 3090 GPUs currently sell for $1,250–$1,420 USD."
 date: "2026-10-10"
 status: "active"
 source: "voice"
 session: "verify-10"
 ---
 
-# Used RTX 3090 Price Note
+# Used RTX 3090 Price
 
 ## Used RTX 3090 Price
 
-Current used RTX 3090 GPUs are selling for approximately $1,250 to $1,420, based on recent eBay and Reddit listings. The price can vary depending on condition and seller.
+Current market data shows used RTX 3090 GPUs are selling for approximately $1,250 to $1,420 USD, based on recent eBay and Reddit hardwareswap listings. Refurbished units on Newegg are listed around $1,499 USD.
 
 _Prices as stated on 2026-10-10; they may be out of date._
 
@@ -544,7 +616,7 @@ Saved new preference [food] coffee: black.
 
 **What it said to the user:**
 
-> Got it—your coffee is black.
+> Got it—your coffee preference is now set to black.
 
 ### Request 12
 
@@ -554,110 +626,19 @@ Saved new preference [food] coffee: black.
 
 > remember that the stt sidecar uses base.en, not small
 
-1. `search_notes`
+1. `remember_preference`
 
 ```json
-{"query":"stt sidecar base.en"}
+{"category":"technical","topic":"stt_sidecar_model","value":"base.en"}
 ```
 
 ```
-3 note(s) closest to that, best first:
-1. [reference] "Backend environment" — id 2026-10-10-backend-environment, 2026-10-10 (Backend Environment)
-   Backend runs in WSL2 on gaming PC; Windows side idle.
-   ---
-## Backend Environment
-
-The backend runs inside WSL2 on the gaming PC. The Windows side does not run any services.
-
-2. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference-2, 2026-10-10 (Search Engine Preference)
-   Switch search engine from Tavily to self-hosted Searx.
-   ---
-## Search Engine Preference
-
-We are moving from Tavily to a self-hosted Searx instance for web search.
-
-3. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
-   Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
-   ---
-## The decision
-
-The paid Dev tier was chosen over migrating to a local
-```
-
-2. `search_notes`
-
-```json
-{"query":"stt sidecar base.en"}
-```
-
-```
-3 note(s) closest to that, best first:
-1. [reference] "Backend environment" — id 2026-10-10-backend-environment, 2026-10-10 (Backend Environment)
-   Backend runs in WSL2 on gaming PC; Windows side idle.
-   ---
-## Backend Environment
-
-The backend runs inside WSL2 on the gaming PC. The Windows side does not run any services.
-
-2. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference-2, 2026-10-10 (Search Engine Preference)
-   Switch search engine from Tavily to self-hosted Searx.
-   ---
-## Search Engine Preference
-
-We are moving from Tavily to a self-hosted Searx instance for web search.
-
-3. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
-   Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
-   ---
-## The decision
-
-The paid Dev tier was chosen over migrating to a local
-```
-
-3. `search_notes`
-
-```json
-{"query":"stt sidecar"}
-```
-
-```
-3 note(s) closest to that, best first:
-1. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference-2, 2026-10-10 (Search Engine Preference)
-   Switch search engine from Tavily to self-hosted Searx.
-   ---
-## Search Engine Preference
-
-We are moving from Tavily to a self-hosted Searx instance for web search.
-
-2. [reference] "Backend environment" — id 2026-10-10-backend-environment, 2026-10-10 (Backend Environment)
-   Backend runs in WSL2 on gaming PC; Windows side idle.
-   ---
-## Backend Environment
-
-The backend runs inside WSL2 on the gaming PC. The Windows side does not run any services.
-
-3. [decision] "Tavily is the search provider" — id 2026-09-01-tavily-is-the-search-provider, 2026-09-01 (The choice + Why not Brave)
-   Web search goes through Tavily. Brave was evaluated and never wired in.
-   ---
-## The choice
-
-Tavily returns extracted content rather than links.
-
-```
-
-4. `remember_preference`
-
-```json
-{"category":"technical","topic":"stt sidecar model","value":"uses base.en, not small"}
-```
-
-```
-Saved new preference [technical] stt sidecar model: uses base.en, not small.
+Saved new preference [technical] stt_sidecar_model: base.en.
 ```
 
 **What it said to the user:**
 
-> Got it—I'll remember that the STT sidecar uses the `base.en` model, not the `small` one.
+> Got it. I’ll use `base.en` for the STT sidecar.
 
 ### Request 13
 
@@ -667,13 +648,19 @@ Saved new preference [technical] stt sidecar model: uses base.en, not small.
 
 > what did we talk about last time?
 
-**ERROR:** Tool call validation failed: tool call validation failed: parameters for tool search_memory did not match schema: errors: [`/from`: expected string, but got null, `/query`: expected string, but got null, `/to`: expected string, but got null]
+1. `search_memory`
 
-**No tool call.**
+```json
+{"from":null,"query":null,"to":null}
+```
+
+```
+Memory search is unavailable right now (the vector index or embedding service is not reachable). Tell the user you cannot search your memory at the moment rather than guessing at what was discussed.
+```
 
 **What it said to the user:**
 
-> (nothing)
+> I’m sorry, but I can’t access my memory right now.
 
 ### Request 14
 
@@ -691,34 +678,36 @@ Saved new preference [technical] stt sidecar model: uses base.en, not small.
 
 ```
 3 note(s) closest to that, best first:
-1. [decision] "Search Engine Preference" — id 2026-10-10-search-engine-preference-2, 2026-10-10 (Search Engine Preference)
-   Switch search engine from Tavily to self-hosted Searx.
+1. [decision] "Tavily search provider decision updated" — id 2026-10-10-tavily-search-provider-decision-updated, 2026-10-10 (Decision)
+   Decision to switch from Tavily to self-hosted Searx for search.
    ---
-## Search Engine Preference
+## Decision
 
-We are moving from Tavily to a self-hosted Searx instance for web search.
+We are moving from Tavily to a self-hosted Searx instance for search queries. This replaces the previous decision to use Tavily.
 
-2. [decision] "Ixa is on the Groq Dev tier" — id 2026-09-15-ixa-is-on-the-groq-dev-tier, 2026-09-15 (The decision)
-   Ixa runs on the Groq Dev tier, so the free tier's daily cap no longer blocks testing.
+2. [reference] "Groq dev tier status" — id 2026-10-10-groq-dev-tier-status, 2026-10-10 (Groq Dev Tier)
+   User is on Groq dev tier.
    ---
-## The decision
+## Groq Dev Tier
 
-The paid Dev tier was chosen over migrating to a local LLM for now.
+We are currently using the Groq dev tier.
 
-3. [decision] "Tavily is the search provider" — id 2026-09-01-tavily-is-the-search-provider, 2026-09-01 (The choice + Why not Brave)
-   Web search goes through Tavily. Brave was evaluated and never wired in.
+3. [reference] "Backend environment" — id 2026-10-10-backend-environment, 2026-10-10 (Backend Environment)
+   Backend runs in WSL2 on gaming PC; Windows side idle.
    ---
-## The choice
+## Backend Environment
 
-Tavily returns extracted content rather th
+The backend runs in WSL2 on the gaming PC. The Windows side does not run any services.
+
+These are the closest matc
 ```
 
 **What it said to the user:**
 
-> I wrote a decision note titled **“Tavily is the search provider”** (ID 2026‑09‑01‑tavily‑is‑the‑search‑provider). It states:
+> You noted that the search provider has been changed:  
 > 
-> - Web search goes through **Tavily**.
-> - **Brave** was evaluated but never wired in and was dropped before any code shipped.
+> **Decision (2026‑10‑10)** – “Tavily search provider decision updated.”  
+> The note states that you are moving from Tavily to a self‑hosted Searx instance for all search queries, replacing the earlier decision to use Tavily.
 
 ### Request 15
 
@@ -731,13 +720,13 @@ Tavily returns extracted content rather th
 1. `remember_preference`
 
 ```json
-{"category":"general","topic":"units","value":"Always answer in metric units"}
+{"category":"communication","topic":"unit system","value":"Always answer in metric units"}
 ```
 
 ```
-Saved new preference [general] units: Always answer in metric units.
+Saved new preference [communication] unit system: Always answer in metric units.
 ```
 
 **What it said to the user:**
 
-> Got it—I'll use metric units in all responses.
+> Got it. I’ll keep that preference in mind.

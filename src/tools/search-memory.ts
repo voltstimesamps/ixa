@@ -1,6 +1,6 @@
 import { getEpisodicMemory } from "../memory/episodic-memory"
 import { formatEpisodeWhen, type Episode } from "../memory/episodes"
-import type { Tool } from "./registry"
+import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 // requiresConfirmation: false — this only reads Ixa's own memory of past
 // conversations. Same reasoning as the preference tools: the gate is for
@@ -14,9 +14,13 @@ const UNAVAILABLE =
 interface SearchInput {
   // Optional: with no query this returns the most recent conversations
   // instead of searching by meaning. See the tool description.
-  query?: string
-  from?: string
-  to?: string
+  //
+  // `| null` is not decoration: the model sends an explicit null for a field
+  // it is not using, so the schema below accepts one and every read of these
+  // goes through optionalString, which treats null exactly as absent.
+  query?: string | null
+  from?: string | null
+  to?: string | null
 }
 
 function isSearchInput(value: unknown): value is SearchInput {
@@ -74,18 +78,18 @@ export const searchMemoryTool: Tool = {
     type: "object",
     properties: {
       query: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description:
           "Optional. What to look for, in natural language — a topic, decision, or question. " +
           "OMIT IT ENTIRELY to get the most recent conversations instead, which is what a " +
           "question about recency needs.",
       },
       from: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description: "Optional earliest date to search, as YYYY-MM-DD.",
       },
       to: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description: "Optional latest date to search, as YYYY-MM-DD.",
       },
     },
@@ -102,19 +106,18 @@ export const searchMemoryTool: Tool = {
     const memory = getEpisodicMemory()
     if (!memory) return UNAVAILABLE
 
-    const range = {
-      from: parseDate(input.from, false),
-      to: parseDate(input.to, true),
-    }
-    // A blank or whitespace query is treated as no query. The model sometimes
-    // sends `query: ""` rather than omitting the field, and embedding an empty
-    // string would return nothing at all — the opposite of what it meant.
-    const query = input.query?.trim()
+    // null, "" and absent all mean "not given" — see optionalString. The
+    // model sends all three, and embedding an empty string would return
+    // nothing at all, the opposite of what it meant.
+    const from = optionalString(input.from)
+    const to = optionalString(input.to)
+    const range = { from: parseDate(from, false), to: parseDate(to, true) }
+    const query = optionalString(input.query)
 
     const result = query ? await memory.search(query, range) : memory.recent(range)
     if (!result.available) return UNAVAILABLE
 
-    const dated = input.from || input.to ? " in that date range" : ""
+    const dated = from || to ? " in that date range" : ""
     if (result.episodes.length === 0) {
       return query
         ? `No past conversations match that${dated}.`

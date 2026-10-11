@@ -38,6 +38,10 @@ async function withNotes(count: number) {
     id,
     score: 0.8 - index * 0.05,
   }))
+  // A save runs its own duplicate search now, so seeding leaves records in
+  // here. Cleared so these tests count the search under test and nothing else;
+  // the save-time search is note-duplicates.test.ts's subject.
+  h.index.searches.length = 0
   return h
 }
 

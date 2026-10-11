@@ -1,5 +1,5 @@
 import { getPreferenceStore, type Preference } from "../memory/preferences"
-import type { Tool } from "./registry"
+import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 // requiresConfirmation is false for all three of these, deliberately.
 //
@@ -22,7 +22,10 @@ const CATEGORY_HINT =
 interface RememberInput {
   topic: string
   value: string
-  category?: string
+  // Nullable because the model writes `category: null` rather than omitting
+  // it, and a bare "string" schema makes that a hard turn failure — see
+  // OPTIONAL_STRING in registry.ts for the measured error.
+  category?: string | null
 }
 
 interface ForgetInput {
@@ -60,6 +63,20 @@ export const rememberPreferenceTool: Tool = {
     "Save or update a preference: something about the USER or how they want you to behave. " +
     "Call it only when they state one (\"I prefer…\", \"I like…\", \"always…\", \"from now on…\"). " +
     "A fact, a decision, or work in progress is NOT a preference — write those with save_note. " +
+    // A WORKED EXAMPLE PAIR WAS TRIED HERE AND REMOVED. It read:
+    //
+    //   "remember that the backup runs at 3am" → save_note.
+    //   "from now on skip the greeting" → this tool.
+    //
+    // +97 chars, and measured against the routing set it bought nothing: the
+    // failing case ("remember that the stt sidecar uses base.en, not small")
+    // still came here, and "make a note to always answer in metric" — which
+    // had been passing — came here AND wrote a note. So the examples are not
+    // in the shipped description. Kept as a comment because the next person to
+    // reach for this lever should know it was pulled and measured.
+    //
+    // Note for whoever tries again: neither example may be one of the probes,
+    // or the re-run measures recall of this sentence instead of routing.
     "Never infer a preference from what the user asks about. 'topic' is a short key such as " +
     "\"coffee\"; when updating, reuse the EXACT topic from the saved preferences block so the " +
     "update replaces it instead of forking a near-duplicate. " +
@@ -78,7 +95,7 @@ export const rememberPreferenceTool: Tool = {
         description: "The preference itself, in plain language.",
       },
       category: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description: `Optional grouping. ${CATEGORY_HINT}`,
       },
     },
@@ -94,7 +111,7 @@ export const rememberPreferenceTool: Tool = {
       const { preference, superseded } = getPreferenceStore().remember({
         topic: input.topic,
         value: input.value,
-        category: input.category,
+        category: optionalString(input.category),
       })
 
       if (superseded) {
@@ -152,7 +169,7 @@ export const listPreferencesTool: Tool = {
     type: "object",
     properties: {
       category: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description: `Optional filter. ${CATEGORY_HINT}`,
       },
     },
@@ -161,7 +178,7 @@ export const listPreferencesTool: Tool = {
   execute: async (input: unknown): Promise<string> => {
     const category =
       typeof input === "object" && input !== null
-        ? ((input as Record<string, unknown>).category as string | undefined)
+        ? optionalString((input as Record<string, unknown>).category)
         : undefined
 
     const active = getPreferenceStore().listActive(category)

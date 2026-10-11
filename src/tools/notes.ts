@@ -8,7 +8,7 @@ import {
 import { getNotebook } from "../memory/notebook"
 import { NOTE_TYPES, type NoteSection, type NoteType } from "../memory/notes-markdown"
 import type { NoteHit } from "../memory/notebook"
-import type { Tool } from "./registry"
+import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 // save_note and search_notes: Ixa's notebook.
 //
@@ -129,7 +129,21 @@ export const saveNoteTool: Tool = {
   inputSchema: {
     type: "object",
     properties: {
-      type: { type: "string", enum: NOTE_TYPES, description: TYPE_DESCRIPTION },
+      // NO `enum` HERE, deliberately, even though there are exactly three
+      // valid values and the description names all three.
+      //
+      // Groq validates a tool call against this schema before Ixa ever sees
+      // it, and a rejection is a DEAD TURN: measured, "find out what a used
+      // 3090 costs right now and write it down" ran its web_search, then
+      // chose a type outside the set, and the turn died with
+      //   parameters for tool save_note did not match schema:
+      //   [`/type`: value must be one of 'decision', 'project', 'reference']
+      // — no note, no answer, and the search paid for nothing. With the enum
+      // gone the same mistake reaches execute(), which replies "'type' must
+      // be one of decision, project, reference" and the model fixes it on the
+      // next iteration. A schema constraint costs the whole turn; the same
+      // constraint in code costs one round trip.
+      type: { type: "string", description: TYPE_DESCRIPTION },
       title: {
         type: "string",
         description:
@@ -150,7 +164,7 @@ export const saveNoteTool: Tool = {
         },
       },
       supersedes: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description:
           "Id of the note this replaces, exactly as search_notes gave it. The new note must say what it replaces and why.",
       },
@@ -193,6 +207,9 @@ export const saveNoteTool: Tool = {
     if (unsupported.length > 0) return priceRefusal(unsupported, "save_note")
 
     const date = localDateString()
+    // optionalString: null, "" and absent are one case. The model sends all
+    // three — see OPTIONAL_STRING in registry.ts.
+    const supersedes = optionalString(raw.supersedes)
 
     // A note that states a price carries its own date, appended HERE and not
     // asked of the model: a figure in a file has no conversation around it to
@@ -212,9 +229,7 @@ export const saveNoteTool: Tool = {
         title,
         summary,
         sections: stamped,
-        ...(typeof raw.supersedes === "string" && raw.supersedes.trim()
-          ? { supersedes: raw.supersedes.trim() }
-          : {}),
+        ...(supersedes ? { supersedes } : {}),
         source: evidence.source,
         sessionId: evidence.sessionId,
         date,
@@ -245,6 +260,24 @@ export const saveNoteTool: Tool = {
             `supersedes="${result.titleClash.id}".`
         )
       }
+      // What the description asks for and does not get. Verification measured
+      // search_notes being called before only three of eight writes, and the
+      // write that skipped it duplicated a note that was already there. So the
+      // search runs in code on every save and its result is reported here.
+      if (result.duplicates.length > 0) {
+        lines.push(
+          `You already have ${result.duplicates.length} note(s) that may cover this subject:`
+        )
+        for (const hit of result.duplicates) {
+          lines.push(`  - id ${hit.note.id} — "${hit.note.title}": ${hit.note.summary}`)
+        }
+        lines.push(
+          "If one of them is about the same thing as what you just saved, the two will disagree " +
+            "later. Call save_note again with the same content and supersedes set to that id, " +
+            "which marks the old one superseded instead of leaving both active. If none of them " +
+            "is about the same thing, ignore this."
+        )
+      }
       if (priced) lines.push(`A dated price caveat was added to the note automatically.`)
       if (!result.indexed) {
         lines.push(
@@ -267,7 +300,7 @@ export const searchNotesTool: Tool = {
     type: "object",
     properties: {
       query: {
-        type: "string",
+        type: OPTIONAL_STRING,
         description:
           "Optional. What to look for, in plain language. OMIT IT to get the most recent notes.",
       },
@@ -282,10 +315,11 @@ export const searchNotesTool: Tool = {
     if (!notebook) return UNAVAILABLE
 
     const raw = (typeof input === "object" && input !== null ? input : {}) as { query?: unknown }
-    // A blank query is treated as no query, for the reason search_memory
-    // documents: the model sends `query: ""` rather than omitting the field,
-    // and embedding an empty string returns the opposite of what it meant.
-    const query = typeof raw.query === "string" ? raw.query.trim() : ""
+    // A blank or null query is treated as no query, for the reason
+    // optionalString documents: the model sends `query: ""` and `query: null`
+    // as well as omitting the field, and embedding an empty string returns the
+    // opposite of what it meant.
+    const query = optionalString(raw.query) ?? ""
 
     const result = query ? await notebook.search(query) : notebook.recent()
     if (!result.available) return UNAVAILABLE

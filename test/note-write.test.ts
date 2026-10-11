@@ -145,12 +145,16 @@ test("re-saving an unchanged note re-embeds nothing", async (t) => {
   t.after(h.cleanup)
 
   await h.notebook.save(BASE)
-  const first = h.embedder.calls.length
+  // DOCUMENT embeddings only. Every save also embeds its own title and summary
+  // as a QUERY, for the duplicate check, and that is not a re-embed of the
+  // note — see note-duplicates.test.ts.
+  const documents = () => h.embedder.calls.filter((call) => call.kind === "document").length
+  const first = documents()
   const pointIds = [...h.index.points.keys()]
 
   const again = await h.notebook.save(BASE)
 
-  assert.equal(h.embedder.calls.length, first, "no embedding call for text that did not change")
+  assert.equal(documents(), first, "no embedding call for text that did not change")
   assert.equal(again.chunks.added, 0)
   assert.ok(again.chunks.kept > 0)
   assert.deepEqual([...h.index.points.keys()], pointIds, "the points keep their ids")

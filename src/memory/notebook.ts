@@ -29,6 +29,11 @@ import type { Payload, VectorIndex } from "./qdrant"
 // SHE IS THE ONLY WRITER, so there is no watcher. The thing that writes a
 // note and the thing that indexes it are the same call.
 
+// How many possible duplicates a save reports. Two: enough to catch the note
+// that should have been superseded, short enough that the read-back stays a
+// read-back rather than a search result.
+const DUPLICATES = 2
+
 export interface NotebookLimits {
   searchLimit: number
   searchTimeoutMs: number
@@ -71,6 +76,10 @@ export interface SaveResult {
   // content, so this one was given a distinct id rather than written over it.
   // Worth telling the model: it probably meant to supersede.
   titleClash?: Note
+  // Active notes that may already cover this subject, found by searching on
+  // the new note's own title and summary BEFORE it was written. Advisory: the
+  // write never waits on this and never fails because of it.
+  duplicates: NoteHit[]
   // False means the file is on disk and the vectors are not. The note exists;
   // it is not searchable yet.
   indexed: boolean
@@ -153,6 +162,29 @@ export class Notebook {
     }
   }
 
+  // SEARCH-BEFORE-WRITE, IN CODE. `save_note`'s description says to call
+  // search_notes first, every time. Verification measured that instruction
+  // being obeyed on three writes out of eight — and the write that skipped it
+  // produced a second, near-identical Groq-tier note. A description is not a
+  // mechanism, so the duplicate check runs here, where skipping it is not an
+  // option.
+  //
+  // It is ADVISORY ONLY and cannot stop the write. The user asked for a note;
+  // a near-duplicate is a thing to tell the model about, not a reason to lose
+  // what they said. Hence no threshold either — the same measurement that
+  // removed the score floor from retrieval applies: the model reads the
+  // candidates and judges them.
+  private async possibleDuplicates(
+    input: SaveNoteInput,
+    exclude: Set<string>
+  ): Promise<NoteHit[]> {
+    // Title AND summary, because the summary is what retrieval matches on and
+    // the title alone is often too short to embed usefully.
+    const result = await this.search(`${input.title}\n${input.summary}`, DUPLICATES + exclude.size)
+    if (!result.available) return [] // Index down: silent, by design.
+    return result.hits.filter((hit) => !exclude.has(hit.note.id)).slice(0, DUPLICATES)
+  }
+
   async save(input: SaveNoteInput): Promise<SaveResult> {
     const chunks = chunkSections(input.sections, this.limits)
 
@@ -196,6 +228,14 @@ export class Notebook {
       }
     }
 
+    // Before the file lands, so the new note cannot match itself. The
+    // excluded ids are the ones already reported more precisely: a note being
+    // superseded, and a title clash (or an identical re-save) under this id.
+    const duplicates = await this.possibleDuplicates(
+      input,
+      new Set([id, buildId(input.date, input.title), ...(superseded ? [superseded.id] : [])])
+    )
+
     const meta: NoteMeta = {
       id,
       type: input.type,
@@ -226,6 +266,7 @@ export class Notebook {
       superseded,
       ...(supersedeProblem ? { supersedeProblem } : {}),
       ...(titleClash ? { titleClash } : {}),
+      duplicates,
       indexed,
       chunks: { added: diff.added.length, kept: diff.kept.length, removed: diff.removedIds.length },
     }
@@ -398,7 +439,7 @@ export class Notebook {
   // threshold in that range cuts real answers and keeps wrong ones, so the
   // tool returns its best few and says plainly that they may be unrelated —
   // the reader discards a weak match, not a number.
-  async search(query: string): Promise<NoteSearchResult> {
+  async search(query: string, limit = this.limits.searchLimit): Promise<NoteSearchResult> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.limits.searchTimeoutMs)
     try {
@@ -407,7 +448,7 @@ export class Notebook {
         // Chunks, not notes: several chunks of one note can match, and they
         // collapse below. Over-fetched so the collapse still has N notes to
         // return.
-        limit: this.limits.searchLimit * 4,
+        limit: limit * 4,
         filter: [{ key: "status", match: { value: "active" } }],
         withPayload: true,
         signal: controller.signal,
@@ -443,7 +484,7 @@ export class Notebook {
             text: chunk.text,
           })
         }
-        if (best.size >= this.limits.searchLimit) break
+        if (best.size >= limit) break
       }
 
       return { available: true, hits: [...best.values()] }
