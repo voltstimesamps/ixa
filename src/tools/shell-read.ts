@@ -14,6 +14,56 @@ function truncate(s: string): string {
   return s.slice(0, MAX_OUTPUT) + `\n[output truncated — ${omitted} characters omitted]`
 }
 
+// Pinned rather than raised, and pinned rather than left to the default so the
+// message below can name a real number that cannot drift with a Node version.
+//
+// `ls -R` in a home directory is 1.8MB — measured, 69234 lines — and that is
+// how this was found: the child was killed with ERR_CHILD_PROCESS_STDIO_MAXBUFFER,
+// `truncate` above never saw a byte of it, and the model was told only
+// "Command failed: stdout maxBuffer length exceeded" three times in one turn.
+// Raising the ceiling would buy a bigger buffer for output that is thrown away
+// at 8000 characters anyway; what was missing was a message that says what to
+// do instead.
+const MAX_BUFFER = 1024 * 1024
+
+// Output that overran the buffer. Written for the model: what happened, that
+// nothing is wrong with the tool, and three narrower commands to reach for.
+// Not phrased as a bare failure — an unexplained failure is retried verbatim,
+// which is what happened live.
+const OUTPUT_TOO_LARGE =
+  "Output too large to return: the command produced more than 1 MB before it was stopped, " +
+  "so none of it is available. Nothing is wrong with the command or the tool — it is the " +
+  "SIZE. Ask a narrower question instead: name a subdirectory rather than a whole tree, " +
+  "use find with -iname and a name pattern to look for one thing, or read a bounded number " +
+  "of lines with head -n."
+
+// What successful output of nothing says. An empty string is indistinguishable
+// from a tool that broke, and live that ambiguity cost two calls: `find` with
+// a pattern that could not match returned "" twice, and the model read it as
+// the tool failing rather than as the answer being "nothing here".
+const NO_OUTPUT = "(no output)"
+
+// Shell quoting that never reached a shell.
+//
+// `command` may arrive as one string and is split on whitespace, so the model
+// writes what it would type — find . -name '*architecture*' — and execFile
+// passes the quotes through as literal characters. The pattern then contains
+// two apostrophes and matches nothing, silently: no error, no output, no way
+// to tell it apart from a directory with nothing in it. Measured live, twice
+// in one turn.
+//
+// Stripping a matched surrounding pair is exactly what the shell would have
+// done. The length check leaves a lone quote alone, which is a real argument
+// ("'" is what you grep for when you want an apostrophe).
+function stripQuotes(arg: string): string {
+  if (arg.length < 2) return arg
+  const first = arg[0]!
+  if ((first === "'" || first === '"') && arg.endsWith(first)) {
+    return arg.slice(1, -1)
+  }
+  return arg
+}
+
 const WHITELIST = new Set([
   "ls", "cat", "head", "tail", "grep", "find", "pwd", "echo", "wc",
   "stat", "df", "du", "ps", "git", "env", "which", "whoami", "uname", "uptime",
@@ -98,7 +148,12 @@ export const shellReadTool: Tool = {
     "searching (grep, find), checking system state (ps, df, du, pwd, uname, uptime, " +
     "whoami), or inspecting git (git status, git log, git diff). These commands never " +
     "modify anything and never require confirmation. Always prefer this tool over " +
-    "shell_write when the operation is read-only.",
+    "shell_write when the operation is read-only. " +
+    // Added after a live turn spent two calls on `find -name` patterns that
+    // could not match: the file was ARCHITECTURE.md. The flag is not rewritten
+    // in code — a tool that silently runs a different command than it was asked
+    // for is worse than one that needs this sentence.
+    "Note that find's -name is case-sensitive: prefer -iname unless you know the exact case.",
   inputSchema: {
     type: "object",
     properties: {
@@ -130,7 +185,8 @@ export const shellReadTool: Tool = {
     }
 
     const home = homedir()
-    const expandedArgs = args.map((arg) => {
+    // Quotes come off first, so '~/Projects' expands the way the shell would.
+    const expandedArgs = args.map(stripQuotes).map((arg) => {
       if (arg === "~" || arg === "$HOME") return home
       if (arg.startsWith("~/")) return home + arg.slice(1)
       return arg
@@ -142,12 +198,27 @@ export const shellReadTool: Tool = {
       : { exe: command, args: expandedArgs }
 
     try {
-      const { stdout, stderr } = await execFile(spec.exe, spec.args, { cwd, timeout: 10000, env: { ...process.env } })
+      const { stdout, stderr } = await execFile(spec.exe, spec.args, {
+        cwd,
+        timeout: 10000,
+        maxBuffer: MAX_BUFFER,
+        env: { ...process.env },
+      })
       if (stdout) return truncate(stdout)
       if (stderr) return truncate(stderr)
-      return ""
+      return NO_OUTPUT
     } catch (err: unknown) {
-      const execErr = err as { killed?: boolean; stderr?: string; message?: string }
+      const execErr = err as { code?: unknown; killed?: boolean; stderr?: string; message?: string }
+      // Before the `killed` check, deliberately. A buffer overrun kills the
+      // child too, and on Node 24 it arrives with `killed` undefined — so this
+      // currently reaches the generic branch, but a future runtime that sets
+      // the flag would report a 1.8MB listing as a timeout.
+      if (
+        execErr.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ||
+        (execErr.message ?? "").includes("maxBuffer")
+      ) {
+        return OUTPUT_TOO_LARGE
+      }
       if (execErr.killed) return "Command timed out after 10 seconds."
       const detail = execErr.stderr || execErr.message || String(err)
       return `Command failed: ${detail}`

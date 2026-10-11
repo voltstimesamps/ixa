@@ -47,7 +47,11 @@ test("preferences sit between the system prompt and the history", async () => {
 
   assert.equal(messages[2]!.role, "user", "then the history")
   assert.equal(messages[2]!.content, "what should I order?")
-  assert.equal(messages.length, 3)
+  // Then the working-directory line, which sits with the other per-call
+  // statements below the history rather than in the injected block above it.
+  assert.equal(messages[3]!.role, "system")
+  assert.match(String(messages[3]!.content), /shell_read and shell_write run in/)
+  assert.equal(messages.length, 4)
 
   sessions.shutdown()
 })
@@ -61,7 +65,7 @@ test("on a voice turn the order is system, preferences, history, voice constrain
   const messages = sent.at(-1)!
   assert.deepEqual(
     messages.map((m) => m.role),
-    ["system", "system", "user", "system"],
+    ["system", "system", "user", "system", "system"],
   )
   assert.match(String(messages[0]!.content), /You are Ixa/)
   assert.match(String(messages[1]!.content), /saved preferences/)
@@ -78,7 +82,11 @@ test("nothing is injected when no preference is active", async () => {
   await sessions.submitTurn("hello", connection, "text")
 
   const messages = sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "user"], "no empty block is added")
+  assert.deepEqual(
+    messages.map((m) => m.role),
+    ["system", "user", "system"],
+    "no empty block is added — the trailing system message is the working directory",
+  )
 
   sessions.shutdown()
 })
@@ -104,7 +112,7 @@ test("a preference saved mid-session applies to the very next call", async () =>
   const { store, sent, sessions, connection } = setup()
 
   await sessions.submitTurn("first", connection, "text")
-  assert.equal(sent.at(-1)!.length, 2, "nothing injected yet")
+  assert.equal(sent.at(-1)!.length, 2 + 1, "no preference block yet, just the cwd line")
 
   store.remember({ topic: "units", value: "metric" })
   await sessions.submitTurn("second", connection, "text")
@@ -141,9 +149,9 @@ test("preferences survive a context budget that drops all history", async () => 
   // whatever it costs — a window with no conversation in it produced empty
   // replies). Everything behind it is still clipped, which is what this test
   // is about: the preference block is BUILT per call, not carried by history.
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user", "system"])
   assert.match(String(messages[1]!.content), /coffee: black/)
-  assert.equal(messages.at(-1)!.content, "still there?")
+  assert.equal(messages[2]!.content, "still there?", "the newest message always travels")
   assert.equal(
     messages.some((m) => m.content === "hello"),
     false,

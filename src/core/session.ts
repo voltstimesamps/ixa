@@ -264,6 +264,13 @@ const NOT_EXECUTED_OVER_BUDGET =
   "not executed: this turn's tool-call limit was reached before this call ran. Nothing " +
   "happened, nothing is wrong, and the tool is working. Do not try it again in this turn."
 
+// The one line that tells Ixa where her shell tools are standing. Kept short
+// on purpose — it is on every call of every turn — and naming both tools,
+// because the directory is what `cd` through shell_write changes.
+function workingDirectoryLine(cwd: string): string {
+  return `shell_read and shell_write run in ${cwd}; relative paths are resolved from there.`
+}
+
 // Injected for ONE call when the tool-call budget is spent, and never stored:
 // it is a statement about this call, not something that was said. Paired with
 // passing no tools on that call, so the instruction and what is possible agree
@@ -583,6 +590,23 @@ export class Session {
       while (lead < messages.length && messages[lead]!.role === "system") lead++
       messages = [...messages.slice(0, lead), ...injected, ...messages.slice(lead)]
     }
+
+    // Where the shell tools are standing. Below the history rather than up in
+    // the injected block, with the other statements about this CALL, and
+    // deliberately late: the model reads it just before it chooses a path.
+    //
+    // Injected rather than written into shell_read's description, which is the
+    // cheaper place, because a description is STATIC and this value is not —
+    // `cd` through shell_write moves it mid-session and a restored session
+    // resumes wherever its history left off. The static alternative is a clause
+    // saying "run pwd to find out", which spends a tool call to learn something
+    // that costs 86 characters to say.
+    //
+    // Why it is said at all: live, asked to read her own architecture document,
+    // Ixa spent three of nine tool calls working out where she was standing.
+    // Nothing in the system prompt, the tool descriptions or the schemas named
+    // the directory.
+    messages = [...messages, { role: "system", content: workingDirectoryLine(this.cwd) }]
 
     if (origin === "voice") {
       messages = [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]

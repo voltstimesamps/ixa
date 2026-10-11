@@ -34,10 +34,14 @@ test("a long history sends only recent messages while storing everything", async
   assert.ok(history.some((m) => m.content === "turn 0"), "the oldest turn is still stored")
 
   const lastSent = sentArrays.at(-1)!
-  assert.equal(lastSent.length, 5, "the request is capped at the configured budget")
+  // Five windowed messages plus the working-directory line, which is appended
+  // after windowing and so is never charged to the budget — the same deal the
+  // voice constraint gets.
+  assert.equal(lastSent.length, 6, "the request is capped at the configured budget")
   assert.equal(lastSent[0]!.role, "system")
+  assert.match(String(lastSent.at(-1)!.content), /shell_read and shell_write run in/)
   assert.deepEqual(
-    lastSent.slice(1).map((m) => m.content),
+    lastSent.slice(1, -1).map((m) => m.content),
     ["heard: turn 7", "turn 8", "heard: turn 8", "turn 9"],
     "only the most recent messages are sent",
   )

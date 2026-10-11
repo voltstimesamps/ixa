@@ -67,7 +67,7 @@ test("order is system prompt, preferences, episodes, history", async () => {
   await h.sessions.submitTurn("why was TTS slow?", makeConnection({ id: "c1" }), "text")
 
   const messages = h.sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "system", "user", "system"])
   assert.match(String(messages[0]!.content), /You are Ixa/)
   assert.match(String(messages[1]!.content), /saved preferences/)
   assert.match(String(messages[2]!.content), /earlier conversations/)
@@ -86,7 +86,7 @@ test("on a voice turn the constraint still comes last", async () => {
   const messages = h.sent.at(-1)!
   assert.deepEqual(
     messages.map((m) => m.role),
-    ["system", "system", "system", "user", "system"],
+    ["system", "system", "system", "user", "system", "system"],
   )
   assert.match(String(messages[1]!.content), /saved preferences/)
   assert.match(String(messages[2]!.content), /earlier conversations/)
@@ -128,7 +128,7 @@ test("nothing is injected when recall returns null", async () => {
 
   await h.sessions.submitTurn("hello", makeConnection({ id: "c4" }), "text")
 
-  assert.deepEqual(h.sent.at(-1)!.map((m) => m.role), ["system", "user"])
+  assert.deepEqual(h.sent.at(-1)!.map((m) => m.role), ["system", "user", "system"])
   h.sessions.shutdown()
 })
 
@@ -208,9 +208,9 @@ test("a recalled block survives a budget that drops all history", async () => {
   // The newest message always travels now — see buildWindow. The first turn
   // is still clipped, which is the point: the recalled block is built per
   // call rather than carried along by history.
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user", "system"])
   assert.match(String(messages[1]!.content), /earlier conversations/)
-  assert.equal(messages.at(-1)!.content, "again")
+  assert.equal(messages[2]!.content, "again", "the newest message always travels")
   assert.equal(
     messages.some((m) => m.content === "hello"),
     false,
@@ -269,7 +269,7 @@ test("the recency line is injected between preferences and recalled episodes", a
   await h.sessions.submitTurn("what did we talk about last time?", makeConnection({ id: "r1" }), "text")
 
   const messages = h.sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "system", "system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "system", "system", "user", "system"])
   assert.match(String(messages[1]!.content), /saved preferences/)
   assert.match(String(messages[2]!.content), /most recent conversation/)
   assert.match(String(messages[3]!.content), /earlier conversations/)
@@ -284,7 +284,7 @@ test("the recency line is injected with no preferences and no recall", async () 
   await h.sessions.submitTurn("what did we talk about?", makeConnection({ id: "r2" }), "text")
 
   const messages = h.sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "system", "user", "system"])
   assert.match(String(messages[1]!.content), /most recent conversation/)
 
   h.sessions.shutdown()
@@ -297,7 +297,7 @@ test("nothing is injected when there are no episodes to name", async () => {
   await h.sessions.submitTurn("hello", makeConnection({ id: "r3" }), "text")
 
   const messages = h.sent.at(-1)!
-  assert.deepEqual(messages.map((m) => m.role), ["system", "user"])
+  assert.deepEqual(messages.map((m) => m.role), ["system", "user", "system"])
 
   h.sessions.shutdown()
 })
@@ -306,7 +306,7 @@ test("the recency line is rebuilt per call, so an episode saved mid-session appe
   const h = setup()
   h.setLastEpisode(null)
   await h.sessions.submitTurn("one", makeConnection({ id: "r4" }), "text")
-  assert.deepEqual(h.sent.at(-1)!.map((m) => m.role), ["system", "user"])
+  assert.deepEqual(h.sent.at(-1)!.map((m) => m.role), ["system", "user", "system"])
 
   h.setLastEpisode("Your most recent conversation with the user ended Sat 4 Oct 2026, 16:25.")
   await h.sessions.submitTurn("two", makeConnection({ id: "r4" }), "text")
