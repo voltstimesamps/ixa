@@ -6,7 +6,7 @@ import { registry, type Tool } from "../tools/registry"
 import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
-import { runWithSessionControl } from "./session-context"
+import { currentTurnEvidence, runWithSessionControl } from "./session-context"
 import { shortenForSpeech } from "../voice/shorten"
 import { findCurrencyAmounts, priceCorrectionPrompt } from "./prices"
 import type { Connection } from "./connection"
@@ -408,7 +408,18 @@ export class Session {
       // Binds the session-control channel for the whole turn, so a tool that
       // runs inside the loop can reach THIS session and no other.
       runWithSessionControl(
-        { requestNewConversation: () => { this.endRequested = true } },
+        {
+          requestNewConversation: () => { this.endRequested = true },
+          // What this turn has seen, for save_note's price rule. The user's
+          // words are known now; search results are appended by the tool loop
+          // as they come back.
+          evidence: {
+            userText: userInput,
+            source: origin,
+            sessionId: this.id,
+            searchResults: [],
+          },
+        },
         async (): Promise<string> => {
           this.messages.push({ role: "user", content: userInput })
           onUserMessage?.()
@@ -821,6 +832,10 @@ export class Session {
           if (ran && tc.name === "web_search") {
             searchedThisTurn = true
             searchesThisTurn++
+            // Recorded for the turn, not just counted: save_note has to check
+            // a figure against what the search actually returned, and "a
+            // search happened" does not say which number came back.
+            currentTurnEvidence()?.searchResults.push(result)
           }
 
           if (tool?.name === "shell_write") {

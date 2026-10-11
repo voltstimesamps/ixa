@@ -27,7 +27,7 @@ async function endedSession(turns: number): Promise<Session> {
 
 // ------------------------------------------------------------- migration 2
 
-test("migration 2 adds the episodes table to an existing v1 database", (t) => {
+test("migrations after v1 are additive to an existing v1 database", (t) => {
   const file = `/tmp/ixa-migration-${process.pid}-${Date.now()}.db`
   t.after(() => {
     for (const suffix of ["", "-wal", "-shm"]) {
@@ -43,8 +43,15 @@ test("migration 2 adds the episodes table to an existing v1 database", (t) => {
   const store = new EpisodeStore(db)
   store.save({ sessionId: "s1", startedAt: 1, endedAt: 2, summary: "kept", tags: [] })
 
-  // Rewind to v1, as if the database predates this phase.
-  db.exec("DROP TABLE episodes; DELETE FROM schema_version WHERE version = 2;")
+  // Rewind to v1, as if the database predates every phase since. Everything
+  // migrations 2 and up created goes, children before parents, so re-running
+  // them is a clean apply rather than a CREATE over an existing table.
+  db.exec(`
+    DROP TABLE note_chunks;
+    DROP TABLE notes;
+    DROP TABLE episodes;
+    DELETE FROM schema_version WHERE version > 1;
+  `)
   assert.equal(schemaVersion(db), 1)
   db.close()
 
@@ -52,8 +59,14 @@ test("migration 2 adds the episodes table to an existing v1 database", (t) => {
   assert.equal(schemaVersion(upgraded), LATEST_SCHEMA_VERSION)
   assert.ok(
     upgraded.prepare("SELECT name FROM sqlite_master WHERE name = 'preferences'").get(),
-    "migration 2 is additive — earlier tables survive",
+    "later migrations are additive — earlier tables survive",
   )
+  for (const table of ["episodes", "notes", "note_chunks"]) {
+    assert.ok(
+      upgraded.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(table),
+      `${table} is recreated by the upgrade`,
+    )
+  }
   assert.equal(new EpisodeStore(upgraded).count(), 0, "the dropped table starts empty")
 })
 

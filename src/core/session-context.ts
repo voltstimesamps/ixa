@@ -20,14 +20,56 @@ export interface SessionControl {
   requestNewConversation(): void
 }
 
-const storage = new AsyncLocalStorage<SessionControl>()
+// What this turn has actually seen, for a tool that must not write down a
+// fact nobody gave it.
+//
+// save_note needs two things it cannot get from its own input: what the user
+// said, and what a web_search returned in THIS turn. Those are facts about
+// the turn, so they arrive the same way `requestNewConversation` leaves — a
+// tool still never touches the Session, and this direction is read-only,
+// which is weaker than the channel already here.
+//
+// Why not read them out of history instead: history is the whole
+// conversation, and "the user mentioned a price six turns ago" is exactly the
+// staleness the price rule exists to catch. The window is one turn.
+export interface TurnEvidence {
+  // The user's message, verbatim, as it arrived this turn.
+  userText: string
+  // Provenance, for a tool that records something durable. Here rather than
+  // in a tool schema because the model cannot know either one: asked for a
+  // session id in the spike, it supplied "?". `source` is the turn's origin,
+  // so a note says whether it came from speech or typing.
+  source: "voice" | "text"
+  sessionId: string
+  // Results of web_search calls that ACTUALLY RAN this turn — not ones that
+  // were declined, capped or abandoned. Appended as each result comes back,
+  // so a tool called before the search in the same group correctly sees
+  // nothing.
+  searchResults: string[]
+}
 
-export function runWithSessionControl<T>(control: SessionControl, run: () => T): T {
-  return storage.run(control, run)
+export interface TurnContext extends SessionControl {
+  evidence: TurnEvidence
+}
+
+// ONE store for the whole turn context, not one per concern: both are bound
+// at the same moment around the same turn, and a second AsyncLocalStorage
+// would be a second thing to remember to bind.
+const storage = new AsyncLocalStorage<TurnContext>()
+
+export function runWithSessionControl<T>(context: TurnContext, run: () => T): T {
+  return storage.run(context, run)
 }
 
 // Undefined when called outside a turn — a dev script, or a tool invoked
 // directly in a test. Callers must handle that rather than assume a session.
 export function currentSessionControl(): SessionControl | undefined {
   return storage.getStore()
+}
+
+// Undefined outside a turn, and a tool that needs it must FAIL CLOSED rather
+// than treat "no evidence" as "nothing to check against": unverifiable is not
+// the same as verified.
+export function currentTurnEvidence(): TurnEvidence | undefined {
+  return storage.getStore()?.evidence
 }

@@ -82,6 +82,68 @@ const MIGRATIONS: Migration[] = [
       `)
     },
   },
+  {
+    version: 3,
+    up: (db) => {
+      // Ixa's notebook (Phase 3d).
+      //
+      // BOTH OF THESE TABLES ARE REBUILDABLE. The markdown file is the source
+      // of truth for a note — it is what Obsidian renders and what Syncthing
+      // replicates — so these rows are a derived index over the vault, in the
+      // same relationship Qdrant has to SQLite for episodes. Dropping them
+      // costs a re-scan, never a note.
+      db.exec(`
+        CREATE TABLE notes (
+          id            TEXT    PRIMARY KEY,
+          type          TEXT    NOT NULL,
+          title         TEXT    NOT NULL,
+          summary       TEXT    NOT NULL,
+          -- YYYY-MM-DD, local, as the frontmatter carries it.
+          date          TEXT    NOT NULL,
+          status        TEXT    NOT NULL DEFAULT 'active',
+          -- Relative to the vault root, so moving the vault is a config change.
+          path          TEXT    NOT NULL,
+          superseded_by TEXT    REFERENCES notes(id),
+          superseded_at INTEGER,
+          -- Provenance, stamped by the harness. The model is never asked for
+          -- any of it: asked for a session id in the spike, it invented "?".
+          source        TEXT    NOT NULL DEFAULT 'text',
+          session_id    TEXT,
+          created_at    INTEGER NOT NULL
+        );
+
+        -- The no-query half of search_notes: the most recent ACTIVE notes.
+        -- Partial for the same reason the preference index is: "active" is
+        -- the only state anything reads in the hot path.
+        CREATE INDEX idx_notes_recent ON notes(created_at) WHERE status = 'active';
+
+        CREATE TABLE note_chunks (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          note_id         TEXT    NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          ordinal         INTEGER NOT NULL,
+          heading_path    TEXT    NOT NULL,
+          text            TEXT    NOT NULL,
+          -- Content hash. Re-saving a note re-embeds only the chunks whose
+          -- hash is new; an unchanged chunk keeps its row, its id (which IS
+          -- its Qdrant point id) and its indexed_at.
+          hash            TEXT    NOT NULL,
+          embedding_model TEXT,
+          indexed_at      INTEGER,
+          created_at      INTEGER NOT NULL
+        );
+
+        CREATE UNIQUE INDEX idx_note_chunks_ordinal ON note_chunks(note_id, ordinal);
+
+        -- Matched on when a note is re-saved, to tell a changed chunk from a
+        -- moved one.
+        CREATE INDEX idx_note_chunks_hash ON note_chunks(note_id, hash);
+
+        -- Same shape as the episode backlog: almost always empty, so partial.
+        CREATE INDEX idx_note_chunks_backlog ON note_chunks(created_at)
+          WHERE indexed_at IS NULL;
+      `)
+    },
+  },
 ]
 
 // The version a freshly opened database ends up at.

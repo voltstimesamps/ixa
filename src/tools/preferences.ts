@@ -17,7 +17,7 @@ import type { Tool } from "./registry"
 // decided at runtime.
 
 const CATEGORY_HINT =
-  "Suggested categories: general, food, communication, schedule, work, home, technical, personal."
+  "Categories: general, food, communication, schedule, work, home, technical, personal."
 
 interface RememberInput {
   topic: string
@@ -46,24 +46,32 @@ function describe(preference: Preference): string {
 
 export const rememberPreferenceTool: Tool = {
   name: "remember_preference",
+  // THIS DESCRIPTION AND save_note's ARE A PAIR. Changing one without the
+  // other is what caused the bug this version fixes.
+  //
+  // The previous version said to call this when the user "directly asks you to
+  // remember something" — which is how a request to note a FACT arrives, word
+  // for word. Measured over ten spoken-style note requests, three of them were
+  // routed here instead of to save_note; deleting that one clause flipped two
+  // of the three. The clause is gone, and each description now names the
+  // other's territory explicitly, because a boundary stated from one side only
+  // is not a boundary.
   description:
-    "Save or update one of the user's stated preferences in long-term memory. " +
-    "Call this ONLY when the user explicitly states a preference (\"I prefer…\", \"I like…\", " +
-    "\"always…\", \"from now on…\") or directly asks you to remember something. NEVER infer a " +
-    "preference from what the user does, asks about, or seems to want — if they did not say it, " +
-    "do not save it. 'topic' is a short key such as \"coffee\" or \"wake time\"; 'value' is the " +
-    "preference in plain language. When you are updating a preference that already exists, reuse " +
-    "the EXACT topic name shown for it in the saved preferences block, so the update replaces the " +
-    "old value instead of creating a second, near-duplicate topic. " +
+    "Save or update a preference: something about the USER or how they want you to behave. " +
+    "Call it only when they state one (\"I prefer…\", \"I like…\", \"always…\", \"from now on…\"). " +
+    "A fact, a decision, or work in progress is NOT a preference — write those with save_note. " +
+    "Never infer a preference from what the user asks about. 'topic' is a short key such as " +
+    "\"coffee\"; when updating, reuse the EXACT topic from the saved preferences block so the " +
+    "update replaces it instead of forking a near-duplicate. " +
     CATEGORY_HINT +
-    " After calling this, always tell the user in one short sentence what you saved or updated.",
+    " Afterwards tell the user in one short sentence what you saved.",
   inputSchema: {
     type: "object",
     properties: {
       topic: {
         type: "string",
         description:
-          "Short key for the preference, e.g. \"coffee\". Reuse the existing topic name exactly when updating.",
+          "Short key, e.g. \"coffee\". Reuse the existing one exactly when updating.",
       },
       value: {
         type: "string",
@@ -71,7 +79,7 @@ export const rememberPreferenceTool: Tool = {
       },
       category: {
         type: "string",
-        description: `Optional grouping. ${CATEGORY_HINT} Defaults to the existing category when updating, otherwise general.`,
+        description: `Optional grouping. ${CATEGORY_HINT}`,
       },
     },
     required: ["topic", "value"],

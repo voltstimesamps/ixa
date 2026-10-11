@@ -1,3 +1,4 @@
+import os from "os"
 import path from "path"
 import * as dotenv from "dotenv"
 dotenv.config()
@@ -146,8 +147,35 @@ export const config = {
     indexRetryMs: parseInt(process.env.IXA_EPISODE_INDEX_RETRY_MS ?? "300000"),
     searchLimit: parseInt(process.env.IXA_MEMORY_SEARCH_LIMIT ?? "5"),
   },
-  obsidian: {
-    vaultPath: process.env.OBSIDIAN_VAULT_PATH ?? "",
+  notes: {
+    // Ixa's notebook. SHE is the only writer: the markdown files are the
+    // source of truth, and the note/chunk rows in SQLite plus the Qdrant
+    // collection are both rebuildable from them.
+    //
+    // Default OUTSIDE the repo. `||` not `??`, so a bare OBSIDIAN_VAULT_PATH=
+    // line copied from .env.example falls back rather than resolving to "" —
+    // which would put the vault at the process CWD and write notes into
+    // whatever directory Ixa happened to be started from. Kept under the old
+    // variable name because that is what .env.example already documents.
+    vaultPath: process.env.OBSIDIAN_VAULT_PATH || path.join(os.homedir(), "Ixa-Vault"),
+    // A SECOND collection, never the episode one. Note vectors and episode
+    // vectors answer different questions and are filtered differently.
+    collection: process.env.IXA_NOTES_COLLECTION || "ixa_notes",
+    // Chunking, in proxy tokens (chars / 4 — see note-chunks.ts for why there
+    // is no tokenizer). A section under the floor merges into its neighbour; a
+    // group over the ceiling splits on paragraph boundaries.
+    minTokens: parseInt(process.env.IXA_NOTE_CHUNK_MIN_TOKENS ?? "150"),
+    maxTokens: parseInt(process.env.IXA_NOTE_CHUNK_MAX_TOKENS ?? "400"),
+    // How many notes a search returns. Three, and NO SCORE FLOOR: measured
+    // over 19 questions against 24 notes, text that answered the question
+    // scored as low as 0.586 while text from an unrelated note reached 0.755,
+    // so the bands overlap completely and any threshold cuts real answers.
+    // The tool result tells the model the hits may be unrelated instead.
+    searchLimit: parseInt(process.env.IXA_NOTE_SEARCH_LIMIT ?? "3"),
+    // Whole-budget cap on embed + search for one search_notes call. Looser
+    // than recall's 300ms because this one is a tool the user asked for, not
+    // an automatic step in front of every turn.
+    searchTimeoutMs: parseInt(process.env.IXA_NOTE_SEARCH_TIMEOUT_MS ?? "3000"),
   },
   homeAssistant: {
     url: process.env.HA_URL ?? "",

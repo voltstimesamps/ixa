@@ -156,3 +156,221 @@ export function priceCorrectionPrompt(amounts: string[]): string {
     "theirs to repeat."
   )
 }
+
+// ---------------------------------------------- the same price, as a NUMBER
+//
+// Phase 3d needs a different question answered. The guard above asks "did the
+// model state a price without searching", over a draft reply. A note asks
+// "is this figure one the user gave me, or one a search returned" — and that
+// comparison cannot be made on text.
+//
+// The spike is the proof. The user said "like six hundred bucks"; the model
+// wrote "A used RTX 3090 is currently selling for about $600". Those are the
+// same figure and share not one character, so a substring check waves a
+// fabricated price through exactly as readily as a faithful one. What is
+// compared is therefore a value and a currency.
+//
+// WHY THIS MATTERS MORE FOR A NOTE THAN FOR A REPLY. The guard above inspects
+// the draft reply, so a price inside a save_note ARGUMENT never reaches it: a
+// tool call is not a reply. An unguarded note would put the figure on disk,
+// where a later search hands it back as something Ixa recorded, long after
+// the conversation that could have corrected it is gone.
+
+export interface NormalizedAmount {
+  // The text as it was written, for quoting back.
+  text: string
+  value: number
+  // A coarse bucket, not a currency code with FX: "$5" and "5 dollars" are
+  // the same figure, "$5" and "5 cents" are not. Nothing here converts
+  // between currencies, because two figures in different currencies are never
+  // the same stated price.
+  currency: string
+}
+
+const SYMBOL_CURRENCY: Record<string, string> = {
+  $: "USD",
+  "£": "GBP",
+  "€": "EUR",
+  "¥": "JPY",
+  "₹": "INR",
+}
+
+const WORD_CURRENCY: Array<[RegExp, string]> = [
+  [/\b(?:dollars?|usd|bucks)\b/i, "USD"],
+  [/\b(?:pounds? sterling|gbp|quid)\b/i, "GBP"],
+  [/\b(?:euros?|eur)\b/i, "EUR"],
+  [/\byen\b/i, "JPY"],
+  [/\brupees?\b/i, "INR"],
+  [/\bcents?\b/i, "USD-cent"],
+  [/\bpence\b/i, "GBP-pence"],
+]
+
+// Every currency word in one pattern, for stripping it out of a spoken amount
+// before the number run is parsed. Longest first, so "pounds sterling" is
+// removed whole rather than leaving "sterling" behind.
+const CURRENCY_WORD_TOKENS =
+  /\b(?:pounds? sterling|dollars?|bucks|quid|euros?|rupees?|cents?|pence|yen|usd|gbp|eur)\b/gi
+
+const WORD_VALUES: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
+  nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30,
+  forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+}
+
+const WORD_SCALES: Record<string, number> = {
+  hundred: 100, thousand: 1000, million: 1e6, billion: 1e9, trillion: 1e12,
+}
+
+// "one thousand three hundred sixty" -> 1360. Returns null for a run with no
+// number in it at all, which is how a vague quantifier ("a few hundred") is
+// rejected: it names a scale but never a figure.
+function wordsToNumber(words: string[]): number | null {
+  let total = 0
+  let current = 0
+  let sawNumber = false
+
+  for (const word of words) {
+    if (word === "and" || word === "a" || word === "an") continue
+    const value = WORD_VALUES[word]
+    if (value !== undefined) {
+      current += value
+      sawNumber = true
+      continue
+    }
+    const scale = WORD_SCALES[word]
+    if (scale === undefined) return null
+    // A bare scale counts: "a thousand dollars" is a figure, and only the
+    // leading "a" stands between it and one. What still returns null is an
+    // UNKNOWN word, which is what "a few hundred dollars" trips on.
+    sawNumber = true
+    if (scale === 100) {
+      current = (current || 1) * 100
+    } else {
+      total += (current || 1) * scale
+      current = 0
+    }
+  }
+
+  if (!sawNumber) return null
+  return total + current
+}
+
+// Thousands separators are not just commas — the model writes a NARROW
+// NO-BREAK SPACE at least as often (see SEPARATOR above), and a plain space
+// too. Stripped before parsing; a trailing k or m is a multiplier.
+function digitsToNumber(raw: string): number | null {
+  const cleaned = raw.replace(/[,    ]/g, "")
+  const match = /^(\d+(?:\.\d+)?)([kKmM]?)$/.exec(cleaned)
+  if (!match) return null
+  const value = parseFloat(match[1]!)
+  if (Number.isNaN(value)) return null
+  const suffix = match[2]!.toLowerCase()
+  return suffix === "k" ? value * 1000 : suffix === "m" ? value * 1e6 : value
+}
+
+// One amount, as findCurrencyAmounts returned it, to {value, currency}.
+// Null when it is not a determinate figure — a vague quantifier, or a shape
+// this does not understand. Null NEVER means "allowed": the caller falls back
+// to comparing the text.
+export function normalizeAmount(amount: string): NormalizedAmount | null {
+  const text = amount.trim()
+
+  let currency: string | null = null
+  const symbol = Object.keys(SYMBOL_CURRENCY).find((s) => text.includes(s))
+  if (symbol) currency = SYMBOL_CURRENCY[symbol]!
+  if (!currency) {
+    for (const [pattern, code] of WORD_CURRENCY) {
+      if (pattern.test(text)) {
+        currency = code
+        break
+      }
+    }
+  }
+  if (!currency) return null
+
+  // Digits win when both are present: "$600" is the figure, not a stray word.
+  const digits = /\d[\d,.    ]*[kKmM]?/.exec(text)
+  if (digits) {
+    const value = digitsToNumber(digits[0]!.trim())
+    return value === null ? null : { text, value, currency }
+  }
+
+  // The currency word has to come out before the number run is parsed, or
+  // "six hundred bucks" dies on "bucks". A vague quantifier is deliberately
+  // left in, because an unknown word is what makes wordsToNumber reject
+  // "a few hundred dollars" as the non-figure it is.
+  const words = text
+    .toLowerCase()
+    .replace(CURRENCY_WORD_TOKENS, " ")
+    .split(/[\s\-]+/)
+    .filter(Boolean)
+  const value = wordsToNumber(words)
+  return value === null ? null : { text, value, currency }
+}
+
+// Which amounts in `text` are NOT backed by anything in `evidence`.
+//
+// Evidence is the user's own words this turn plus the results of any
+// web_search that actually ran in it. Two ways for an amount to pass:
+//
+//   1. Its normalised value and currency appear in the evidence. This is the
+//      one that matters: it is what lets the user say "six hundred bucks" and
+//      the model write "$600".
+//   2. Its text appears verbatim, case-insensitively. This covers the figures
+//      that have no determinate value — "a few hundred dollars" — where
+//      repeating the user's own hedge is faithful and inventing one is not.
+//
+// Deliberately an EXACT value match, with no tolerance. "Six hundred" written
+// back as $599 is a different figure, and a guard that rounded would be
+// deciding how wrong a price is allowed to be.
+export function unsupportedAmounts(text: string, evidence: string[]): string[] {
+  const stated = findCurrencyAmounts(text)
+  if (stated.length === 0) return []
+
+  const haystack = evidence.join("\n")
+  const lowerHaystack = haystack.toLowerCase()
+  const supported = new Set(
+    findCurrencyAmounts(haystack)
+      .map(normalizeAmount)
+      .filter((a): a is NormalizedAmount => a !== null)
+      .map((a) => `${a.currency} ${a.value}`)
+  )
+
+  const unsupported: string[] = []
+  for (const amount of stated) {
+    const normalized = normalizeAmount(amount)
+    if (normalized && supported.has(`${normalized.currency} ${normalized.value}`)) continue
+    if (lowerHaystack.includes(amount.toLowerCase())) continue
+    if (!unsupported.includes(amount)) unsupported.push(amount)
+  }
+  return unsupported
+}
+
+// What a tool says when it refuses to write a figure nobody gave it.
+//
+// It names the amounts and offers both ways out, unlike priceCorrectionPrompt
+// above, which deliberately asks for the search and nothing else. The
+// difference is what the model is in the middle of: a reply has to say
+// something about the price, so offering "or omit it" got the vaguer answer
+// almost every time. A note does not — a note with the price left out is a
+// perfectly good note, and the sentence that mentions the search result can
+// come later.
+export function priceRefusal(amounts: string[], toolName: string): string {
+  const plural = amounts.length !== 1
+  return (
+    `Nothing was saved. The ${plural ? "figures" : "figure"} ${amounts.join(", ")} ` +
+    `${plural ? "are" : "is"} not in anything the user said in this conversation and did not ` +
+    `come from a web_search in this turn, so ${plural ? "they are" : "it is"} from memory and ` +
+    `may be wrong — and a wrong price written into a note is read back later as a measurement. ` +
+    `Either call web_search now and use what it returns, or call ${toolName} again with the ` +
+    `${plural ? "figures" : "figure"} left out. Do not guess.`
+  )
+}
+
+// Appended by CODE to a note that states a price, never asked of the model.
+// A figure in a note has no conversation around it to date it, so it carries
+// its own date: a reader a year later sees a price AND when it was true.
+export function priceAsOfLine(date: string): string {
+  return `_Prices as stated on ${date}; they may be out of date._`
+}

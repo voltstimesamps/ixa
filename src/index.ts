@@ -12,6 +12,8 @@ import { getEpisodeStore } from "./memory/episodes"
 import { OllamaEmbedder } from "./memory/embeddings"
 import { QdrantIndex } from "./memory/qdrant"
 import { EpisodicMemory, setEpisodicMemory } from "./memory/episodic-memory"
+import { getNoteStore } from "./memory/notes"
+import { Notebook, setNotebook } from "./memory/notebook"
 import { SqliteSessionStore } from "./core/sqlite-session-store"
 
 async function main() {
@@ -23,14 +25,32 @@ async function main() {
   const preferences = getPreferenceStore()
   console.log(`Preferences: ${preferences.listActive().length} active`)
 
+  // One embedder, two consumers: episodes and notes embed into the same
+  // vector space with the same model, and a second instance would only mean a
+  // second warm-up.
+  const embedder = new OllamaEmbedder()
+
   // Episodic memory. Qdrant and Ollama are optional at runtime: if either is
   // missing, Ixa logs one warning and runs without recall.
   const memory = new EpisodicMemory({
     store: getEpisodeStore(),
-    embedder: new OllamaEmbedder(),
+    embedder,
     index: new QdrantIndex(),
   })
   setEpisodicMemory(memory)
+
+  // Ixa's notebook, in a SECOND Qdrant collection. Its payload indexes differ
+  // from the episode collection's: notes filter on `status` so a superseded
+  // note cannot outrank its replacement, which measurement showed it does.
+  const notebook = new Notebook({
+    store: getNoteStore(),
+    embedder,
+    index: new QdrantIndex({
+      collection: config.notes.collection,
+      payloadIndexes: [{ field: "status", schema: "keyword" }],
+    }),
+  })
+  setNotebook(notebook)
 
   // One manager owns every session. Sessions outlive the connections attached
   // to them, so a client can drop and reconnect without losing context.
@@ -59,6 +79,10 @@ async function main() {
   // Probe Qdrant/Ollama, warm the embedding model and drain any episodes that
   // were saved while they were down. Never fatal.
   await memory.start()
+  // Same for the notebook: the collection is created if missing, and any note
+  // whose chunks were written while Qdrant was down is indexed now. A note on
+  // disk with no vector is unsearchable, never lost.
+  await notebook.start()
 
   // After the handlers are registered, so a session that expired while the
   // backend was down still fires onSessionEnd (and gets summarized).

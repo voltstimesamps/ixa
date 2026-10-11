@@ -21,6 +21,22 @@ Run them against a backend already started with `npm run dev`.
   `--dry-run` prints it first and deletes nothing. If Qdrant is unreachable the
   SQLite row still goes, which is what makes the episode unreachable; the stale
   vector is cleaned up by recall or by the next rebuild.
+- `rebuild-note-index.ts` — drops the notes Qdrant collection and re-embeds every chunk
+  row from SQLite. The CHEAP half of a notes rebuild: for notes the markdown file is the
+  source of truth, so `vault -> SQLite` (the reconcile scan) is a separate, later thing.
+  Run it after an embedding-model change, a Qdrant data loss, or when a search returns
+  something the vault does not say — including the case the notebook logs loudly, a note
+  marked superseded in SQLite whose vectors still say `active`.
+- `notes-verify.ts` — the Phase 3d step 2 acceptance run: the step-1 spike's ten writer
+  requests driven through the REAL registered tools, plus a routing set in BOTH directions
+  (a note must not become a preference, and a preference must not become a note). Writes
+  real markdown, real rows and real vectors — into a throwaway vault, database and
+  collection under `/tmp/ixa-notes-verify`, asserted to differ from the configured ones
+  before anything runs. `remember_preference` IS executed, which is what makes reverse
+  routing measurable. `web_search` is stubbed unless `--live-search`. Seeds two notes first
+  so the supersede and duplicate probes can actually fail. Writes
+  `notes-verify-report.md`; `--cleanup` drops the collection and the temp vault. Needs
+  Ollama, Qdrant and Groq, not the backend.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping
@@ -48,6 +64,9 @@ Usage:
     IXA_DB_PATH=data/phase3b-verify.db npx tsx dev/scripts/phase3b-verify.ts prefs
     IXA_DB_PATH=data/phase3b-verify.db npx tsx dev/scripts/phase3b-verify.ts window
     npx tsx dev/scripts/rebuild-episode-index.ts
+    npx tsx dev/scripts/rebuild-note-index.ts
+    npx tsx dev/scripts/notes-verify.ts
+    npx tsx dev/scripts/notes-verify.ts --cleanup
     npx tsx dev/scripts/forget-episode.ts 12 --dry-run
     npx tsx dev/scripts/tts-abort.ts            # expect the one-line disconnect
     npx tsx dev/scripts/tts-abort.ts complete   # control: expect "done: N chunk(s)"
