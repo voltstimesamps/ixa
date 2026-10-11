@@ -3,8 +3,10 @@ import path from "path"
 import { randomUUID } from "crypto"
 import {
   chat as defaultChat,
+  isParsingFailure,
   isToolChoiceRejection,
   LLMDeadlineError,
+  logFailedGeneration,
   type LLMResponse,
   type Message,
   type ToolCall,
@@ -265,6 +267,22 @@ export function turnFailureReply(err: unknown): string {
 export function emptyReplyRecord(toolCalls: number): string {
   const calls = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`
   return `${EMPTY_REPLY_FALLBACK} [no reply was produced after ${calls}]`
+}
+
+// The same, for a turn the provider could not parse twice.
+//
+// The spoken words are EMPTY_REPLY_FALLBACK's, because from where the user is
+// sitting it is the same event — they asked, they heard nothing, they can ask
+// again — and inventing a second apology for a provider-side parse failure
+// would be a distinction drawn for the machine's benefit. The bracketed note
+// is where the difference belongs: it is read by the model, and "could not be
+// parsed" is a different thing to have happened from "returned no content".
+export function parsingFailureRecord(toolCalls: number): string {
+  const calls = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`
+  return (
+    `${EMPTY_REPLY_FALLBACK} [no reply was produced after ${calls}: the model's output ` +
+    `could not be parsed, twice]`
+  )
 }
 
 // The same, for a turn whose budget ran out and whose wind-up call could not
@@ -818,6 +836,11 @@ export class Session {
     // model that calls a tool on a call that has none, twice, having been told
     // plainly that the attempt is rejected, is not going to stop on the third.
     let noToolCallRetryUsed = false
+    // The unparseable-output retry, once. Same reasoning as withArgumentRetry:
+    // the request was fine and the sampled tokens were not, so the fix is
+    // another sample — and a third sample of a request the provider has
+    // refused to parse twice is a loop, not a strategy.
+    let parsingRetryUsed = false
     // Tool calls spent against the per-turn budget, parallel ones counted
     // individually. A call the user declined, one the search cap refused and
     // one that timed out all count — each reached the registry or the user.
@@ -906,6 +929,33 @@ export class Session {
               `delivering the ${budgetSpent ? "budget" : "empty reply"} fallback`
           )
           return budgetSpent ? BUDGET_EXHAUSTED_FALLBACK : EMPTY_REPLY_FALLBACK
+        }
+
+        // Output the provider could not parse at all. Ordered BEFORE the
+        // malformed-tool-call list below, which matches the words "parsing
+        // failed" and used to swallow this: that list's lever is to drop the
+        // tools, and dropping the tools is the wrong answer to a sampling
+        // fluke — it changes what the model is allowed to do instead of
+        // getting another sample of what it was asked. Live, the no-tools
+        // retry failed in exactly the same way and the turn died with seven
+        // tool calls of work already done.
+        //
+        // So: the SAME call again, once, with nothing changed. Then a
+        // fallback, because a provider that has refused to parse the same
+        // request twice will refuse it a third time.
+        if (isParsingFailure(err)) {
+          logFailedGeneration(err)
+          if (!parsingRetryUsed) {
+            parsingRetryUsed = true
+            console.log(`llm retry, same call: ${msg}`)
+            continue
+          }
+          const record = parsingFailureRecord(toolCallsThisTurn)
+          this.messages.push({ role: "assistant", content: record })
+          console.warn(
+            `parsing failed twice after ${toolCallsThisTurn} tool calls — delivering the fallback`
+          )
+          return EMPTY_REPLY_FALLBACK
         }
 
         if (!retrying && (

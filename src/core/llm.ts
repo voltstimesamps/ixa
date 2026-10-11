@@ -172,6 +172,71 @@ export function isToolChoiceRejection(err: unknown): boolean {
   return TOOL_CHOICE_REJECTION.test(err.message)
 }
 
+// A FOURTH rejection of the model's output, and the one that reads least like
+// one. Groq, on openai/gpt-oss-*, returns a 400 when it cannot parse the
+// model's harmony output into tool calls at all:
+//
+//   Parsing failed. The model generated output that could not be parsed.
+//   Please adjust your prompt or try again. See 'failed_generation' for
+//   the raw output.
+//
+// Measured live: it ended a turn that had already made seven tool calls. It
+// was not unhandled — the session's malformed-tool-call list matches the words
+// "parsing failed", so the turn DID retry — but that retry drops the tools,
+// which is the wrong lever for a sampling fluke, and when the second attempt
+// failed the same way there was nothing behind it and the turn died.
+//
+// Distinguished from isArgumentRejection by the shape of the complaint: that
+// one is a tool call the provider could read and reject against a schema, this
+// one is output it could not read at all, and the remedy is another sample of
+// the SAME request. Both phrases are required, so an unrelated 400 — a bad
+// parameter, a context-length error — does not match.
+const PARSING_FAILURE = /parsing failed/i
+const FAILED_GENERATION = /failed_generation/i
+
+export function isParsingFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  if (err instanceof LLMDeadlineError) return false
+  // A schema rejection is a different 400 and has already had its one retry
+  // inside withArgumentRetry below; it must not get a second one here.
+  if (isArgumentRejection(err)) return false
+  return PARSING_FAILURE.test(err.message) && FAILED_GENERATION.test(err.message)
+}
+
+// How much of the raw generation goes in the log. Enough to tell a malformed
+// tool call from harmony control tokens from ordinary prose, not so much that
+// one bad turn fills the terminal.
+const FAILED_GENERATION_LOG_CHARS = 300
+
+// The raw output the provider could not parse, if it sent it.
+//
+// The SDK puts the response body's `error` object on `err.error`, so Groq's
+// `failed_generation` lands there beside `message` and `code`. Nothing else in
+// the codebase reads it, and nothing branches on it: this exists only so the
+// NEXT occurrence is diagnosable. When this failure was first seen, the whole
+// record of it was 80 characters of truncated message in a history row, which
+// said nothing about what the model had actually produced.
+export function failedGeneration(err: unknown): string | null {
+  const body = (err as { error?: { failed_generation?: unknown } }).error
+  const raw = body?.failed_generation
+  return typeof raw === "string" && raw.length > 0 ? raw : null
+}
+
+export function logFailedGeneration(err: unknown): void {
+  const raw = failedGeneration(err)
+  if (!raw) {
+    console.log("llm parsing failure: the provider sent no failed_generation to show")
+    return
+  }
+  const shown =
+    raw.length > FAILED_GENERATION_LOG_CHARS
+      ? `${raw.slice(0, FAILED_GENERATION_LOG_CHARS)}… (${raw.length} chars)`
+      : raw
+  // Newlines flattened: harmony output is full of them and a log line that
+  // wraps forty times is a log nobody reads.
+  console.log(`llm parsing failure, failed_generation: ${shown.replace(/\s*\n\s*/g, " ⏎ ")}`)
+}
+
 // Exported for the tests: the retry has to be provable without a network.
 export async function withArgumentRetry<T>(run: () => Promise<T>): Promise<T> {
   try {
