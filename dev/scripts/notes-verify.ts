@@ -74,7 +74,12 @@ const WRITER_PROBES: Probe[] = [
   {
     id: 1,
     testing: "a clear new decision: right type, specific title, searched first, nothing invented",
-    text: "so we decided we're going with tavily for search instead of brave, write that down somewhere",
+    // NOT the search provider, which the seeds already cover: against a
+    // seeded note this stopped testing a plain write and started testing
+    // duplicate avoidance (it searched, found the seeded Tavily note, said "I
+    // have already saved that" and wrote nothing — correct, but probe 6 is
+    // where that belongs). TTS is seeded nowhere.
+    text: "so we decided we're going with kokoro for the voice instead of piper, write that down somewhere",
     expect: "search_notes then save_note, type decision",
   },
   {

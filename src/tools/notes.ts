@@ -43,29 +43,16 @@ import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 const SAVE_NOTE_DESCRIPTION =
   "Write a note in your notebook: a FACT, a DECISION and why it was made, or ongoing WORK. " +
-  // A CLAUSE CLAIMING THE VERB WAS TRIED HERE, TWICE, AND IS NOT SHIPPED:
-  //
-  //   "Remember that ..." is this tool when what follows is a fact or a
-  //   decision.                                                    (+76 chars)
-  //
-  // It is the only thing measured to fix the reverse-routing failure —
-  // "remember that the stt sidecar uses base.en, not small" reached save_note
-  // in both runs that had it, and in none of the four without — but it cost a
-  // case each time, and both costs were the same shape: a thing the user said
-  // was not recorded. With the clause, "from now on keep your spoken answers
-  // really short" made NO tool call and replied "Got it", storing nothing.
-  //
-  // Note what the comparison runs showed about the other candidate
-  // regression: "make a note to always answer in metric" writes a redundant
-  // note with the clause AND without it, on a clean vault, so that one is not
-  // the clause's fault. This model's routing is noisy enough that one run per
-  // state cannot separate a 76-character description change from sampling —
-  // except on request 12, where 0/4 against 2/2 is the clearest signal in the
-  // set. Settling it needs repeated runs per state, not another clause.
-  //
-  // Evidence: dev/scripts/notes-verify-report.md (shipped) and
-  // notes-verify-report-routing-clause.md (with the clause), same seed, both
-  // on a clean vault.
+  // THIS CLAUSE CLAIMS THE VERB, and it is the only thing measured to fix the
+  // reverse-routing failure. Measured: "remember that the stt sidecar uses
+  // base.en, not small" was filed as a PREFERENCE in 4 runs of 4 without this
+  // clause, and wrote a reference note in 2 of 2 with it. The cost seen once,
+  // in a single run: "from now on keep your spoken answers really short" made
+  // no tool call at all and replied "Got it" having stored nothing. Routing is
+  // noisy enough that one run per state is suggestive, not conclusive — see
+  // ARCHITECTURE.md, which carries the per-probe table and the condition for
+  // reverting this.
+  "\"Remember that ...\" is this tool when what follows is a fact or a decision. " +
   "Not how the user wants you to behave — that is remember_preference. " +
   "Call search_notes first, every time: if a note already covers this, set 'supersedes' to its " +
   "id rather than writing a second note that disagrees with the first. Write only what the user " +
