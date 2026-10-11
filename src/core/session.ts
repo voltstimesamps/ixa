@@ -254,6 +254,27 @@ export function emptyReplyRecord(toolCalls: number): string {
 const NOT_EXECUTED =
   "not executed: the turn failed before this tool ran. Nothing happened."
 
+// The same shape for a call the per-turn budget could not pay for. A sibling
+// of NOT_EXECUTED rather than NOT_EXECUTED itself, because that one says "the
+// turn failed" and this turn did not fail: it is still running and is about to
+// answer. A tool result that reads as a fault is an invitation to retry, which
+// is the behaviour the cap exists to stop — the same reasoning as
+// searchCapReached below.
+const NOT_EXECUTED_OVER_BUDGET =
+  "not executed: this turn's tool-call limit was reached before this call ran. Nothing " +
+  "happened, nothing is wrong, and the tool is working. Do not try it again in this turn."
+
+// Injected for ONE call when the tool-call budget is spent, and never stored:
+// it is a statement about this call, not something that was said. Paired with
+// passing no tools on that call, so the instruction and what is possible agree
+// — a model told to answer while still holding tools reaches for one.
+function toolBudgetSpentPrompt(limit: number): string {
+  return (
+    `You have used all ${limit} tool calls for this turn. Answer with what you found, or ` +
+    `say plainly what you could not find out.`
+  )
+}
+
 // What a tool result says when the per-turn search cap is reached.
 //
 // It must not read as a failure. A result that looks like a broken search is
@@ -390,6 +411,10 @@ export class Session {
   // history — see priceCorrectionPrompt.
   private priceCorrection: string | null = null
 
+  // The tool-budget notice, set for the calls made after the budget is spent.
+  // Same single-field, never-stored reasoning as priceCorrection.
+  private toolBudgetNotice: string | null = null
+
   // Set when a tool asked for this conversation to end (start_new_conversation).
   // Read and cleared by the manager at the turn boundary: ending the session
   // mid-turn would pull the history out from under the tool loop that is still
@@ -469,6 +494,7 @@ export class Session {
           } finally {
             this.recalled = null
             this.priceCorrection = null
+            this.toolBudgetNotice = null
           }
         }
       )
@@ -560,6 +586,10 @@ export class Session {
 
     if (origin === "voice") {
       messages = [...messages, { role: "system", content: VOICE_RESPONSE_PROMPT }]
+    }
+
+    if (this.toolBudgetNotice) {
+      messages = [...messages, { role: "system", content: this.toolBudgetNotice }]
     }
 
     // Last, so it is the most recent thing the model is told: it is a
@@ -675,8 +705,9 @@ export class Session {
     // price now.
     let searchedThisTurn = false
     // How many have run, for the per-turn cap. Counted rather than flagged
-    // because the loop caps ITERATIONS at 10 and one iteration may carry any
-    // number of parallel calls — so the bound has to be on the calls.
+    // because the loop bounds ITERATIONS and one iteration may carry any
+    // number of parallel calls — so the bound has to be on the calls. The
+    // generic budget below is the same argument applied to every tool.
     let searchesThisTurn = 0
     // The price guard retries once and once only. A model that states prices
     // twice is not going to stop on the third ask, and a loop here would spend
@@ -684,19 +715,50 @@ export class Session {
     let priceGuardUsed = false
     // The empty-reply retry, once per turn for the same reason.
     let emptyRetryUsed = false
-    // Tool calls issued this turn, parallel ones counted individually. Read by
-    // the empty-reply record, so a turn that said nothing after nine calls
-    // says so.
+    // Tool calls spent against the per-turn budget, parallel ones counted
+    // individually. A call the user declined, one the search cap refused and
+    // one that timed out all count — each reached the registry or the user.
+    // A call the budget could not pay for does not, because it never existed.
+    // Also read by the empty-reply record, so a turn that said nothing after
+    // nine calls says so.
     let toolCallsThisTurn = 0
+    const callBudget = config.tools.maxToolCallsPerTurn
+    let budgetNoticeLogged = false
 
-    for (let i = 0; i < 10; i++) {
+    // AN ITERATION IS NOT A CALL, which is why this is no longer the limit.
+    //
+    // It was a hard-coded 10, and the live turn that prompted all this made
+    // nine single-call iterations — one iteration short of a ceiling that
+    // would have ended it in the failure apology. A turn that answers after
+    // every call needs one iteration per call plus one to answer in, and the
+    // malformed-tool-call, price-guard and empty-reply retries each spend an
+    // iteration while making no call at all. So the iteration bound sits well
+    // above the call budget: the call budget is the limit that is meant to
+    // bind, and this one exists only so a loop that makes no progress cannot
+    // spin forever.
+    const maxIterations = (callBudget > 0 ? callBudget : 20) + 5
+
+    for (let i = 0; i < maxIterations; i++) {
+      // Once the budget is spent, every remaining call goes out with no tools
+      // and with one line saying so. Both halves matter: a model told to
+      // answer while still holding tools reaches for one.
+      const budgetSpent = callBudget > 0 && toolCallsThisTurn >= callBudget
+      this.toolBudgetNotice = budgetSpent ? toolBudgetSpentPrompt(callBudget) : null
+      if (budgetSpent && !budgetNoticeLogged) {
+        budgetNoticeLogged = true
+        console.log(
+          `tool budget: all ${callBudget} tool calls used this turn — ` +
+            `asking for an answer with no tools`
+        )
+      }
+
       // On retry after a malformed tool call, pass no tools — forces a plain text response
       let response: LLMResponse
       // Built once and kept, so the empty-reply diagnostic below describes the
       // array that was actually sent rather than a second, rebuilt one.
       const sent = this.messagesForCall(origin)
       try {
-        response = await this.chat(sent, retrying ? [] : tools)
+        response = await this.chat(sent, retrying || budgetSpent ? [] : tools)
       } catch (err) {
         // A deadline is never a malformed tool call, and asking again without
         // tools would just spend the budget twice.
@@ -818,18 +880,48 @@ export class Session {
           function: { name: tc.name, arguments: tc.arguments },
         })),
       })
+      // How many of this group the remaining budget can pay for.
+      //
+      // A group is issued whole by the model and must be ANSWERED whole — an
+      // assistant tool_calls message with a missing result is rejected by the
+      // API — but it does not have to be RUN whole. The calls past the budget
+      // get the over-budget placeholder instead of an execution, in the same
+      // loop, so the group is complete either way and nothing special happens
+      // to history. Without this, a single iteration of parallel calls could
+      // walk straight past a budget that is checked only between iterations.
+      const affordable =
+        callBudget > 0
+          ? Math.min(response.calls.length, Math.max(0, callBudget - toolCallsThisTurn))
+          : response.calls.length
       // Counted here rather than per execution: a call the user declined, one
-      // the cap refused and one that timed out were all still calls the model
-      // chose to make. A discarded iteration (unparseable arguments, above)
-      // never reaches this line and is not counted, because none of its calls
-      // is in history.
-      toolCallsThisTurn += response.calls.length
+      // the search cap refused and one that timed out were all still calls
+      // that reached the registry or the user. A discarded iteration
+      // (unparseable arguments, above) never reaches this line, and a call the
+      // budget could not pay for is not counted because it never ran.
+      toolCallsThisTurn += affordable
 
       // Which calls in this group already have their result in history. The
       // group is only valid once every call does — see completeToolGroup.
       const answered = new Set<string>()
       try {
-        for (const tc of response.calls) {
+        for (const [index, tc] of response.calls.entries()) {
+          if (index >= affordable) {
+            this.messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: NOT_EXECUTED_OVER_BUDGET,
+            })
+            answered.add(tc.id)
+            logToolCall(
+              tc.name,
+              "over-budget",
+              Date.now(),
+              tc.arguments,
+              `all ${callBudget} tool calls for this turn were already used`
+            )
+            continue
+          }
+
           const tool = registry.get(tc.name)
           let result: string
           // Whether the tool actually ran, as opposed to being unknown,
@@ -932,6 +1024,10 @@ export class Session {
       }
     }
 
-    throw new Error("Tool call limit (10) reached")
+    // Not the tool-call cap — that one ends in an answer, above. Reaching this
+    // means the loop made `maxIterations` LLM calls without ever producing
+    // text, which no normal turn can do: it is the runaway guard, and a
+    // runaway is a failed turn.
+    throw new Error(`LLM call limit (${maxIterations} calls in one turn) reached`)
   }
 }

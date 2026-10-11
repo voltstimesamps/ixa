@@ -51,6 +51,19 @@ export const config = {
     // evicting the turn that gathered them, and the model searches again for
     // what it can no longer see. Set to 0 to turn the cap off.
     maxSearchesPerTurn: parseInt(process.env.IXA_MAX_SEARCHES_PER_TURN ?? "3"),
+    // How many tool calls of ANY kind one turn may run, parallel calls counted
+    // individually. The tool loop used to bound ITERATIONS at a hard-coded 10,
+    // which is the wrong unit twice over: one iteration can carry any number
+    // of parallel calls, and a turn that answers after each call spends an
+    // iteration per call, so a nine-call live turn was one iteration from a
+    // ceiling it could not see.
+    //
+    // 15 because the live turn that found this needed nine calls to fail at
+    // finding one file, and a legitimate multi-step turn (search, read, note)
+    // is well under it. Reaching it is not an error: the last call is made
+    // with no tools and a line saying the budget is spent, so the turn ends in
+    // an answer rather than an apology. Set to 0 to turn the cap off.
+    maxToolCallsPerTurn: parseInt(process.env.IXA_MAX_TOOL_CALLS_PER_TURN ?? "15"),
   },
   confirm: {
     // How long a confirmation prompt stays answerable before it is treated as
