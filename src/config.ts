@@ -52,6 +52,17 @@ export const config = {
     // what it can no longer see. Set to 0 to turn the cap off.
     maxSearchesPerTurn: parseInt(process.env.IXA_MAX_SEARCHES_PER_TURN ?? "3"),
   },
+  confirm: {
+    // How long a confirmation prompt stays answerable before it is treated as
+    // a no. 60s, not 30: the old 30 was a hard-coded default in two confirmers
+    // and it is a person being asked a question, not a tool hanging — and the
+    // desktop client used to block its whole event loop on a stdin read, so a
+    // prompt that outlived the timeout was answered into a void. The deadline
+    // is now sent to the client (an optional `timeoutMs` on the `confirm`
+    // message) so it can show the time remaining and decline locally rather
+    // than leave the user typing at an expired prompt.
+    timeoutMs: parseInt(process.env.IXA_CONFIRM_TIMEOUT_MS ?? "60000"),
+  },
   voice: {
     enabled: process.env.VOICE_MODE === "true",
     ttsUrl: process.env.TTS_URL ?? "http://localhost:5001",
@@ -224,6 +235,16 @@ export const config = {
     // ~2000 chars is under a tenth of the default context budget.
     maxInjected: parseInt(process.env.IXA_PREFS_MAX_INJECTED ?? "40"),
     maxChars: parseInt(process.env.IXA_PREFS_MAX_CHARS ?? "2000"),
+  },
+  dev: {
+    // Tools that exist to exercise the harness, not to serve the user. Off by
+    // default: `echo` is one LLM-visible tool with a description that reads
+    // like a way to deliver a reply ("Echoes back the provided message"), and
+    // in live use the model called it to say something conversational — which
+    // tripped the confirmation gate for a plain sentence. It is also the only
+    // safe way to exercise that gate by hand, so it is kept behind a flag
+    // rather than deleted.
+    tools: process.env.IXA_DEV_TOOLS === "1",
   },
   sidecars: {
     // The harness spawns sidecars/{stt,tts}/main.py itself. Set false to run

@@ -14,6 +14,15 @@ import sounddevice as sd
 import websockets
 
 from audio_framing import FrameBuffer
+from confirmation import (
+    AlreadyExpired,
+    Chat,
+    ConfirmationRouter,
+    Expired,
+    Reply,
+    Reprompt,
+    Warning_,
+)
 from conversation import ConversationGate, ConversationState
 from recorder import SPEECH_PROB_THRESHOLD, VoiceActivityRecorder
 from vad import SileroVAD
@@ -153,6 +162,17 @@ async def main() -> None:
             wake_word_enabled=wakeword is not None,
         )
 
+        # The one place a typed line becomes either an answer or a message.
+        confirmations = ConfirmationRouter()
+
+        async def sendConfirmReply(reply: Reply) -> None:
+            await ws.send(json.dumps({
+                "type": "confirmReply",
+                "content": reply.content,
+                "requestId": reply.request_id,
+            }))
+            await gate.note_utterance_sent()
+
         async def finishPlayback() -> None:
             """Drain the playback queue and wait for the speaker to actually go
             quiet, then hand the conversation back to the user.
@@ -232,16 +252,24 @@ async def main() -> None:
                         # signal that returns us to LISTENING.
                         await finishPlayback()
                     elif msgType == "confirm":
-                        answer = input(f"\nConfirm: {msg.get('content')} (yes/no): ")
-                        await ws.send(json.dumps({
-                            "type": "confirmReply",
-                            "content": answer.strip().lower(),
-                            "requestId": msg.get("requestId")
-                        }))
+                        # PRINTS ONLY. This used to be a blocking input(),
+                        # which froze the whole event loop for the length of
+                        # the prompt — no audio, no timers, no wake word, no
+                        # pings — and raced sender()'s stdin reader for the
+                        # line the user typed. The answer now arrives through
+                        # sender(), the single owner of stdin, via the router.
+                        #
+                        # timeoutMs is optional: an older backend does not send
+                        # it and the router falls back to its own default.
+                        print(confirmations.prompt(
+                            msg.get("requestId", ""),
+                            msg.get("content", "(no description)"),
+                            msg.get("timeoutMs"),
+                        ))
                         # A confirmation prompt proves the backend is alive and
-                        # the turn is still running, and the answer starts the
-                        # wait over — otherwise a slow confirmation could trip
-                        # the response timeout mid-turn.
+                        # the turn is still running, so the wait starts over —
+                        # otherwise a slow confirmation could trip the response
+                        # timeout mid-turn.
                         await gate.note_utterance_sent()
                     elif msgType == "error":
                         print(f"Error: {msg.get('content')}")
@@ -281,14 +309,26 @@ async def main() -> None:
             await onSpeechEnd()
 
         async def sender() -> None:
+            # THE SINGLE OWNER OF STDIN. Nothing else may read fd 0: two
+            # readers race for one line, and the loser waits for a line the
+            # user thinks they already typed.
             pttTask: asyncio.Task | None = None
             pttStop: asyncio.Event | None = None
             while True:
-                text = await loop.run_in_executor(None, sys.stdin.readline)
-                text = text.strip()
-                if not text:
-                    continue
+                raw = await loop.run_in_executor(None, sys.stdin.readline)
+                if raw == "":
+                    # EOF, not a blank line: stdin is closed (piped input
+                    # exhausted, or no terminal at all). Nothing more will ever
+                    # arrive, so stop reading instead of spinning — and with a
+                    # confirmation open, spinning would re-print its "time
+                    # left" line on every iteration. Voice carries on; the
+                    # local deadline still answers a pending prompt.
+                    logger.info("stdin closed — no more typed input this session")
+                    return
+                text = raw.strip()
 
+                # Checked before the router so the recording toggle keeps
+                # working while a prompt is open; "yes"/"no" still answer it.
                 if RECORD_MODE == "ptt" and text == ":rec":
                     if pttTask is None:
                         pttStop = asyncio.Event()
@@ -300,7 +340,20 @@ async def main() -> None:
                         pttTask = None
                     continue
 
-                await ws.send(json.dumps({"type": "user", "content": text}))
+                # An empty line is a no-op in conversation, but with a prompt
+                # open it is how the user asks how long is left — so the
+                # router sees it either way.
+                routed = confirmations.line(text)
+                if isinstance(routed, Reply):
+                    await sendConfirmReply(routed)
+                    continue
+                if isinstance(routed, (Reprompt, AlreadyExpired)):
+                    print(routed.message)
+                    continue
+                if isinstance(routed, Chat) and not routed.text:
+                    continue
+
+                await ws.send(json.dumps({"type": "user", "content": routed.text}))
                 await gate.note_utterance_sent()
 
         async def micLoopVad() -> None:
@@ -347,6 +400,17 @@ async def main() -> None:
             while True:
                 await asyncio.sleep(TICK_INTERVAL_S)
                 await gate.tick()
+
+                # The local half of the confirmation deadline. Expiring here —
+                # a second inside the backend's own timer — means the user is
+                # TOLD the prompt closed, instead of typing into a request the
+                # backend has already declined in silence.
+                tocked = confirmations.tick()
+                if isinstance(tocked, Expired):
+                    print(tocked.message)
+                    await sendConfirmReply(tocked.reply)
+                elif isinstance(tocked, Warning_):
+                    print(tocked.message)
 
         tasks = [receiver(), sender(), conversationTicker()]
         if RECORD_MODE == "vad":

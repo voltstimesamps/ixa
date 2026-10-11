@@ -29,6 +29,27 @@ on this same machine.
 | `IXA_TRAILING_SILENCE_MS` | `1500` | How long the user has to pause before the utterance is considered finished and sent. Raise it if Ixa cuts you off mid-thought; lower it for snappier turns. (Smart Turn v3 will eventually replace this fixed timer.) |
 | `IXA_CONVERSATION_TIMEOUT_MS` | `20000` | How long Ixa keeps listening for a follow-up before the wake phrase is needed again. Runs **only** while waiting for the user to speak — never while Ixa is thinking or talking. |
 | `IXA_RESPONSE_TIMEOUT_MS` | `90000` | Safety net: how long to wait for a reply that never arrives before giving up on the turn and going back to sleep. Must stay comfortably above the slowest real tool-using turn. |
+| `IXA_CONFIRM_TIMEOUT_MS` | `60000` | **Fallback only.** The backend sends the real deadline with each confirmation prompt (`timeoutMs` on the `confirm` message); this is what to assume if it does not. The client expires one second early so its "no" lands while the request is still open. |
+
+## Answering a confirmation
+
+Some tools need a yes before they run (`shell_write` today). When one does, the
+prompt is **printed** by the receiver and answered by typing into the same
+prompt you send messages with — `sender()` is the only reader of stdin, and it
+asks `confirmation.py` whether a line is an answer or a message.
+
+While a prompt is open: `yes`/`y` and `no`/`n` answer it, Enter on its own
+shows the time remaining, and anything else re-prompts rather than being sent
+to Ixa as conversation. Ten seconds before the deadline there is one warning;
+at the deadline the client answers **no** on your behalf and says so, rather
+than leaving you typing into a request the backend has already given up on. A
+yes or no typed just after that is answered with "that request already
+expired" instead of silently becoming a message.
+
+Nothing blocks the event loop while a prompt is open: the wake word, VAD, the
+conversation timers, playback and the WebSocket keepalive all keep running.
+That was not true before — the prompt used to be a blocking `input()` inside
+the receiver, which froze all of them.
 
 ## Conversation states
 

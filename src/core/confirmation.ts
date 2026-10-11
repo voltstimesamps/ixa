@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto"
 import * as readline from "readline"
+import { config } from "../config"
 import type { WsMessage } from "../api/types"
 
 // --- Shared stdin line reader ---
@@ -87,7 +88,7 @@ export async function requestConfirmation(
   return confirmer(description)
 }
 
-export function createStdinConfirmer(timeoutMs = 30_000): Confirmer {
+export function createStdinConfirmer(timeoutMs = config.confirm.timeoutMs): Confirmer {
   return async (description: string): Promise<ConfirmationOutcome> => {
     process.stdout.write(`\n${description}\nConfirm? (yes/no): `)
 
@@ -134,7 +135,7 @@ const pendingConfirmations = new Map<string, PendingConfirmation>()
 export function createWsConfirmer(
   connectionId: string,
   send: (msg: WsMessage) => void,
-  timeoutMs = 30_000
+  timeoutMs = config.confirm.timeoutMs
 ): Confirmer {
   return (description: string): Promise<ConfirmationOutcome> =>
     new Promise<ConfirmationOutcome>((resolve) => {
@@ -156,7 +157,10 @@ export function createWsConfirmer(
 
       pendingConfirmations.set(requestId, { connectionId, settle })
 
-      send({ type: "confirm", content: description, requestId })
+      // timeoutMs is sent so the client can show the time remaining and
+      // decline locally. It is advisory: this timer is still the authority,
+      // and a client that ignores the field behaves as it always did.
+      send({ type: "confirm", content: description, requestId, timeoutMs })
     })
 }
 
