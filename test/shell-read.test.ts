@@ -161,3 +161,135 @@ test("every call is told the working directory", async () => {
 
   sessions.shutdown()
 })
+
+// ------------------------------------------------------ shell operators
+
+// There is no shell. `execFile` runs one program, so a pipe is handed to that
+// program as an argument — and the program complains about ITS OWN syntax,
+// which is the worst possible error to give a model that is trying to pipe.
+//
+// Live, "find every Python file in the TTS sidecar and tell me what the
+// biggest one does" spent 15 shell_read calls, 12 of them piped, and got:
+//
+//   find: paths must precede expression: `%p\n"'    ×7
+//   find: missing argument to `-exec'               ×3
+//   find: paths must precede expression: `|'        ×2
+//
+// Every one of those reads as a find-syntax problem, so the model rearranged
+// the find expression and tried again. Nine of the twelve were the SAME
+// command re-sent verbatim.
+test("a piped command is refused, not handed to find as an argument", async () => {
+  const out = await run(
+    `find ${dir} -type f -name "*.py" -printf "%s %p\\n" | sort -nr | head -n 1`,
+  )
+
+  assert.match(out, /^Not run:/)
+  assert.match(out, /"\|" is a shell operator/)
+  assert.match(out, /ONE program directly with no shell/)
+  assert.match(out, /nothing is wrong with the tool/)
+  // find's own parser never sees it, so its confusing error cannot appear.
+  assert.doesNotMatch(out, /paths must precede expression/)
+  // And it says what to do instead, including the command that answers the
+  // question that was actually being asked.
+  assert.match(out, /-printf '%s %p/)
+  assert.match(out, /-exec wc -l \{\} \+/)
+  assert.ok(out.length < 420, "the refusal stays short")
+})
+
+test("every operator form is refused and named", async () => {
+  const cases: [string, string][] = [
+    [`ls ${dir} | wc -l`, "|"],
+    [`ls ${dir} || ls .`, "||"],
+    [`ls ${dir} && ls .`, "&&"],
+    [`ls ${dir} ; ls .`, ";"],
+    [`ls ${dir} > out.txt`, ">"],
+    [`ls ${dir} >> out.txt`, ">>"],
+    [`wc -l < ${dir}/Projects/ixa/ARCHITECTURE.md`, "<"],
+    ["ls `pwd`", "`"],
+    ["ls $(pwd)", "$("],
+  ]
+  for (const [command, operator] of cases) {
+    const out = await run(command)
+    assert.match(out, /^Not run:/, `not refused: ${command}`)
+    assert.ok(
+      out.includes(`"${operator}" is a shell operator`),
+      `${command} should name ${operator}, got: ${out.slice(0, 90)}`,
+    )
+  }
+})
+
+test("an operator the model pre-split into args is refused too", async () => {
+  // The same pipe, arriving as its own token because the model split the
+  // command itself. Nothing is left to read quoting from here, so only a
+  // whole argument counts.
+  const out = await run("ls", [dir, "|", "wc", "-l"])
+  assert.match(out, /^Not run:/)
+  assert.match(out, /"\|" is a shell operator/)
+})
+
+// The refusal must not swallow the legitimate uses of the same characters.
+test("quoted operators are arguments, not operators", async () => {
+  // Extended-regex alternation: a real pipe inside a real pattern.
+  await writeFile(join(dir, "alt.txt"), "alpha\nbeta\ngamma\n")
+  const grep = await run("grep -E 'alpha|gamma' alt.txt", [], dir)
+  assert.doesNotMatch(grep, /^Not run:/, "a quoted pipe is part of the pattern")
+  assert.match(grep, /alpha/)
+  assert.match(grep, /gamma/)
+  assert.doesNotMatch(grep, /beta/)
+})
+
+test("find -exec keeps its semicolon terminator", async () => {
+  // `\;` and ';' are how a shell user writes the literal, and the model writes
+  // both. Refusing a bare `;` would refuse the most useful form of -exec, so
+  // it only counts as chaining when there is no -exec to terminate.
+  const escaped = await run(`find . -maxdepth 3 -name "ARCHITECTURE.md" -exec wc -c {} \;`, [], dir)
+  assert.doesNotMatch(escaped, /^Not run:/, "an escaped semicolon is -exec's terminator")
+  assert.match(escaped, /ARCHITECTURE\.md/)
+
+  const bare = await run(`find . -maxdepth 3 -name "ARCHITECTURE.md" -exec wc -c {} ;`, [], dir)
+  assert.doesNotMatch(bare, /^Not run:/, "and so is a bare one, when there is an -exec")
+  assert.match(bare, /ARCHITECTURE\.md/)
+
+  // With no -exec, a bare semicolon is the model trying to chain.
+  const chained = await run("ls . ; ls .", [], dir)
+  assert.match(chained, /^Not run:/)
+})
+
+// ------------------------------------------------------ quoted arguments
+
+// The OTHER half of the live failure, and the one no amount of per-token quote
+// stripping reaches: seven of the fifteen calls failed on `-printf "%s %p\n"`
+// alone, with or without a pipe, because a whitespace split turns one argument
+// into two. The remedy the refusal above recommends would be a trap without
+// this.
+test("an argument with a space inside quotes survives as one argument", async () => {
+  const out = await run(`find . -maxdepth 3 -name "ARCHITECTURE.md" -printf "%s %p\\n"`, [], dir)
+  assert.doesNotMatch(out, /paths must precede expression/)
+  assert.match(out, /^\d+ \.\/Projects\/ixa\/ARCHITECTURE\.md/)
+})
+
+test("double quotes keep a backslash that find itself expands", async () => {
+  // In a shell, "\n" inside double quotes is a literal backslash-n; find is
+  // what turns it into a newline. Converting it here would hand find a real
+  // newline and break -printf.
+  const out = await run(`find . -maxdepth 3 -name "ARCHITECTURE.md" -printf "%p\\n%s\\n"`, [], dir)
+  assert.equal(out.trim().split("\n").length, 2, "find expanded two newlines of its own")
+})
+
+// ------------------------------------------------------ failure reporting
+
+test("the tool declares which of its own results are failures", () => {
+  const isFailure = shellReadTool.isFailure!
+  // Every string the live turn actually received.
+  assert.equal(isFailure("Command failed: find: paths must precede expression: `|'"), true)
+  assert.equal(isFailure("Output too large to return: the command produced more than 1 MB"), true)
+  assert.equal(isFailure("Not run: \"|\" is a shell operator"), true)
+  assert.equal(isFailure("Command timed out after 10 seconds."), true)
+  assert.equal(isFailure("Command 'curl' is not allowed in read-only mode."), true)
+
+  // And the ones that are not failures, including the one that looks most
+  // like one: a successful command whose answer is "nothing".
+  assert.equal(isFailure("(no output)"), false)
+  assert.equal(isFailure("6119 ./main.py"), false)
+  assert.equal(isFailure("total 0\ndrwxr-xr-x 2 wyatt wyatt 4096 Oct 11 04:06 ."), false)
+})

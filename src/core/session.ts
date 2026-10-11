@@ -309,6 +309,18 @@ function searchCapReached(limit: number): string {
 // four times is a log nobody reads.
 const TOOL_LOG_ARG_CHARS = 120
 
+// Why a tool-reported failure failed, for the log line. One line, bounded: a
+// find error is short, but an 8000-character result that happens to start with
+// a failure prefix is not.
+const TOOL_LOG_REASON_CHARS = 100
+
+function firstLine(result: string): string {
+  const line = result.split("\n")[0]!.trim()
+  return line.length > TOOL_LOG_REASON_CHARS
+    ? `${line.slice(0, TOOL_LOG_REASON_CHARS - 1)}…`
+    : line
+}
+
 function logToolCall(
   name: string,
   status: string,
@@ -686,7 +698,16 @@ export class Session {
         tool.name
       )
       const result = typeof output === "string" ? output : JSON.stringify(output)
-      logToolCall(tool.name, "ok", startedAt, tc.arguments)
+      // A tool that catches its own errors and returns them as a result is
+      // doing right by the model and used to lie to the log: fifteen
+      // consecutive failed shell_read calls in one live turn logged fifteen
+      // "ok" lines. The tool says which of its own results are failures; this
+      // only picks the word, and the result handed back is untouched.
+      if (tool.isFailure?.(result)) {
+        logToolCall(tool.name, "failed", startedAt, tc.arguments, firstLine(result))
+      } else {
+        logToolCall(tool.name, "ok", startedAt, tc.arguments)
+      }
       return result
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)

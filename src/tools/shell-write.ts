@@ -4,6 +4,7 @@ import { existsSync } from "fs"
 import { resolve } from "path"
 import { homedir, platform } from "os"
 import type { Tool } from "./registry"
+import { isShellFailure } from "./shell-result"
 
 const execFile = promisify(execFileCb)
 
@@ -67,6 +68,7 @@ export const shellWriteTool: Tool = {
     required: ["command"],
   },
   requiresConfirmation: true,
+  isFailure: isShellFailure,
   execute: async (input) => {
     const raw = input as ShellWriteInput
     let command = raw.command

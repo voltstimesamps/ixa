@@ -6,6 +6,17 @@ export interface Tool {
   inputSchema: Record<string, unknown>
   requiresConfirmation: boolean
   execute: (input: unknown) => Promise<unknown>
+  // Optional, and for the LOG LINE only — nothing branches on it and the model
+  // never sees the answer.
+  //
+  // A tool that catches its own errors and returns them as a result string is
+  // doing the right thing by the model, which can act on "find: unknown
+  // predicate" and cannot act on an exception. But `executeTool` logs "ok"
+  // whenever `execute()` resolves, so a live turn of fifteen consecutive
+  // failed `shell_read` calls logged fifteen "ok" lines. This lets a tool say
+  // which of its own results are failures, without the session having to know
+  // anything about what they look like. See src/tools/shell-result.ts.
+  isFailure?: (result: string) => boolean
 }
 
 class ToolRegistry {
