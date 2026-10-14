@@ -6,8 +6,7 @@ export interface Tool {
   inputSchema: Record<string, unknown>
   requiresConfirmation: boolean
   execute: (input: unknown) => Promise<unknown>
-  // Optional, and for the LOG LINE only — nothing branches on it and the model
-  // never sees the answer.
+  // Optional, and for the LOG WORD only. The model never sees the answer.
   //
   // A tool that catches its own errors and returns them as a result string is
   // doing the right thing by the model, which can act on "find: unknown
@@ -16,7 +15,31 @@ export interface Tool {
   // failed `shell_read` calls logged fifteen "ok" lines. This lets a tool say
   // which of its own results are failures, without the session having to know
   // anything about what they look like. See src/tools/shell-result.ts.
+  //
+  // THIS USED TO SAY "nothing branches on it", and that went stale the moment
+  // the repeated-failure refusal shipped: it gated on `isFailure` merely
+  // EXISTING, so giving a tool an honest log word silently enrolled it in a
+  // behaviour change too. `dedupeFailures` below is that behaviour, opted into
+  // on its own.
   isFailure?: (result: string) => boolean
+  // Whether an identical call that already failed this turn should be refused
+  // rather than run again. Requires `isFailure` — there is no way to know a
+  // call failed without it — and is deliberately a SEPARATE flag.
+  //
+  // The two questions are not the same question. "Was this result a failure?"
+  // is about one result and is always safe to ask. "Will running this again
+  // give the same result?" is about the FUTURE, and it is only true for a tool
+  // whose result depends on nothing but its arguments.
+  //
+  // The shell tools qualify: `ls -R` in the same directory returns the same
+  // oversized output every time. `save_note` DOES NOT. Its price guard
+  // compares the note against what `web_search` returned in this turn, and its
+  // refusal says in as many words: "Either call web_search now and use what it
+  // returns, or call save_note again with the figure left out." A model that
+  // does exactly that — searches, confirms the figure, re-sends the identical
+  // call — is making a call that is now legitimate, and refusing it on
+  // signature alone would break the one recovery path the refusal asks for.
+  dedupeFailures?: boolean
 }
 
 class ToolRegistry {

@@ -23,7 +23,8 @@ function sessions(chat: ChatFn): SessionManager {
 }
 
 // A probe that fails the way shell_read does, so the real isFailure predicate
-// decides — this must not work by a test-only convention.
+// decides — this must not work by a test-only convention. Enrolled in the
+// refusal the way shell_read is, with the flag and not just the predicate.
 let probeRuns = 0
 let probeResult = "Command failed: find: unknown predicate `-R'"
 registry.register({
@@ -32,6 +33,7 @@ registry.register({
   inputSchema: { type: "object", properties: {} },
   requiresConfirmation: false,
   isFailure: shellReadTool.isFailure,
+  dedupeFailures: true,
   execute: async () => {
     probeRuns++
     return probeResult
@@ -145,9 +147,9 @@ test("a call that succeeded can be repeated as often as the model likes", async 
   manager.shutdown()
 })
 
-// Only tools that can say what a failure looks like take part. Everything else
-// — the memory tools, web_search, an MCP tool in Phase 4 — is untouched,
-// because a result this layer cannot judge must not be guessed at.
+// Only tools that OPT IN take part. Everything else — the memory tools,
+// web_search, an MCP tool in Phase 4 — is untouched, because a result this
+// layer cannot judge must not be guessed at.
 test("a tool with no isFailure is never deduplicated", async () => {
   let runs = 0
   registry.register({
@@ -176,6 +178,46 @@ test("a tool with no isFailure is never deduplicated", async () => {
   const manager = sessions(chat)
   await manager.submitTurn("try it", makeConnection(), "text")
   assert.equal(runs, 2)
+
+  manager.shutdown()
+})
+
+// THE SAVE_NOTE CASE. An honest log word must not enrol a tool in the refusal.
+//
+// save_note's result is not a function of its arguments: its price guard
+// compares the note against what web_search returned IN THIS TURN, and its
+// refusal tells the model to search and then call again — which it does with
+// the identical call. Refusing that would break the one recovery path the
+// refusal asks for, so `isFailure` alone must change nothing but the log.
+test("a tool with isFailure but no dedupeFailures is never deduplicated", async () => {
+  let runs = 0
+  registry.register({
+    name: "honest_probe",
+    description: "A probe that reports its own failures but is not enrolled.",
+    inputSchema: { type: "object", properties: {} },
+    requiresConfirmation: false,
+    isFailure: (result: string) => result.startsWith("Nothing was saved"),
+    execute: async () => {
+      runs++
+      return "Nothing was saved. The figure $1,300 is not in anything the user said."
+    },
+  })
+
+  let n = 0
+  const chat: ChatFn = async () => {
+    n++
+    if (n <= 3) {
+      return {
+        type: "tool_calls",
+        calls: [{ id: `h${n}`, name: "honest_probe", arguments: '{"title":"x"}' }],
+      }
+    }
+    return { type: "text", content: "done" }
+  }
+
+  const manager = sessions(chat)
+  await manager.submitTurn("write it down", makeConnection(), "text")
+  assert.equal(runs, 3, "the predicate decides the log word, not whether the call runs")
 
   manager.shutdown()
 })

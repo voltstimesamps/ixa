@@ -324,6 +324,10 @@ export const shellReadTool: Tool = {
   },
   requiresConfirmation: false,
   isFailure: isShellFailure,
+  // The same command, in the same directory, fails the same way every time:
+  // one live turn ran `ls -R` in $HOME four times for four identical
+  // "output too large" results. See `dedupeFailures` in registry.ts.
+  dedupeFailures: true,
   execute: async (input) => {
     const raw = input as ShellReadInput
     let command = raw.command

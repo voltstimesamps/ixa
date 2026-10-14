@@ -69,6 +69,9 @@ export const shellWriteTool: Tool = {
   },
   requiresConfirmation: true,
   isFailure: isShellFailure,
+  // Same argument as shell_read: the result is a function of the command and
+  // the directory, so a repeat is a repeat. See registry.ts.
+  dedupeFailures: true,
   execute: async (input) => {
     const raw = input as ShellWriteInput
     let command = raw.command

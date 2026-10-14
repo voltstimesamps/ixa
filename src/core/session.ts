@@ -1193,7 +1193,7 @@ export class Session {
           if (!tool) {
             result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
             logToolCall(tc.name, "unknown", Date.now(), tc.arguments)
-          } else if (tool.isFailure && alreadyFailed !== undefined) {
+          } else if (tool.dedupeFailures && alreadyFailed !== undefined) {
             // The same call, byte for byte, that already failed this turn.
             //
             // Measured: one live turn ran `ls -R` in $HOME FOUR times, each
@@ -1203,11 +1203,15 @@ export class Session {
             // a command it believes in, and tries it again.
             //
             // Only calls that actually RAN and FAILED are remembered, and only
-            // for tools that can say which of their results are failures, so
-            // this can never block a call that worked or one whose outcome is
-            // not knowable. It still costs a tool call: the budget is there to
-            // bound the turn, and a repeat is still the model choosing to
-            // spend one.
+            // for tools that OPT IN with `dedupeFailures`, so this can never
+            // block a call that worked or one whose outcome is not knowable.
+            // It still costs a tool call: the budget is there to bound the
+            // turn, and a repeat is still the model choosing to spend one.
+            //
+            // The opt-in is a flag of its own rather than "has isFailure",
+            // which is what it used to be. Only a tool whose result is a pure
+            // function of its arguments may enrol — `save_note` is the
+            // counter-example, and registry.ts carries the reasoning.
             result = repeatedFailureResult(alreadyFailed)
             logToolCall(tool.name, "repeat", Date.now(), tc.arguments, "identical call already failed")
           } else if (
@@ -1256,11 +1260,12 @@ export class Session {
             ran = true
           }
 
-          // Remembered only for a call that RAN and that the tool itself
-          // calls a failure. A declined, cancelled, capped or over-budget call
-          // did not fail — it did not happen — and a tool with no isFailure
-          // has no opinion, so nothing it returns is ever remembered.
-          if (ran && tool?.isFailure?.(result)) {
+          // Remembered only for a call that RAN, that the tool itself calls a
+          // failure, and that belongs to a tool enrolled in the refusal. A
+          // declined, cancelled, capped or over-budget call did not fail — it
+          // did not happen — and this map is read nowhere else, so recording a
+          // tool that will never be refused would only grow it.
+          if (ran && tool?.dedupeFailures && tool.isFailure?.(result)) {
             failedCalls.set(signature, firstLine(result))
           }
 

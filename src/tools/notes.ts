@@ -118,10 +118,36 @@ function renderHit(hit: NoteHit, index: number): string {
   return `${head}${where}\n   ${hit.note.summary}\n   ---\n${hit.text}`
 }
 
-const UNAVAILABLE =
+// ------------------------------------------------------------ what failed
+//
+// Exported, and compared against rather than prefix-matched, for the reason
+// shell-result.ts gives: a list of strings maintained at a distance from the
+// strings it matches goes stale. These two are the whole of it that is not
+// already covered by the shared prefix below.
+
+export const SEARCH_UNAVAILABLE =
   "Your notebook cannot be searched right now (the vector index or embedding service is not " +
   "reachable). Tell the user you cannot search your notes at the moment rather than guessing at " +
   "what you wrote, and do not call save_note — you cannot check for an existing note first."
+
+export const NOTEBOOK_UNAVAILABLE = "The notebook is not available, so nothing was saved."
+
+// Every refusal save_note writes opens with this, including priceRefusal's
+// "Nothing was saved. The figure ..." — hence no colon in the prefix.
+const NOTHING_SAVED = "Nothing was saved"
+
+// Whether a note tool's RESULT reports a failure. THE LOG WORD ONLY: neither
+// note tool sets `dedupeFailures`, because save_note's outcome depends on what
+// web_search returned in this turn and not on its arguments alone. See
+// registry.ts.
+//
+// "Nothing in your notebook matches that" is deliberately NOT a failure. An
+// empty search is a search that worked and found nothing, which is an answer;
+// calling it a failure would log every first note of a session as a problem.
+export function noteFailure(result: string): boolean {
+  if (result === SEARCH_UNAVAILABLE || result === NOTEBOOK_UNAVAILABLE) return true
+  return result.startsWith(NOTHING_SAVED)
+}
 
 // Said on every search, including a good one. The spike measured why: with
 // this embedder, text that genuinely answered a question scored as low as
@@ -182,9 +208,12 @@ export const saveNoteTool: Tool = {
     required: ["type", "title", "summary", "sections"],
   },
   requiresConfirmation: false,
+  // Log word only — no `dedupeFailures`. A price refusal tells the model to
+  // search and call again, and the call it comes back with is byte-identical.
+  isFailure: noteFailure,
   execute: async (input: unknown): Promise<string> => {
     const notebook = getNotebook()
-    if (!notebook) return "The notebook is not available, so nothing was saved."
+    if (!notebook) return NOTEBOOK_UNAVAILABLE
 
     const raw = (typeof input === "object" && input !== null ? input : {}) as SaveNoteInput
     const type = typeof raw.type === "string" ? raw.type : ""
@@ -320,9 +349,10 @@ export const searchNotesTool: Tool = {
     required: [],
   },
   requiresConfirmation: false,
+  isFailure: noteFailure,
   execute: async (input: unknown): Promise<string> => {
     const notebook = getNotebook()
-    if (!notebook) return UNAVAILABLE
+    if (!notebook) return SEARCH_UNAVAILABLE
 
     const raw = (typeof input === "object" && input !== null ? input : {}) as { query?: unknown }
     // A blank or null query is treated as no query, for the reason
@@ -332,7 +362,7 @@ export const searchNotesTool: Tool = {
     const query = optionalString(raw.query) ?? ""
 
     const result = query ? await notebook.search(query) : notebook.recent()
-    if (!result.available) return UNAVAILABLE
+    if (!result.available) return SEARCH_UNAVAILABLE
 
     if (result.hits.length === 0) {
       return query
