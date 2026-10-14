@@ -45,6 +45,7 @@ import { QdrantIndex } from "../../src/memory/qdrant"
 import { getNoteStore, type Note } from "../../src/memory/notes"
 import { Notebook, setNotebook } from "../../src/memory/notebook"
 import { getPreferenceStore } from "../../src/memory/preferences"
+import { ROUTING_PROBES, type Probe } from "./lib/routing-probes"
 import "../../src/tools/register"
 
 const LIVE_SEARCH = process.argv.includes("--live-search")
@@ -60,14 +61,6 @@ const SEARCH_STUB =
   "2. r/hardwareswap — recent sales between $1,250 and $1,420.\n" +
   "3. Newegg — no new stock; refurbished units listed at $1,499."
 
-interface Probe {
-  id: number
-  testing: string
-  text: string
-  // What should happen. Checked by hand in the report, not asserted — one
-  // sample per shape, as the spike's caveat says.
-  expect: string
-}
 
 // The spike's ten, verbatim, transcript style and all.
 const WRITER_PROBES: Probe[] = [
@@ -139,39 +132,6 @@ const WRITER_PROBES: Probe[] = [
 ]
 
 // Routing, both directions. The spike could only measure one.
-const ROUTING_PROBES: Probe[] = [
-  {
-    id: 11,
-    testing: "ROUTING: a genuine preference must still reach remember_preference",
-    text: "i prefer my coffee black, remember that",
-    expect: "remember_preference",
-  },
-  {
-    id: 12,
-    testing: "ROUTING: 'remember' plus a FACT must reach save_note",
-    text: "remember that the stt sidecar uses base.en, not small",
-    expect: "save_note",
-  },
-  {
-    id: 13,
-    testing: "ROUTING: a question about a past CONVERSATION must reach search_memory",
-    text: "what did we talk about last time?",
-    expect: "search_memory with no query",
-  },
-  {
-    id: 14,
-    testing: "ROUTING: a question about something written down must reach search_notes",
-    text: "what did i write down about the search provider?",
-    expect: "search_notes",
-  },
-  {
-    id: 15,
-    testing: "ROUTING: a behaviour instruction phrased as a note must stay a preference",
-    text: "make a note to always answer in metric",
-    expect: "remember_preference, not save_note",
-  },
-]
-
 interface CallRecord {
   name: string
   args: string

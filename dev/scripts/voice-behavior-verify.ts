@@ -22,12 +22,18 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts tokens       # prompt cost
 //   npx tsx dev/scripts/voice-behavior-verify.ts strays       # 6, read-only
 //   npx tsx dev/scripts/voice-behavior-verify.ts readback     # 11
+//   npx tsx dev/scripts/voice-behavior-verify.ts length       # 12, no backend
 //
 // `readback` also needs a THROWAWAY VAULT, because it writes notes:
 //
 //   IXA_DB_PATH=/tmp/ixa-voice.db QDRANT_COLLECTION=ixa_voice \
 //     IXA_NOTES_COLLECTION=ixa_voice_notes OBSIDIAN_VAULT_PATH=/tmp/ixa-voice-vault \
 //     VOICE_MODE=true npm run dev
+//
+// `length` needs the throwaway vault too, and needs NO BACKEND: it drives
+// chat() directly, because its arms are per-request parameters and its numbers
+// are per-call token counts, and a WebSocket client can neither set nor see
+// either. It refuses to run against the live database, vault or collections.
 //
 // `detector` needs none of that: it checks the clock judge offline, against the
 // replies two live failures actually produced. Run it before `clock`, because a
@@ -52,10 +58,20 @@
 // As in behavior-verify.ts, evidence comes from what the backend RECORDED,
 // not from the reply text. A model saying "I searched" is the claim under
 // test; the backstop's bracketed history note is how we know it fired.
+import fs from "fs"
+import os from "os"
+import path from "path"
 import OpenAI from "openai"
 import { config } from "../../src/config"
 import "../../src/tools/register"
 import { registry } from "../../src/tools/registry"
+import { chat, rateLimit, type Message } from "../../src/core/llm"
+import { runWithSessionControl } from "../../src/core/session-context"
+import { OllamaEmbedder } from "../../src/memory/embeddings"
+import { QdrantIndex } from "../../src/memory/qdrant"
+import { getNoteStore } from "../../src/memory/notes"
+import { Notebook, setNotebook } from "../../src/memory/notebook"
+import { ROUTING_PROBES } from "./lib/routing-probes"
 import { SYSTEM_PROMPT, VOICE_RESPONSE_PROMPT } from "../../src/core/session"
 import { shortenForSpeech, CONTINUE_OFFER } from "../../src/voice/shorten"
 import { sanitizeForSpeech } from "../../src/voice/sanitize"
@@ -2598,6 +2614,661 @@ async function client_askAudio(ask: string): Promise<Reply> {
   }
 }
 
+// ------------------------------------------------------------- 12: length
+//
+// `finish_reason=length` with ZERO characters of content.
+//
+// Measured while verifying the read-back and NOT caused by it: on the
+// long-note case, 4 of 10 turns came back cut off with reasoning deltas and no
+// content, so `EMPTY_REPLY_FALLBACK` was delivered — *"Sorry, I lost my train
+// of thought there"* — about a note that was already on disk and correct. It
+// has since been seen on a SHORT voice turn too, call 1, no tools yet.
+//
+// No `max_tokens` or `max_completion_tokens` is set anywhere in the codebase,
+// so the cap being exhausted is Groq's own: 65,536 max completion tokens for
+// `openai/gpt-oss-20b`, whose `reasoning_effort` defaults to `medium` and also
+// accepts `low` and `high`. The two candidate levers are therefore an explicit
+// completion cap and a cheaper reasoning effort, and the cost of `low` is a
+// quality question, not a token one — which is why the routing and read-back
+// scores are reported BESIDE the truncation rate rather than after it.
+//
+// WHAT IS REAL HERE AND WHAT IS NOT. Deliberately NOT the backend: the arms
+// are per-REQUEST parameters and the numbers wanted are per-CALL token counts,
+// neither of which a WebSocket client can set or see. So this drives `chat()`
+// directly with its own tool loop, in the shape notes-verify.ts established.
+//
+//   the tool registry        REAL — every tool, the descriptions the model reads
+//   save_note / search_notes REAL, writing real markdown and real vectors
+//   remember_preference      REAL and EXECUTED, into the throwaway database
+//   chat()                   REAL (streaming, deadlines, retries)
+//   SYSTEM_PROMPT            REAL and unchanged
+//   VOICE_RESPONSE_PROMPT    REAL, appended as the trailing system message,
+//                            which is where a voice turn carries it
+//   web_search               STUBBED. Nothing here measures search.
+//   STT                      NOT IN THE PATH. `readback` speaks its asks
+//                            through real Kokoro and real whisper; these are
+//                            typed in, because a mishearing changes the value
+//                            under test and this run is about the completion.
+//   the working-directory line  ABSENT. ~86 characters the real call carries.
+//
+// ONE KNOWN CONFOUND, kept deliberately. Notes ACCUMULATE across runs, as
+// they do in `readback`: every turn is a fresh conversation, but the vault is
+// not emptied, so a later run may find its own earlier note and supersede it
+// — or decide not to write at all — which is a different code path and a
+// different number of tokens. It is kept because the 4-of-10 truncation this
+// is chasing was measured under exactly these conditions, and because the
+// store has no hard delete to undo a write with. Start from an empty vault,
+// and read the per-run table rather than the arm average if the routes
+// diverge.
+//
+// NOTHING LIVE IS TOUCHED: the database, the vault and both collections are
+// asserted to differ from the configured ones before anything runs.
+//
+//   IXA_DB_PATH=/tmp/ixa-length/verify.db QDRANT_COLLECTION=ixa_length \
+//     IXA_NOTES_COLLECTION=ixa_length_notes OBSIDIAN_VAULT_PATH=/tmp/ixa-length/vault \
+//     npx tsx dev/scripts/voice-behavior-verify.ts length
+//
+// Needs Ollama, Qdrant and Groq. Does NOT need the backend or the sidecars.
+
+interface LengthArm {
+  id: string
+  // Unset is the measurement's point: it is the default the live code sends,
+  // which is to say nothing at all and let the provider choose.
+  reasoningEffort?: "low" | "medium" | "high"
+  maxCompletionTokens?: number
+  runs: number
+}
+
+// 10 runs on the capped arms and 5 on the uncapped ones, because an uncapped
+// length cut can burn the whole 65,536-token completion and ten of those is a
+// quarter of a million tokens to learn the same thing twice.
+const LENGTH_RUNS = Number(process.env.IXA_LENGTH_RUNS ?? 10)
+const LENGTH_RUNS_UNCAPPED = Number(process.env.IXA_LENGTH_RUNS_UNCAPPED ?? 5)
+// The guard cases are a guard, not the measurement: one run each per arm by
+// default. Routing is noisy enough that a single run cannot separate a
+// regression from sampling — see ARCHITECTURE.md's routing table — so raise
+// this before reading one as a verdict.
+const LENGTH_GUARD_RUNS = Number(process.env.IXA_LENGTH_GUARD_RUNS ?? 1)
+
+function lengthArms(): LengthArm[] {
+  return [
+    { id: "medium (unset) / no cap", runs: LENGTH_RUNS_UNCAPPED },
+    { id: "medium (unset) / 4096", maxCompletionTokens: 4096, runs: LENGTH_RUNS },
+    { id: "low / no cap", reasoningEffort: "low", runs: LENGTH_RUNS_UNCAPPED },
+    { id: "low / 4096", reasoningEffort: "low", maxCompletionTokens: 4096, runs: LENGTH_RUNS },
+  ]
+}
+
+// A canned Tavily-shaped result, as in notes-verify.ts. Nothing here measures
+// search, and a run that depends on the live web is a run that cannot be
+// compared with the next one.
+const LENGTH_SEARCH_STUB =
+  "Search results for used RTX 3090 pricing:\n" +
+  "1. eBay — sold listings for the RTX 3090 cluster around $1,360 shipped.\n" +
+  "2. r/hardwareswap — recent sales between $1,250 and $1,420."
+
+// The runaway bound on one probe's tool loop. Lower than production's, because
+// nothing in this set legitimately needs more than a search, a save and a
+// reply.
+const LENGTH_MAX_ITERATIONS = 6
+
+interface LengthRun {
+  arm: string
+  // "long" is the measurement; everything else is the guard.
+  slug: string
+  kind: "long" | "readback" | "routing"
+  run: number
+  // The LAST call of the turn — the one that was supposed to produce the
+  // reply, and the one a cut ruins.
+  finishReason: string | null
+  contentChars: number
+  completionTokens: number | null
+  // Whole turn, every call in it.
+  seconds: number
+  calls: number
+  tokens: number
+  route: string[]
+  // Tool calls the provider rejected and llm.ts re-sampled. Invisible in the
+  // reply: the turn still answered.
+  rejections: number
+  reply: string
+  // Only meaningful for a case that writes a note.
+  noteId: string | null
+  body: string
+  missing: string[]
+  verdict: "verbatim" | "paraphrased" | "summarized" | "no-note" | "answered" | "routed" | "misrouted" | "cut" | "error"
+  note?: string
+}
+
+// How close to the per-minute token allowance is too close. A fraction rather
+// than a number because the Dev tier's limit is not the free tier's, and the
+// provider states its own limit on every response.
+const RATE_LIMIT_FLOOR = 0.15
+
+// Counts the one quality signal that is only visible in the log: Groq
+// rejecting the tool call the model sampled, which `withArgumentRetry` absorbs
+// by re-issuing the call once. The turn still answers, so nothing in the
+// return value says it happened — and an arm that samples invalid arguments
+// more often is exactly the regression `reasoning_effort: low` might buy.
+//
+// A log tap rather than a new return field, because llm.ts is instrumentation
+// that must not grow a hook for one measurement script.
+const REJECTION_LINE = /^llm retrying once: the provider rejected/
+
+async function countingRejections<T>(fn: () => Promise<T>): Promise<{ result: T; rejections: number }> {
+  let rejections = 0
+  const real = console.log
+  console.log = (...args: unknown[]) => {
+    if (REJECTION_LINE.test(args.map(String).join(" "))) rejections++
+    real(...(args as []))
+  }
+  try {
+    return { result: await fn(), rejections }
+  } finally {
+    console.log = real
+  }
+}
+
+function resetSeconds(reset: string | null): number | null {
+  if (!reset) return null
+  // Groq's own format, verbatim: "7.66s", "2m59.56s".
+  const match = /^(?:(\d+)m)?([\d.]+)s$/.exec(reset.trim())
+  if (!match) return null
+  return Number(match[1] ?? 0) * 60 + Number(match[2])
+}
+
+// Waits out the per-minute cap rather than earning a 429. The SDK would retry
+// one, but a retry costs the same tokens again and a table with a hole in it
+// is worse than a table that took six minutes longer.
+async function respectRateLimit(): Promise<void> {
+  const seen = rateLimit()
+  if (!seen || seen.remainingTokens === null || seen.limitTokens === null) return
+  if (seen.remainingTokens > seen.limitTokens * RATE_LIMIT_FLOOR) return
+  const wait = resetSeconds(seen.resetTokens) ?? 20
+  console.log(
+    `    rate limit: ${seen.remainingTokens} of ${seen.limitTokens} tokens left — ` +
+      `waiting ${wait.toFixed(1)}s (reset ${seen.resetTokens ?? "unknown"})`
+  )
+  await new Promise((resolve) => setTimeout(resolve, wait * 1000 + 500))
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2
+}
+
+function show(value: number | null, digits = 0): string {
+  return value === null ? "—" : value.toFixed(digits)
+}
+
+async function verifyLength(): Promise<void> {
+  section("12. the completion the provider cut off")
+
+  // The guard. A measurement run that wrote into the real database, the real
+  // vault or either real collection would be worse than no measurement.
+  const live = {
+    db: path.join(path.resolve(__dirname, "../.."), "data", "ixa.db"),
+    vault: path.join(os.homedir(), "Ixa-Vault"),
+    episodes: "ixa_episodes",
+    notes: "ixa_notes",
+  }
+  if (path.resolve(config.data.dbPath) === path.resolve(live.db)) {
+    throw new Error(`refusing to run against the live database ${config.data.dbPath}`)
+  }
+  if (path.resolve(config.notes.vaultPath) === path.resolve(live.vault)) {
+    throw new Error(`refusing to run against the live vault ${config.notes.vaultPath}`)
+  }
+  if (config.notes.collection === live.notes || config.qdrant.collection === live.episodes) {
+    throw new Error(
+      `refusing to run against a live collection ` +
+        `(notes=${config.notes.collection}, episodes=${config.qdrant.collection})`
+    )
+  }
+
+  const notebook = new Notebook({
+    store: getNoteStore(),
+    embedder: new OllamaEmbedder(),
+    index: new QdrantIndex({
+      collection: config.notes.collection,
+      payloadIndexes: [{ field: "status", schema: "keyword" }],
+    }),
+  })
+  setNotebook(notebook)
+  await notebook.start()
+
+  const tools = registry.toOpenAI()
+  const arms = lengthArms()
+  console.log(`  model:      ${config.llm.model}`)
+  console.log(`  vault:      ${config.notes.vaultPath}`)
+  console.log(`  notes:      ${config.notes.collection}`)
+  console.log(`  tools:      ${tools.length}, ${JSON.stringify(tools).length} chars of schema`)
+  console.log(`  arms:       ${arms.length}`)
+  console.log(`  guard runs: ${LENGTH_GUARD_RUNS} per case per arm\n`)
+
+  const runs: LengthRun[] = []
+  let tokensSpent = 0
+  let llmCalls = 0
+
+  // One turn, driven the way the tool loop drives one, with the arm's
+  // overrides on every call in it.
+  async function turn(
+    arm: LengthArm,
+    text: string
+  ): Promise<{
+    reply: string
+    route: string[]
+    results: Array<{ name: string; result: string }>
+    finishReason: string | null
+    completionTokens: number | null
+    calls: number
+    tokens: number
+    seconds: number
+    rejections: number
+    error?: string
+  }> {
+    const startedAt = Date.now()
+    const route: string[] = []
+    const results: Array<{ name: string; result: string }> = []
+    let reply = ""
+    let finishReason: string | null = null
+    let completionTokens: number | null = null
+    let calls = 0
+    let tokens = 0
+    let error: string | undefined
+
+    const searchResults: string[] = []
+    let rejections = 0
+
+    // Named rather than inlined into the call below, so the loop body keeps
+    // its indentation and the log tap stays one line.
+    const drive = (): Promise<void> =>
+      runWithSessionControl(
+        {
+          requestNewConversation: () => {},
+          evidence: {
+            userText: text,
+            source: "voice",
+            sessionId: `length-${Date.now()}`,
+            searchResults,
+          },
+        },
+        async () => {
+          // The system prompt leads and the voice constraint trails, which is
+          // where messagesForCall puts them. The constraint is the half of
+          // this that matters: it is the instruction that asks for a short
+          // spoken reply and it is only on voice turns.
+          const messages: Message[] = [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: text },
+          ]
+          const forCall = (): Message[] => [
+            ...messages,
+            { role: "system", content: VOICE_RESPONSE_PROMPT },
+          ]
+
+          for (let i = 0; i < LENGTH_MAX_ITERATIONS; i++) {
+            await respectRateLimit()
+            calls++
+            llmCalls++
+            const response = await chat(forCall(), tools, {
+              silent: true,
+              ...(arm.reasoningEffort ? { reasoningEffort: arm.reasoningEffort } : {}),
+              ...(arm.maxCompletionTokens
+                ? { maxCompletionTokens: arm.maxCompletionTokens }
+                : {}),
+            })
+            const spent = (response.cost?.promptTokens ?? 0) + (response.cost?.completionTokens ?? 0)
+            tokens += spent
+            tokensSpent += spent
+            completionTokens = response.cost?.completionTokens ?? null
+
+            if (response.type === "text") {
+              reply = response.content
+              finishReason = response.finishReason ?? null
+              return
+            }
+
+            // A cut that lands mid-tool-call is still a cut, and it is the one
+            // shape where the turn has work on the floor.
+            finishReason = null
+            messages.push({
+              role: "assistant",
+              content: null,
+              tool_calls: response.calls.map((tc) => ({
+                id: tc.id,
+                type: "function" as const,
+                function: { name: tc.name, arguments: tc.arguments },
+              })),
+            })
+
+            for (const tc of response.calls) {
+              route.push(tc.name)
+              const tool = registry.get(tc.name)
+              let result: string
+              if (!tool) {
+                result = `Unknown tool: ${tc.name}`
+              } else if (tool.name === "web_search") {
+                result = LENGTH_SEARCH_STUB
+                searchResults.push(result)
+              } else {
+                const output = await tool.execute(JSON.parse(tc.arguments || "{}"))
+                result = typeof output === "string" ? output : JSON.stringify(output)
+              }
+              results.push({ name: tc.name, result })
+              messages.push({ role: "tool", tool_call_id: tc.id, content: result })
+            }
+          }
+          reply = "(no final reply: hit the iteration ceiling)"
+        }
+      )
+
+    try {
+      const counted = await countingRejections(drive)
+      rejections = counted.rejections
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+    }
+
+    return {
+      reply,
+      route,
+      results,
+      finishReason,
+      completionTokens,
+      calls,
+      tokens,
+      rejections,
+      seconds: (Date.now() - startedAt) / 1000,
+      ...(error ? { error } : {}),
+    }
+  }
+
+  // The note this turn wrote, read back off disk the way `readback` reads it,
+  // so the two subcommands score the same thing.
+  function savedNote(results: Array<{ name: string; result: string }>): {
+    noteId: string | null
+    body: string
+    hadBodyReadBack: boolean
+  } {
+    const saved = results
+      .filter((entry) => entry.name === "save_note")
+      .map((entry) => entry.result)
+      .filter((result) => result.startsWith("Saved "))
+    const noteId = saved.at(-1)?.match(/\(id ([^)]+)\)/)?.[1] ?? null
+    return {
+      noteId,
+      body: noteId ? bodyOnDisk(noteId) : "",
+      hadBodyReadBack: saved.some((result) => result.includes("Body on disk:")),
+    }
+  }
+
+  for (const arm of arms) {
+    console.log(`  === ${arm.id} ===`)
+
+    // ---- the measurement: the long-note voice case
+    for (let run = 1; run <= arm.runs; run++) {
+      const item = READ_BACK_CASES.find((entry) => entry.kind === "long")!
+      const outcome = await turn(arm, item.ask)
+      const { noteId, body } = savedNote(outcome.results)
+      const verdict: LengthRun["verdict"] = outcome.error
+        ? "error"
+        : outcome.reply.length === 0
+          ? "cut"
+          : !noteId
+            ? "no-note"
+            : "summarized"
+      runs.push({
+        arm: arm.id,
+        slug: "long",
+        kind: "long",
+        run,
+        finishReason: outcome.finishReason,
+        contentChars: outcome.reply.length,
+        completionTokens: outcome.completionTokens,
+        seconds: outcome.seconds,
+        calls: outcome.calls,
+        tokens: outcome.tokens,
+        route: outcome.route,
+        rejections: outcome.rejections,
+        reply: outcome.reply,
+        noteId,
+        body,
+        missing: [],
+        verdict,
+        ...(outcome.error ? { note: outcome.error } : {}),
+      })
+      console.log(
+        `    long ${String(run).padStart(2)}. ${verdict.toUpperCase().padEnd(10)} ` +
+          `finish=${outcome.finishReason ?? "none"} ${outcome.reply.length} chars  ` +
+          `completion=${outcome.completionTokens ?? "?"}  ${outcome.seconds.toFixed(1)}s  ` +
+          `${outcome.calls} call(s)  ${outcome.tokens} tok  ` +
+          `${outcome.route.join(" → ") || "(no tool call)"}` +
+          (outcome.rejections > 0 ? `  ${outcome.rejections} rejected` : "") +
+          (outcome.error ? `  [ERROR ${outcome.error}]` : "")
+      )
+    }
+
+    // ---- the guard: the read-back cases whose value must survive verbatim
+    for (const item of READ_BACK_CASES.filter((entry) => entry.kind !== "long")) {
+      for (let run = 1; run <= LENGTH_GUARD_RUNS; run++) {
+        const outcome = await turn(arm, item.ask)
+        const { noteId, body, hadBodyReadBack } = savedNote(outcome.results)
+        const tokens = body ? valueTokens(body) : []
+        const flatReply = flattenValue(outcome.reply)
+        const missing = tokens.filter((token) => !flatReply.includes(flattenValue(token)))
+        const verdict: LengthRun["verdict"] = outcome.error
+          ? "error"
+          : !noteId
+            ? "no-note"
+            : !hadBodyReadBack
+              ? "summarized"
+              : missing.length === 0
+                ? "verbatim"
+                : "paraphrased"
+        runs.push({
+          arm: arm.id,
+          slug: item.slug,
+          kind: "readback",
+          run,
+          finishReason: outcome.finishReason,
+          contentChars: outcome.reply.length,
+          completionTokens: outcome.completionTokens,
+          seconds: outcome.seconds,
+          calls: outcome.calls,
+          tokens: outcome.tokens,
+          route: outcome.route,
+          rejections: outcome.rejections,
+          reply: outcome.reply,
+          noteId,
+          body,
+          missing,
+          verdict,
+          ...(outcome.error ? { note: outcome.error } : {}),
+        })
+        console.log(
+          `    ${item.slug.padEnd(7)} ${run}. ${verdict.toUpperCase().padEnd(10)} ` +
+            `finish=${outcome.finishReason ?? "none"} ${outcome.seconds.toFixed(1)}s` +
+            (missing.length > 0 ? `  missing: ${missing.join(", ")}` : "") +
+            (outcome.error ? `  [ERROR ${outcome.error}]` : "")
+        )
+      }
+    }
+
+    // ---- the guard: routing, because `low` is a quality change
+    for (const probe of ROUTING_PROBES) {
+      for (let run = 1; run <= LENGTH_GUARD_RUNS; run++) {
+        const outcome = await turn(arm, probe.text)
+        const called = new Set(outcome.route)
+        const routed =
+          probe.mustCall.some((name) => called.has(name)) &&
+          !probe.mustNotCall.some((name) => called.has(name))
+        runs.push({
+          arm: arm.id,
+          slug: `route-${probe.id}`,
+          kind: "routing",
+          run,
+          finishReason: outcome.finishReason,
+          contentChars: outcome.reply.length,
+          completionTokens: outcome.completionTokens,
+          seconds: outcome.seconds,
+          calls: outcome.calls,
+          tokens: outcome.tokens,
+          route: outcome.route,
+          rejections: outcome.rejections,
+          reply: outcome.reply,
+          noteId: null,
+          body: "",
+          missing: [],
+          verdict: outcome.error ? "error" : routed ? "routed" : "misrouted",
+          note: probe.expect,
+        })
+        console.log(
+          `    route ${probe.id} ${run}. ${(outcome.error ? "ERROR" : routed ? "ROUTED" : "MISROUTED").padEnd(10)} ` +
+            `${outcome.route.join(" → ") || "(no tool call)"}  ` +
+            `[expected ${probe.expect}]  ${outcome.seconds.toFixed(1)}s`
+        )
+      }
+    }
+    console.log("")
+  }
+
+  notebook.stopBacklogSweep()
+
+  // --------------------------------------------------------------- the table
+
+  section("per arm: what the cut costs, and what the fix costs")
+  console.log(
+    `  ${"arm".padEnd(24)} ${"cut".padEnd(9)} ${"empty".padEnd(9)} ` +
+      `${"completion med/max".padEnd(20)} ${"seconds med/max".padEnd(17)} ` +
+      `${"verbatim".padEnd(10)} ${"routed".padEnd(8)} rejected`
+  )
+  const lines: string[] = []
+  for (const arm of arms) {
+    const mine = runs.filter((entry) => entry.arm === arm.id)
+    const long = mine.filter((entry) => entry.kind === "long" && entry.verdict !== "error")
+    const cut = long.filter((entry) => entry.finishReason === "length")
+    const empty = long.filter((entry) => entry.contentChars === 0)
+    const completions = long
+      .map((entry) => entry.completionTokens)
+      .filter((value): value is number => value !== null)
+    const seconds = long.map((entry) => entry.seconds)
+    const readback = mine.filter((entry) => entry.kind === "readback")
+    const verbatim = readback.filter((entry) => entry.verdict === "verbatim").length
+    const routing = mine.filter((entry) => entry.kind === "routing")
+    const routed = routing.filter((entry) => entry.verdict === "routed").length
+    const line =
+      `  ${arm.id.padEnd(24)} ` +
+      `${`${cut.length}/${long.length}`.padEnd(9)} ` +
+      `${`${empty.length}/${long.length}`.padEnd(9)} ` +
+      `${`${show(median(completions))} / ${show(Math.max(0, ...completions))}`.padEnd(20)} ` +
+      `${`${show(median(seconds), 1)} / ${show(Math.max(0, ...seconds), 1)}`.padEnd(17)} ` +
+      `${`${verbatim}/${readback.length}`.padEnd(10)} ` +
+      `${`${routed}/${routing.length}`.padEnd(8)} ` +
+      `${mine.reduce((total, entry) => total + entry.rejections, 0)}/${mine.length}`
+    console.log(line)
+    lines.push(line)
+  }
+
+  console.log("")
+  console.log(`  "cut" is finish_reason=length on the call that should have answered.`)
+  console.log(`  "empty" is zero characters of content, which is what the user hears as the fallback.`)
+  console.log(`  verbatim is the path/name/digits guard; routed is the five routing probes.`)
+  console.log(`  "rejected" counts tool calls the provider rejected and llm.ts re-sampled.`)
+  console.log("")
+  console.log(`  ${llmCalls} LLM calls, ${tokensSpent} tokens spent in total`)
+  const seen = rateLimit()
+  if (seen) {
+    console.log(
+      `  rate limit at the end: ${seen.remainingTokens ?? "?"} of ${seen.limitTokens ?? "?"} ` +
+        `tokens, reset ${seen.resetTokens ?? "?"}`
+    )
+  }
+
+  // Deliberately NOT a pass/fail. Nothing here has a threshold to hold: the
+  // run exists to say which arm to adopt, and that is the reader's call.
+  const errors = runs.filter((entry) => entry.verdict === "error")
+  if (errors.length > 0) {
+    console.log("")
+    console.log(`  ${errors.length} run(s) ended in an error:`)
+    for (const entry of errors) console.log(`    ${entry.arm} ${entry.slug} ${entry.run}: ${entry.note}`)
+  }
+
+  writeLengthReport(runs, arms, { llmCalls, tokensSpent })
+}
+
+const LENGTH_REPORT = path.join(__dirname, "length-verify-report.md")
+
+function writeLengthReport(
+  runs: LengthRun[],
+  arms: LengthArm[],
+  totals: { llmCalls: number; tokensSpent: number }
+): void {
+  const out: string[] = []
+  out.push(`# finish_reason=length — measurement`)
+  out.push("")
+  out.push(`Model \`${config.llm.model}\`. ${new Date().toISOString()}.`)
+  out.push("")
+  out.push(
+    `${totals.llmCalls} LLM calls, ${totals.tokensSpent} tokens spent. ` +
+      `Long-note runs per arm: ${LENGTH_RUNS_UNCAPPED} uncapped, ${LENGTH_RUNS} capped. ` +
+      `Guard runs: ${LENGTH_GUARD_RUNS} per case per arm.`
+  )
+  out.push("")
+  out.push(
+    `| arm | cut | empty content | completion tokens med/max | seconds med/max | verbatim | routed | rejected calls |`
+  )
+  out.push(`|---|---|---|---|---|---|---|---|`)
+  for (const arm of arms) {
+    const mine = runs.filter((entry) => entry.arm === arm.id)
+    const long = mine.filter((entry) => entry.kind === "long" && entry.verdict !== "error")
+    const completions = long
+      .map((entry) => entry.completionTokens)
+      .filter((value): value is number => value !== null)
+    const seconds = long.map((entry) => entry.seconds)
+    const readback = mine.filter((entry) => entry.kind === "readback")
+    const routing = mine.filter((entry) => entry.kind === "routing")
+    out.push(
+      `| ${arm.id} ` +
+        `| ${long.filter((e) => e.finishReason === "length").length}/${long.length} ` +
+        `| ${long.filter((e) => e.contentChars === 0).length}/${long.length} ` +
+        `| ${show(median(completions))} / ${show(Math.max(0, ...completions))} ` +
+        `| ${show(median(seconds), 1)} / ${show(Math.max(0, ...seconds), 1)} ` +
+        `| ${readback.filter((e) => e.verdict === "verbatim").length}/${readback.length} ` +
+        `| ${routing.filter((e) => e.verdict === "routed").length}/${routing.length} ` +
+        `| ${mine.reduce((total, entry) => total + entry.rejections, 0)}/${mine.length} |`
+    )
+  }
+  out.push("")
+  out.push(`## Every run`)
+  out.push("")
+  out.push(`| arm | case | run | verdict | finish | chars | completion | s | calls | tokens | route |`)
+  out.push(`|---|---|---|---|---|---|---|---|---|---|---|`)
+  for (const entry of runs) {
+    out.push(
+      `| ${entry.arm} | ${entry.slug} | ${entry.run} | ${entry.verdict} ` +
+        `| ${entry.finishReason ?? "—"} | ${entry.contentChars} ` +
+        `| ${entry.completionTokens ?? "—"} | ${entry.seconds.toFixed(1)} | ${entry.calls} ` +
+        `| ${entry.tokens} | ${entry.route.join(" → ") || "—"}` +
+        `${entry.rejections > 0 ? ` (${entry.rejections} rejected)` : ""} |`
+    )
+  }
+  out.push("")
+  out.push(`## Replies`)
+  out.push("")
+  for (const entry of runs) {
+    out.push(`- **${entry.arm} / ${entry.slug} ${entry.run}** (${entry.verdict}): ${JSON.stringify(entry.reply)}`)
+    if (entry.body) out.push(`  - on disk: ${JSON.stringify(entry.body)}`)
+    if (entry.missing.length > 0) out.push(`  - missing from the reply: ${entry.missing.join(", ")}`)
+    if (entry.note) out.push(`  - note: ${entry.note}`)
+  }
+  fs.writeFileSync(LENGTH_REPORT, `${out.join("\n")}\n`)
+  console.log(`\n  report: ${LENGTH_REPORT}`)
+}
+
 // ------------------------------------------------------------------- main
 
 const commands: Record<string, () => void | Promise<void>> = {
@@ -2615,6 +3286,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   rejudge: verifyRejudge,
   nonsense: verifyNonsense,
   readback: verifyReadBack,
+  length: verifyLength,
 }
 
 async function main(): Promise<void> {

@@ -3,6 +3,7 @@ import path from "path"
 import { randomUUID } from "crypto"
 import {
   chat as defaultChat,
+  describeCost,
   isParsingFailure,
   isToolChoiceRejection,
   LLMDeadlineError,
@@ -1070,7 +1071,14 @@ export class Session {
             `the call carried ${sent.length} messages ` +
             `(${sent.filter((m) => m.role !== "system").length} of them conversation), ` +
             `finish_reason=${response.finishReason ?? "unknown"}, ` +
-            `reasoning tokens ${response.reasoning ? "arrived" : "did not arrive"}`
+            `reasoning tokens ${response.reasoning ? "arrived" : "did not arrive"}, ` +
+            // What the completion actually cost. Added because the one shape
+            // this warning could not explain was `finish_reason=length` with
+            // reasoning deltas and no content: the provider had cut the reply
+            // off and nothing could say whether it spent two hundred tokens or
+            // sixty-five thousand doing it, which is the difference between a
+            // prompt problem and a completion cap.
+            describeCost(response.cost)
         )
 
         // Asked again once, with no tools, which is the lever the malformed

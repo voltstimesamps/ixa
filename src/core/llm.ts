@@ -61,7 +61,60 @@ const loggingFetch = async (input: RequestInfo | URL, init?: RequestInit): Promi
         (retryAfter ? ` retry-after=${retryAfter}` : "")
     )
   }
+
+  rememberRateLimit(response.headers)
   return response
+}
+
+// ------------------------------------------------------- the rate-limit view
+//
+// Groq stamps the remaining per-minute allowance on every response, and the
+// only code that sees a response header is the fetch wrapper above. Nothing in
+// production reads this: it exists so a MEASUREMENT RUN can pause before it
+// earns a 429, which is the difference between a table with a hole in it and
+// one that took six minutes longer.
+//
+// Deliberately a snapshot of the last call rather than a running estimate. The
+// numbers are the provider's own and they refill on their own schedule; a
+// local model of that schedule would be a second source of truth that drifts.
+export type RateLimit = {
+  // Requests and tokens the current minute has left, as the provider reports
+  // them. Null when the header was absent — a local or non-Groq backend.
+  remainingTokens: number | null
+  limitTokens: number | null
+  remainingRequests: number | null
+  // The provider's own reset hint, verbatim ("7.66s"), because it is a string
+  // in a format nobody here should be parsing.
+  resetTokens: string | null
+  at: number
+}
+
+let lastRateLimit: RateLimit | null = null
+
+function headerNumber(headers: Headers, name: string): number | null {
+  const raw = headers.get(name)
+  if (raw === null) return null
+  const value = Number(raw)
+  return Number.isFinite(value) ? value : null
+}
+
+function rememberRateLimit(headers: Headers): void {
+  const remainingTokens = headerNumber(headers, "x-ratelimit-remaining-tokens")
+  const remainingRequests = headerNumber(headers, "x-ratelimit-remaining-requests")
+  // Nothing at all means this backend does not report limits; keeping the
+  // previous snapshot would be worse than having none.
+  if (remainingTokens === null && remainingRequests === null) return
+  lastRateLimit = {
+    remainingTokens,
+    limitTokens: headerNumber(headers, "x-ratelimit-limit-tokens"),
+    remainingRequests,
+    resetTokens: headers.get("x-ratelimit-reset-tokens"),
+    at: Date.now(),
+  }
+}
+
+export function rateLimit(): RateLimit | null {
+  return lastRateLimit
 }
 
 const client = new OpenAI({
@@ -81,14 +134,46 @@ export type ToolCall = {
   arguments: string
 }
 
-// The two diagnostic fields on a text reply exist for ONE question: when the
-// content comes back empty, was the completion spent somewhere the harness
-// cannot see? They are optional because every test that builds a reply by
-// hand predates them, and nothing branches on either — they are logged and
-// nothing more.
+// What one call spent. Every field is diagnostic: nothing in the tool loop
+// branches on any of them, they are logged and reported and nothing more.
+//
+// The reason they exist is ONE question. A live turn came back with
+// `finish_reason=length`, reasoning deltas, and zero characters of content —
+// the provider had cut the reply off, and nothing anywhere could say whether
+// it had spent two hundred tokens or sixty-five thousand getting there. The
+// answer decides whether the fix is a completion cap, a cheaper reasoning
+// effort, or the prompt, and it cannot be guessed from the text.
+//
+// `promptTokens` / `completionTokens` / `reasoningTokens` are the PROVIDER's
+// count and arrive on the final stream chunk, which is only sent because the
+// request asks for it (`stream_options.include_usage`). They are null when it
+// did not arrive — an aborted stream never reaches that chunk, and a local
+// backend may not send one at all.
+//
+// `reasoningChars` and `elapsedMs` are counted HERE, because they are the two
+// things the provider cannot report and they were already in hand: the
+// reasoning deltas stream past this code either way, and a length cut that
+// takes thirty seconds is a different problem from one that takes three.
+export type CallCost = {
+  promptTokens: number | null
+  completionTokens: number | null
+  reasoningTokens: number | null
+  reasoningChars: number
+  elapsedMs: number
+}
+
+// `finishReason` and `reasoning` answer the same question CallCost does, and
+// predate it. All three fields are optional because every test that builds a
+// reply by hand predates all of them, and nothing branches on any of them.
 export type LLMResponse =
-  | { type: "text"; content: string; finishReason?: string | null; reasoning?: boolean }
-  | { type: "tool_calls"; calls: ToolCall[] }
+  | {
+      type: "text"
+      content: string
+      finishReason?: string | null
+      reasoning?: boolean
+      cost?: CallCost
+    }
+  | { type: "tool_calls"; calls: ToolCall[]; cost?: CallCost }
 
 // Thrown when one of our own deadlines fires. Distinct from a transport error
 // so the tool loop's malformed-tool-call retry never mistakes a timeout for a
@@ -264,10 +349,29 @@ function withDeadline<T>(promise: Promise<T>, ms: number, reason: string): Promi
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
 }
 
+// Per-call overrides for the two request parameters that bound a completion.
+//
+// NOTHING IN PRODUCTION PASSES EITHER ONE, and that is deliberate: the
+// defaults are the provider's (65,536 max completion tokens and
+// `reasoning_effort: medium` for `openai/gpt-oss-20b`) and changing them is a
+// behaviour change that has to be measured before it ships. This exists so the
+// measurement can be made at all — `voice-behavior-verify.ts length` runs the
+// same case under four combinations of them and reports what each one costs.
+//
+// When the measurement settles, whichever value wins moves into `config.llm`
+// and is passed from one place. Until then an unset field means "send nothing
+// and let the provider decide", which is exactly what the live code does.
+export type CallOverrides = {
+  reasoningEffort?: "low" | "medium" | "high"
+  maxCompletionTokens?: number
+}
+
+export type ChatOptions = { silent?: boolean } & CallOverrides
+
 export async function chat(
   messages: Message[],
   tools?: OpenAI.Chat.ChatCompletionTool[],
-  options?: { silent?: boolean }
+  options?: ChatOptions
 ): Promise<LLMResponse> {
   return withArgumentRetry(() => attempt(messages, tools, options))
 }
@@ -275,7 +379,7 @@ export async function chat(
 async function attempt(
   messages: Message[],
   tools?: OpenAI.Chat.ChatCompletionTool[],
-  options?: { silent?: boolean }
+  options?: ChatOptions
 ): Promise<LLMResponse> {
   // One controller for the whole call. Aborting it reaches the SDK (which
   // checks the signal between retry attempts) and the underlying socket, so
@@ -306,6 +410,12 @@ async function attempt(
   // where neither did, and only this tells them apart.
   let finishReason: string | null = null
   let reasoning = false
+  // Chars of reasoning delta, and the clock. Both free: the deltas stream past
+  // here either way, and a length cut's duration is the cheapest way to tell a
+  // model that reasoned for thirty seconds from one that stopped at once.
+  let reasoningChars = 0
+  const startedAt = Date.now()
+  let usage: OpenAI.Completions.CompletionUsage | null = null
 
   try {
     const stream = await client.chat.completions.create(
@@ -316,6 +426,17 @@ async function attempt(
         tool_choice: tools?.length ? "auto" : undefined,
         temperature: 0.2,
         stream: true,
+        // The only reason the token counts exist. Without it a streamed
+        // response carries no usage at all, so a length cut could not say how
+        // much it had spent. It adds ONE extra chunk at the end of the stream
+        // and changes nothing the model sees.
+        stream_options: { include_usage: true },
+        // Omitted unless a caller asks, so the wire request is byte for byte
+        // what it was. See CallOverrides.
+        ...(options?.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
+        ...(options?.maxCompletionTokens
+          ? { max_completion_tokens: options.maxCompletionTokens }
+          : {}),
       },
       { signal: controller.signal, timeout: config.llm.requestTimeoutMs }
     )
@@ -344,11 +465,23 @@ async function attempt(
       // often carries an empty delta, and that is the one chunk worth reading.
       finishReason = next.value.choices[0]?.finish_reason ?? finishReason
 
+      // The usage chunk is the LAST one and it has no choices at all, so it
+      // would be dropped by the delta guard below. Groq has also carried usage
+      // under `x_groq` on this endpoint, before `stream_options` existed;
+      // both are read because which one arrives is the provider's business and
+      // a missing count would read as "the call spent nothing".
+      usage =
+        next.value.usage ??
+        (next.value as { x_groq?: { usage?: OpenAI.Completions.CompletionUsage } }).x_groq?.usage ??
+        usage
+
       const delta = next.value.choices[0]?.delta
       if (!delta) continue
 
-      if ((delta as { reasoning?: unknown }).reasoning) {
+      const reasoningDelta = (delta as { reasoning?: unknown }).reasoning
+      if (reasoningDelta) {
         reasoning = true
+        if (typeof reasoningDelta === "string") reasoningChars += reasoningDelta.length
       }
 
       if (delta.content) {
@@ -376,9 +509,36 @@ async function attempt(
     clearTimeout(ceiling)
   }
 
+  const cost: CallCost = {
+    promptTokens: usage?.prompt_tokens ?? null,
+    completionTokens: usage?.completion_tokens ?? null,
+    reasoningTokens: usage?.completion_tokens_details?.reasoning_tokens ?? null,
+    reasoningChars,
+    elapsedMs: Date.now() - startedAt,
+  }
+
+  // Only the endings nobody can currently see. "stop" is an ordinary reply and
+  // a line per turn saying so is noise; "length" is a reply the provider cut
+  // off mid-sentence, which has never been visible here and is
+  // indistinguishable from a short answer by reading the text.
+  //
+  // Logged BEFORE the tool-call return, not after it as it used to be, so a
+  // length cut that lands in the middle of a tool call says so too — that
+  // shape was invisible, and it is the one where the turn has work on the
+  // floor. The empty-content case also gets a line from the tool loop, which
+  // can say how much conversation the call carried: see the empty-reply
+  // warning in session.ts.
+  if (finishReason && finishReason !== "stop" && finishReason !== "tool_calls") {
+    console.log(
+      `llm finish_reason=${finishReason} (${textContent.length} chars of content, ` +
+        `${toolCallMap.size} tool call${toolCallMap.size === 1 ? "" : "s"}, ${describeCost(cost)})`
+    )
+  }
+
   if (toolCallMap.size > 0) {
     return {
       type: "tool_calls",
+      cost,
       calls: Array.from(toolCallMap.entries())
         .sort(([a], [b]) => a - b)
         .map(([, tc]) => tc),
@@ -391,21 +551,22 @@ async function attempt(
     throw new Error("malformed tool call in text content")
   }
 
-  // Only the endings nobody can currently see. "stop" is an ordinary reply and
-  // a line per turn saying so is noise; "length" is a reply the provider cut
-  // off mid-sentence, which has never been visible here and is indistinguishable
-  // from a short answer by reading the text. The empty-content case gets its
-  // line from the tool loop, which can also say how much conversation the call
-  // carried — see the empty-reply warning in session.ts.
-  if (finishReason && finishReason !== "stop" && finishReason !== "tool_calls") {
-    console.log(
-      `llm finish_reason=${finishReason} (${textContent.length} chars of content` +
-        `${reasoning ? ", reasoning tokens arrived" : ""})`
-    )
-  }
-
   if (!options?.silent) {
     process.stdout.write(`Ixa: ${textContent}\n\n`)
   }
-  return { type: "text", content: textContent, finishReason, reasoning }
+  return { type: "text", content: textContent, finishReason, reasoning, cost }
+}
+
+// One phrase for every log line that reports what a call spent, so the fields
+// are named the same way wherever they appear. A count the provider did not
+// send reads as "unknown" rather than as 0, which is a different claim.
+export function describeCost(cost: CallCost | undefined): string {
+  if (!cost) return "cost unknown"
+  const token = (value: number | null): string => (value === null ? "unknown" : String(value))
+  return (
+    `completion_tokens=${token(cost.completionTokens)}, ` +
+    `reasoning_tokens=${token(cost.reasoningTokens)}, ` +
+    `reasoning_chars=${cost.reasoningChars}, ` +
+    `${cost.elapsedMs}ms`
+  )
 }
