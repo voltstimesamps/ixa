@@ -7,6 +7,10 @@ every hint mode against the same audio without restarting anything:
 
     sidecars/stt/venv/bin/python dev/scripts/stt-vocab-check.py
 
+and the path matrix alone — model x hint list x mode, timed — with
+
+    sidecars/stt/venv/bin/python dev/scripts/stt-vocab-check.py paths
+
 The sidecar does not need to be running, and no backend is needed.
 
 Two things are being measured, and they pull in opposite directions:
@@ -33,7 +37,9 @@ audio needs a real recording to prove fixed.
 """
 import json
 import os
+import statistics
 import sys
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -45,7 +51,7 @@ import numpy as np
 from faster_whisper import WhisperModel
 from faster_whisper.audio import decode_audio
 
-from hints import HINT_MODES, hintArgs, parseHintWords, segmentRejection
+from hints import HINT_MODES, defaultHintWords, hintArgs, parseHintWords, segmentRejection
 
 repoRoot = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 samplesDir = os.path.join(repoRoot, "Ixa-Tests", "stt")
@@ -53,12 +59,13 @@ cacheDir = os.path.join(repoRoot, "Ixa-Tests", "stt", "synthesized")
 
 modelName = os.environ.get("STT_MODEL", "base.en")
 ttsUrl = os.environ.get("TTS_URL", "http://localhost:5001")
-hintWords = parseHintWords(
-    os.environ.get(
-        "STT_HOTWORDS",
-        "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale, "
-        "RTX 3090, RTX 4090, RTX 5090",
-    )
+# The shipped list, from the file src/config.ts reads for the same purpose.
+# There used to be a second copy of these twelve words right here, identical by
+# hand, with nothing to say so if they drifted.
+hintWords = (
+    parseHintWords(os.environ["STT_HOTWORDS"])
+    if "STT_HOTWORDS" in os.environ
+    else defaultHintWords()
 )
 
 # expect: a substring the transcript must contain, case-insensitively.
@@ -108,6 +115,75 @@ SHORT_CASES = [
     ("okay", "Okay.", "okay"),
     ("thanks", "Thanks.", "thanks"),
 ]
+
+# ---------------------------------------------------------------- paths
+#
+# A PATH IS A SENTENCE FULL OF PROPER NOUNS, and that is a different problem
+# from a product name. The live failure: "write a note that the Ixa repo is at
+# /home/wyatt/Projects/ixa", spoken with the slashes said aloud, came back as
+#
+#   "... slash home slash WALLET slash PROJECT slash Ixa"
+#
+# and the note on disk said /home/wallet/project/Ixa. Two errors, both lexical:
+# base.en has no reason to prefer the name "Wyatt" over the common noun
+# "wallet", and nothing in the hint list mentions either "Wyatt" or "Projects".
+# "Ixa" came through, which is the available evidence that the mechanism works.
+#
+# Scored on THE TOKENS THAT BROKE, not on the whole sentence: "projects"
+# rendered with a lowercase p is not a mishearing anyone can hear, and demanding
+# the full sentence would score punctuation.
+#
+# `forbid` is the negative control. A hint list that simply teaches the decoder
+# to prefer "Wyatt" wherever it used to hear "wallet" has not fixed anything —
+# it has moved the error onto every sentence about a wallet. One case asks about
+# a wallet and must still say so.
+PATH_CASES = [
+    {
+        "slug": "path-wyatt-note",
+        "text": "Write a note in your notebook that the Ixa repo is at slash home slash wyatt slash Projects slash ixa",
+        "expect": ["wyatt", "projects", "ixa"],
+        "forbid": [],
+    },
+    {
+        "slug": "path-backend-src",
+        "text": "The backend lives at slash home slash wyatt slash Projects slash ixa slash src",
+        "expect": ["wyatt", "projects", "ixa", "src"],
+        "forbid": [],
+    },
+    {
+        "slug": "path-vault",
+        "text": "Open slash home slash wyatt slash Ixa dash Vault",
+        "expect": ["wyatt", "ixa", "vault"],
+        "forbid": [],
+    },
+    {
+        "slug": "path-home",
+        "text": "Remember that my home directory is slash home slash wyatt",
+        "expect": ["wyatt", "home"],
+        "forbid": [],
+    },
+    {
+        "slug": "wallet-control",
+        "text": "Where did I leave my wallet?",
+        "expect": ["wallet"],
+        "forbid": ["wyatt"],
+    },
+]
+
+# The candidate addition, measured against the shipped list rather than
+# replacing it. Both words come straight from the live failure.
+EXTRA_HINT_WORDS = ["Wyatt", "Projects"]
+
+# Which models to compare. small.en is the next lever named in
+# ARCHITECTURE.md's open items; it is ~3.3x base.en's parameters and is
+# downloaded on first use.
+PATH_MODELS = [m.strip() for m in os.environ.get("STT_MODELS", "base.en,small.en").split(",") if m.strip()]
+
+# Only the two that matter for this question. "hotwords" and "both" tie with
+# "prompt" on the domain cases and "prompt" already won that tie on transcript
+# quality; what is unknown here is whether hints help a path AT ALL.
+PATH_MODES = ["off", "prompt"]
+
 
 # Threshold pairs to sweep. (maxNoSpeechProb, minAvgLogprob); None disables.
 THRESHOLDS = [
@@ -222,7 +298,183 @@ def transcribe(model, audio, mode, maxNoSpeechProb, minAvgLogprob):
     return "".join(kept).strip(), dropped
 
 
+def transcribeTimed(model, audio, kwargs, maxNoSpeechProb=None, minAvgLogprob=None):
+    """One transcription, and how long it took. Mirrors the sidecar's call."""
+    start = time.monotonic()
+    segments, _info = model.transcribe(audio, beam_size=5, vad_filter=True, **kwargs)
+    # faster-whisper's generator is lazy: the work happens while the segments
+    # are consumed, so the clock has to stop AFTER the list is built or the
+    # timing measures setting up an iterator.
+    kept = []
+    for segment in segments:
+        if not segmentRejection(segment, maxNoSpeechProb, minAvgLogprob):
+            kept.append(segment.text)
+    elapsed = time.monotonic() - start
+    return "".join(kept).strip(), elapsed
+
+
+def scorePath(case, text):
+    """(missing, forbidden) for one path case, matched case-insensitively."""
+    flat = text.lower()
+    missing = [token for token in case["expect"] if token.lower() not in flat]
+    forbidden = [token for token in case["forbid"] if token.lower() in flat]
+    return missing, forbidden
+
+
+def pathAudio():
+    """Every path case's audio, with whether it is a real recording.
+
+    Real recordings are what this measurement is FOR. The existing domain-word
+    run is on synthesized speech and ARCHITECTURE.md already says so twice: a
+    case that only fails on a microphone cannot be proved fixed by Kokoro.
+    Worse here than there — Kokoro renders "Wyatt" through the same espeak
+    fallback Whisper is then asked to recover it from, so a synthesized pass
+    measures a round trip through one pronunciation guess, not a voice.
+    """
+    out = {}
+    for case in PATH_CASES:
+        slug = case["slug"]
+        path = findSample(slug) or findLegacySample(slug)
+        if path:
+            out[slug] = (decode_audio(path, sampling_rate=16000), True, os.path.basename(path))
+            continue
+        synthesized = synthesize(case["text"], slug)
+        if synthesized:
+            out[slug] = (decode_audio(synthesized, sampling_rate=16000), False, "synthesized")
+        else:
+            print(f"  SKIP  {slug:<18} no recording and could not synthesize")
+    return out
+
+
+def reportPathTable(title, rows, cases):
+    """One table per audio source. Rows are (model, mode, listName, slug, ...)."""
+    if not rows:
+        return
+    print(f"\n  --- {title} ---")
+    arms = []
+    for row in rows:
+        arm = (row["model"], row["mode"], row["list"])
+        if arm not in arms:
+            arms.append(arm)
+
+    header = f"  {'model':<9} {'mode':<6} {'hints':<14} {'score':<7}  " + "  ".join(
+        f"{case['slug'][:16]:<16}" for case in cases
+    )
+    print(header)
+    for arm in arms:
+        mine = [row for row in rows if (row["model"], row["mode"], row["list"]) == arm]
+        passed = sum(1 for row in mine if row["ok"])
+        cells = []
+        for case in cases:
+            row = next((entry for entry in mine if entry["slug"] == case["slug"]), None)
+            if row is None:
+                cells.append(f"{'-':<16}")
+            elif row["ok"]:
+                cells.append(f"{'ok':<16}")
+            else:
+                bad = ",".join(row["missing"] + [f"!{token}" for token in row["forbidden"]])
+                cells.append(f"{bad[:16]:<16}")
+        print(f"  {arm[0]:<9} {arm[1]:<6} {arm[2]:<14} {passed}/{len(mine):<5}  " + "  ".join(cells))
+
+    print("\n  transcripts:")
+    for arm in arms:
+        for row in [entry for entry in rows if (entry["model"], entry["mode"], entry["list"]) == arm]:
+            mark = "ok  " if row["ok"] else "FAIL"
+            print(f"    {mark} [{row['model']} {row['mode']} {row['list']}] {row['slug']}: {row['text']!r}")
+
+
+def verifyPaths():
+    """The path matrix: model x hint list x mode, timed."""
+    print("\n=== paths: model x hint list x mode ===")
+    print("  Scored on the tokens the live failure broke (wyatt, projects), with")
+    print("  one negative control that must still say 'wallet'.\n")
+    print("  STT RUNS ON THIS MACHINE — the backend spawns the sidecar in-process,")
+    print("  so these timings are the ones the voice loop actually pays.\n")
+
+    audioByCase = pathAudio()
+    for case in PATH_CASES:
+        if case["slug"] in audioByCase:
+            audio, real, source = audioByCase[case["slug"]]
+            print(f"  ok    {case['slug']:<18} {len(audio) / 16000:5.1f}s  {source}")
+
+    lists = [("shipped", hintWords), ("shipped+paths", hintWords + EXTRA_HINT_WORDS)]
+    rows = []
+    timings = {}
+
+    for name in PATH_MODELS:
+        print(f"\n  loading '{name}' (cpu/int8)...")
+        try:
+            start = time.monotonic()
+            model = WhisperModel(name, device="cpu", compute_type="int8")
+            loadSeconds = time.monotonic() - start
+        except Exception as err:
+            print(f"  ! cannot load {name}: {err}")
+            continue
+        # First load of a model DOWNLOADS it (small.en is 464MB), so this
+        # figure is startup cost only on a machine that already has it —
+        # measured at 0.8s cached for both models.
+        print(f"    loaded in {loadSeconds:.1f}s (includes the download on first use)")
+        timings[name] = {"load": loadSeconds, "runs": []}
+
+        for mode in PATH_MODES:
+            for listName, words in lists:
+                # With hints off the list is not read at all, so measuring both
+                # lists against it would report the same number twice.
+                if mode == "off" and listName != lists[0][0]:
+                    continue
+                kwargs = hintArgs(mode, words)
+                for case in PATH_CASES:
+                    if case["slug"] not in audioByCase:
+                        continue
+                    audio, real, _source = audioByCase[case["slug"]]
+                    text, elapsed = transcribeTimed(model, audio, kwargs)
+                    timings[name]["runs"].append((elapsed, len(audio) / 16000))
+                    missing, forbidden = scorePath(case, text)
+                    rows.append({
+                        "model": name, "mode": mode,
+                        "list": "n/a" if mode == "off" else listName,
+                        "slug": case["slug"], "real": real, "text": text,
+                        "missing": missing, "forbidden": forbidden,
+                        "ok": not missing and not forbidden,
+                    })
+
+    realCases = [case for case in PATH_CASES if audioByCase.get(case["slug"], (None, False, ""))[1]]
+    synthCases = [case for case in PATH_CASES if case["slug"] in audioByCase and not audioByCase[case["slug"]][1]]
+    reportPathTable("REAL RECORDINGS", [row for row in rows if row["real"]], realCases)
+    reportPathTable("SYNTHESIZED (weak evidence — see pathAudio)", [row for row in rows if not row["real"]], synthCases)
+
+    print("\n  --- latency, per transcription ---")
+    print(f"  {'model':<9} {'load':>7}  {'median':>8} {'max':>8}  {'median rtf':>10}  runs")
+    for name, data in timings.items():
+        if not data["runs"]:
+            continue
+        times = sorted(entry[0] for entry in data["runs"])
+        rtfs = sorted(entry[0] / entry[1] for entry in data["runs"])
+        print(
+            f"  {name:<9} {data['load']:6.1f}s  {statistics.median(times) * 1000:7.0f}ms"
+            f" {max(times) * 1000:7.0f}ms  {statistics.median(rtfs):10.2f}  {len(times)}"
+        )
+    if len(timings) > 1:
+        names = list(timings.keys())
+        base = statistics.median(sorted(entry[0] for entry in timings[names[0]]["runs"]))
+        for other in names[1:]:
+            mine = statistics.median(sorted(entry[0] for entry in timings[other]["runs"]))
+            print(f"\n  {other} is {mine / base:.1f}x {names[0]} per transcription.")
+    print("\n  This latency is serial with the turn: STT finishes before the LLM")
+    print("  call starts, so it is added to time-to-first-audio on every turn.")
+
+
 def main():
+    # `paths` runs the path matrix alone. The sections above load their own
+    # model and sweep thresholds, which is several minutes of work answering a
+    # different question, and the path matrix already loads every model it
+    # compares.
+    if "paths" in sys.argv[1:]:
+        print(f"Hint vocabulary: {', '.join(hintWords)}")
+        print(f"Candidate addition: {', '.join(EXTRA_HINT_WORDS)}")
+        verifyPaths()
+        return
+
     print(f"Loading faster-whisper '{modelName}' (cpu/int8)...")
     model = WhisperModel(modelName, device="cpu", compute_type="int8")
     print(f"Hint vocabulary: {', '.join(hintWords)}\n")
@@ -331,8 +583,12 @@ def main():
         for casualty in casualties:
             print(f"             LOST    {casualty}")
 
+    verifyPaths()
+
     print("\nSet IXA_STT_HINT_MODE, IXA_STT_MAX_NO_SPEECH_PROB and")
     print("IXA_STT_MIN_AVG_LOGPROB from the rows above.")
+    print("The path matrix changes NO defaults on its own: STT_MODEL and")
+    print("IXA_STT_HOTWORDS are decided by reading the numbers.")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import fs from "fs"
 import os from "os"
 import path from "path"
 import * as dotenv from "dotenv"
@@ -7,6 +8,27 @@ dotenv.config()
 // compiled dist/config.js both sit exactly one level under the repo root, so
 // the default data directory is the same whether Ixa runs via tsx or node.
 const repoRoot = path.resolve(__dirname, "..")
+
+// The STT hint vocabulary, read from the file the sidecar's own hints.py reads.
+// Blank lines and # comments are dropped; entries are comma-joined because
+// that is the shape STT_HOTWORDS travels in.
+//
+// Falls back to an EMPTY list rather than to a copy of the words: a second
+// copy here is the thing this file is removing, and no hints is a state the
+// sidecar already handles and reports on its startup line.
+function defaultHintWords(): string {
+  try {
+    return fs
+      .readFileSync(path.join(repoRoot, "sidecars", "stt", "hint-words.txt"), "utf8")
+      .split("\n")
+      .filter((line) => line.trim() && !line.trimStart().startsWith("#"))
+      .flatMap((line) => line.split(",").map((word) => word.trim()))
+      .filter((word) => word.length > 0)
+      .join(", ")
+  } catch {
+    return ""
+  }
+}
 
 export const config = {
   llm: {
@@ -102,15 +124,14 @@ export const config = {
     // Domain words faster-whisper is told to expect. base.en has never heard
     // of most of these, and the ones it mishears it mishears expensively:
     // "RTX 3090" came back as "$30.90" in a live price question.
-    // The bare brand names survive on their own; the MODEL NUMBERS do not.
-    // Live testing heard "RTX 3090" as "RTX 39D" — the decoder got "RTX" and
-    // then guessed at four digits it had no reason to expect. Whole model
-    // names are listed for that reason, not for completeness: the hint slot
-    // competes with the audio, so a longer list makes every entry weaker.
-    sttHotwords:
-      process.env.IXA_STT_HOTWORDS ??
-      "Ixa, RTX, GPU, VRAM, Groq, Kokoro, Qdrant, Ollama, Tailscale, " +
-        "RTX 3090, RTX 4090, RTX 5090",
+    //
+    // THE LIST LIVES IN sidecars/stt/hint-words.txt, with the reasoning for
+    // each entry beside it, because two readers need the same list: this, for
+    // what the sidecar runs, and dev/scripts/stt-vocab-check.py, for what the
+    // measurement measures. It was a literal here AND a second copy in the
+    // script's env default — identical by hand, with nothing to say so when
+    // they drifted.
+    sttHotwords: process.env.IXA_STT_HOTWORDS ?? defaultHintWords(),
     // How the hint list reaches faster-whisper: "hotwords", "prompt", "both"
     // or "off". Both mechanisms land in the same decoder slot and compose —
     // see sidecars/stt/hints.py.

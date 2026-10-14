@@ -18,7 +18,9 @@
 # invented segment from a real one.
 #
 # This module is imported by main.py AND by dev/scripts/stt-vocab-check.py, so
-# what the measurement measures is what the sidecar runs.
+# what the measurement measures is what the sidecar runs. The word list itself
+# lives in hint-words.txt beside this file, for the same reason.
+import os
 
 # Which hint mechanism to use. In faster-whisper 1.2.1 both land in the same
 # decoder slot and compose, so "both" is a real option rather than a conflict:
@@ -29,15 +31,39 @@ HINT_MODES = ("off", "hotwords", "prompt", "both")
 
 
 def parseHintWords(raw):
-    """A comma- or newline-separated hint list into a list of words."""
+    """A comma- or newline-separated hint list into a list of words.
+
+    Lines starting with # are dropped, so the shared hint-words.txt can carry
+    the reasoning for each entry next to the entry.
+    """
     if not raw:
         return []
     words = []
-    for piece in raw.replace("\n", ",").split(","):
-        word = piece.strip()
-        if word and word not in words:
-            words.append(word)
+    for line in raw.split("\n"):
+        if line.lstrip().startswith("#"):
+            continue
+        for piece in line.split(","):
+            word = piece.strip()
+            if word and word not in words:
+                words.append(word)
     return words
+
+
+# The shared word list. ONE FILE, TWO READERS: src/config.ts reads it for the
+# STT_HOTWORDS default and dev/scripts/stt-vocab-check.py reads it through
+# here, so the measurement cannot be measuring a different vocabulary from the
+# one the sidecar runs. It used to be a literal in config.ts with a second copy
+# in the script's env default.
+HINT_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hint-words.txt")
+
+
+def defaultHintWords(path=None):
+    """The hint list from hint-words.txt, or [] if it is not readable."""
+    try:
+        with open(path or HINT_WORDS_FILE, encoding="utf-8") as handle:
+            return parseHintWords(handle.read())
+    except OSError:
+        return []
 
 
 def buildHotwords(words):

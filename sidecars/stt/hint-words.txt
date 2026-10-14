@@ -1,0 +1,36 @@
+# The vocabulary faster-whisper is told to expect, one entry per line.
+#
+# ONE FILE, TWO READERS, so that what the measurement measures is what the
+# sidecar runs: src/config.ts reads it for the STT_HOTWORDS default, and
+# dev/scripts/stt-vocab-check.py reads it through hints.py. It used to be a
+# string literal in config.ts with a SECOND copy in the script's env default —
+# identical by hand, and nothing would have said so when they drifted.
+#
+# Blank lines and lines starting with # are ignored. Order is the order the
+# decoder sees; an entry may contain spaces ("RTX 3090").
+#
+# KEEP IT SHORT. faster-whisper truncates the hint tokens at half the model's
+# context, and everything in this slot competes with the audio for the
+# decoder's attention, so every entry added makes every other entry weaker.
+# That is measurable, and it is why a candidate addition is run against the
+# EXISTING cases as well as the new ones before it lands here.
+
+# base.en returned "Kakaro", "Q-Drant", "Alama" and "tail skill" for these
+# unhinted. Measured 9/14 unhinted against 14/14 with hints.
+Ixa
+RTX
+GPU
+VRAM
+Groq
+Kokoro
+Qdrant
+Ollama
+Tailscale
+
+# The MODEL NUMBERS fail separately from the brand: live testing heard
+# "RTX 3090" as "RTX 39D" — the decoder got "RTX" and then guessed at four
+# digits it had no reason to expect. Unverified on real audio; the measurement
+# cannot separate them on synthesized speech, where all four pass unhinted.
+RTX 3090
+RTX 4090
+RTX 5090
