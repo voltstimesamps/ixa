@@ -1,3 +1,4 @@
+import fs from "fs"
 import { config } from "../config"
 import type { Embedder } from "./embeddings"
 import { chunkSections, type NoteChunk } from "./note-chunks"
@@ -416,10 +417,21 @@ export class Notebook {
       const vector = await this.embedder.embed("warm up", "query")
       await this.index.ensureCollection(vector.length)
       this.markUp()
+      // The vault is created by the FIRST NOTE, in writeNoteFile, and not
+      // here. Creating it at startup would leave an empty ~/Ixa-Vault on
+      // every machine that merely boots Ixa — a test run, a dev script, a
+      // probe — and buys nothing, because `mkdirSync(..., { recursive: true })`
+      // on the write path already makes the real save safe. Nothing else in
+      // the harness reads the directory: the counts below come from SQLite.
+      //
+      // What the line must not do is print a path that does not exist as
+      // though it were sitting there. It did, on the day the notebook first
+      // ran: the vault appeared only when the first note was saved, minutes
+      // after startup said where it was.
       console.log(
         `notebook: ready — ${this.store.countActive()} active note(s), ` +
           `${this.store.countChunks()} chunk(s), ${this.store.countNotIndexedChunks()} awaiting ` +
-          `indexing, vault ${this.vaultPath}`
+          `indexing, vault ${this.vaultPath}${fs.existsSync(this.vaultPath) ? "" : " (created with the first note)"}`
       )
     } catch (err) {
       this.markDown(err instanceof Error ? err.message : String(err))

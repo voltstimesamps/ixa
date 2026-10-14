@@ -2,8 +2,9 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import fs from "fs"
 import path from "path"
-import { makeNotebook, captureLogs } from "./memory-helpers"
+import { makeNotebook, captureLogs, withTurn } from "./memory-helpers"
 import { parseNote } from "../src/memory/notes-markdown"
+import { localDateString } from "../src/tools/notes"
 
 // The write path. THE FILE IS THE SOURCE OF TRUTH, so every one of these
 // writes a real file into a throwaway vault and reads it back off disk — a
@@ -314,4 +315,45 @@ test("one warning for an index outage, not one per note", async (t) => {
 
   const outages = warnings.filter((line) => line.includes("note index is unavailable"))
   assert.equal(outages.length, 1, `expected one outage warning, got ${JSON.stringify(warnings)}`)
+})
+
+// The startup line says where the vault is. It must not say that about a
+// directory that is not there yet — which it did on the day the notebook first
+// ran: the vault appeared minutes after startup had already named it.
+//
+// And it must still NOT create it. An empty ~/Ixa-Vault on every machine that
+// boots Ixa is a side effect bought for nothing, since writeNoteFile's
+// recursive mkdir already makes the first real save safe.
+test("the startup line marks a vault that does not exist yet, and does not create it", async (t) => {
+  const h = makeNotebook()
+  t.after(() => h.cleanup())
+
+  // makeNotebook mkdtemp's the vault, so remove it to get the first-run state.
+  fs.rmSync(h.vault, { recursive: true, force: true })
+  assert.equal(fs.existsSync(h.vault), false)
+
+  const { logs } = await captureLogs(() => h.notebook.start())
+
+  const ready = logs.find((line) => line.startsWith("notebook: ready"))
+  assert.ok(ready, "the startup line was printed")
+  assert.match(ready, /\(created with the first note\)$/)
+  assert.equal(fs.existsSync(h.vault), false, "startup must not create the vault")
+
+  // And once a note exists, the line is plain again.
+  await withTurn({ userText: "note that the repo is in Projects" }, () =>
+    h.notebook.save({
+      type: "reference",
+      title: "Where the repo is",
+      summary: "The repo is in Projects.",
+      sections: [{ heading: "Where", body: "The repo is in Projects." }],
+      source: "text",
+      date: localDateString(),
+    })
+  )
+  assert.equal(fs.existsSync(h.vault), true, "the first note created it")
+
+  const after = await captureLogs(() => h.notebook.start())
+  const second = after.logs.find((line) => line.startsWith("notebook: ready"))
+  assert.ok(second)
+  assert.doesNotMatch(second, /created with the first note/)
 })
