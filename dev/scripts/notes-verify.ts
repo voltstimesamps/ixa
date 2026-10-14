@@ -37,7 +37,7 @@ import fs from "fs"
 import path from "path"
 import { config } from "../../src/config"
 import { chat, type Message } from "../../src/core/llm"
-import { SYSTEM_PROMPT } from "../../src/core/session"
+import { SYSTEM_PROMPT, turnCallOptions } from "../../src/core/session"
 import { runWithSessionControl } from "../../src/core/session-context"
 import { registry } from "../../src/tools/registry"
 import { OllamaEmbedder } from "../../src/memory/embeddings"
@@ -259,7 +259,13 @@ async function run(): Promise<void> {
 
           for (let i = 0; i < MAX_ITERATIONS; i++) {
             llmCalls++
-            const response = await chat(messages, tools)
+            // What a VOICE turn sends, from the shipped config, because these
+            // probes are transcripts of spoken requests and the routing they
+            // measure has to be the routing the user gets. Before
+            // `turnCallOptions` existed this call sent neither parameter, so a
+            // run from before `reasoning_effort` was set is not comparable
+            // with one from after it.
+            const response = await chat(messages, tools, turnCallOptions("voice"))
             if (response.type === "text") {
               reply = response.content
               return

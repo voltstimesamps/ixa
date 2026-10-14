@@ -226,12 +226,17 @@ export const BUDGET_EXHAUSTED_FALLBACK =
 // from. Nothing else in the codebase sends either one: see `CallOverrides` in
 // llm.ts, and the note on the summarizer in ARCHITECTURE.md.
 //
+// Exported for the verification scripts, which drive `chat()` directly rather
+// than through a session: a script that measures "the shipped config" has to
+// send what a turn sends, and a second hand-written copy of this would be
+// measuring something else within a week.
+//
 // Both values are measured, and the measurement is in config.ts beside them.
 // The split is not: a voice turn is a person waiting for speech, where `low`
 // removed the truncation outright and answered 2.5x faster; a typed turn is a
 // written answer nobody is listening to, where nothing has measured what
 // `low` costs, so it keeps the provider's default.
-function turnCallOptions(origin: MessageOrigin): CallOverrides {
+export function turnCallOptions(origin: MessageOrigin): CallOverrides {
   return {
     ...(config.llm.maxCompletionTokens > 0
       ? { maxCompletionTokens: config.llm.maxCompletionTokens }
