@@ -14,6 +14,68 @@ print("Loading Kokoro model...")
 pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
 print("Kokoro ready.")
 
+
+# Whether Kokoro can pronounce a word that is not in its dictionary.
+#
+# THIS IS LOAD-BEARING AND IT FAILS SILENTLY. misaki's lexicon has never heard
+# of "Ixa", "Wyatt", "Qdrant" or "Kokoro", and KPipeline constructs its G2P
+# with `unk=''` — so an unpronounceable token contributes NOTHING. It is not
+# spoken as a noise or spelled out; it disappears.
+#
+# What covers it is an espeak fallback that KPipeline tries to build, and
+# catches and logs if it cannot (kokoro/pipeline.py: "EspeakFallback not
+# Enabled: OOD words will be skipped"). The library carries on without it.
+# There is no system espeak-ng here: `libespeak-ng.so` ships inside the venv
+# via espeakng_loader, a transitive pip dependency — which is exactly why it
+# can go missing without anyone touching this project.
+#
+# Measured through the real G2P, with the fallback and without it:
+#
+#   "/home/wyatt/Projects/ixa"  with  -> "slash home slash wyatt slash
+#                                         projects slash ixa"
+#                               without -> "home Projects"
+#   "/home/wallet/project/Ixa"  without -> "home wallet project"
+#
+# Every slash is dropped and both proper nouns vanish. The WRONG path then
+# sounds more complete than the right one, because "wallet" is a real word and
+# "wyatt" is not — so save_note's read-back, whose whole job is to make a
+# misheard value audible, would be reading back the wrong thing convincingly.
+# Ixa cannot say her own name either.
+#
+# Checked functionally rather than by testing `g2p.fallback is None`: what
+# matters is whether a word comes out with phonemes on it, not which object
+# claims it would provide them.
+OOD_PROBE = 'Ixa'
+
+
+def checkOutOfDictionaryWords() -> None:
+    try:
+        phonemes, _ = pipeline.g2p(OOD_PROBE)
+    except Exception as e:
+        phonemes = ''
+        print(f"[TTS] could not probe the G2P: {e}", flush=True)
+
+    if phonemes and phonemes.strip():
+        print(f"[TTS] out-of-dictionary words are pronounceable ({OOD_PROBE!r} -> {phonemes.strip()!r})", flush=True)
+        return
+
+    for line in (
+        "=" * 72,
+        "[TTS] WARNING: espeak fallback is NOT working.",
+        f"[TTS]   {OOD_PROBE!r} phonemized to nothing, so any word outside misaki's",
+        "[TTS]   dictionary will be SILENTLY DROPPED from speech — names, paths and",
+        "[TTS]   product names among them. Ixa cannot say her own name, and a note's",
+        "[TTS]   read-back will omit the value it exists to read back.",
+        "[TTS]   Nothing will error; replies will just be quietly missing words.",
+        "[TTS]   Fix: reinstall this sidecar's venv from sidecars/tts/requirements.txt",
+        "[TTS]   (espeakng_loader ships the library), or install espeak-ng system-wide.",
+        "=" * 72,
+    ):
+        print(line, flush=True)
+
+
+checkOutOfDictionaryWords()
+
 sampleRate = 24000
 defaultVoice = 'af_nova'
 port = 5001

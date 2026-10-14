@@ -1,0 +1,28 @@
+# Kokoro TTS sidecar. These are the versions INSTALLED AND MEASURED, not the
+# latest: every rendering decision in src/voice/ (the Unicode-space fold, the
+# part-number and price renderings) was measured against this misaki and this
+# kokoro, and an upgrade invalidates those measurements rather than inheriting
+# them. Re-run dev/scripts/tts-render-check.ts and tts-phonemes.py after any
+# bump here.
+#
+# Direct imports of main.py:
+kokoro==0.9.4
+torch==2.14.0
+numpy==2.4.6
+
+# NAMED EXPLICITLY ALTHOUGH KOKORO PULLS ALL THREE, because this is the chain
+# that lets Kokoro pronounce a word outside its dictionary, and it fails
+# SILENTLY: KPipeline builds its G2P with `unk=''`, tries to construct an
+# espeak fallback, and catches and logs if it cannot. Without the fallback,
+# names, paths and product names are dropped from speech with no error —
+# "/home/wyatt/Projects/ixa" is spoken as "home Projects" and Ixa cannot say
+# her own name. There is no system espeak-ng on the dev box; the library ships
+# inside the venv in espeakng_loader. main.py probes this at startup and warns
+# loudly, which is the other half of the same guard.
+misaki==0.9.4
+espeakng-loader==0.2.4
+phonemizer-fork==3.3.2
+
+# torch here is the stock PyPI wheel (2.14.0+cu130) and runs on CPU; no index
+# URL is needed to reproduce it. A CPU-only build would be smaller, and is a
+# separate decision from pinning what is already installed.
