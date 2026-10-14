@@ -67,7 +67,17 @@ test("a listing too large for the buffer says what to do instead", async () => {
     // in any of them. A narrower command does not help a model that does not
     // know where to point it.
     assert.match(out, /search_notes may already say/)
-    assert.ok(out.length < 700, "the message is a message, not a dump")
+    // Added after the live turn that answered this message with a shell_write
+    // redirect: "narrower" can be satisfied by putting the output somewhere,
+    // so the message names the flags that actually bound a tree and rules the
+    // redirect out in words.
+    assert.match(out, /-maxdepth/, "and the flag that bounds a tree")
+    assert.match(out, /node_modules/, "and the exclusion that removes most of the volume")
+    assert.match(out, /there is no shell here, so > does nothing/)
+    // The bound is why the wording above is tight rather than thorough: this
+    // string is handed to the model on every occurrence and competes with the
+    // conversation for the context budget.
+    assert.ok(out.length < 760, `the message is a message, not a dump: ${out.length} chars`)
   } finally {
     await rm(big, { recursive: true, force: true })
   }

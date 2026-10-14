@@ -5,6 +5,15 @@ import { resolve } from "path"
 import { homedir, platform } from "os"
 import type { Tool } from "./registry"
 import { isShellFailure } from "./shell-result"
+import {
+  argOperators,
+  chainingOperators,
+  displayCommand,
+  expandHome,
+  shellOperatorRefusal,
+  tokenize,
+  WRITE_OPERATOR_ADVICE,
+} from "./shell-command"
 
 const execFile = promisify(execFileCb)
 
@@ -46,6 +55,40 @@ interface ShellWriteInput {
   cwd?: string
 }
 
+// The argv this call will actually run, and the operators that mean it cannot.
+//
+// ONE function, called twice: once in `preflight` — before the user is asked
+// anything — and once in `execute`. Both have to agree, because the whole
+// point is that what the user approved is what runs; working it out twice in
+// two places is how they would stop agreeing.
+function parseInvocation(raw: ShellWriteInput): {
+  command: string
+  args: string[]
+  operators: string[]
+} {
+  let command = raw.command
+  let args = raw.args ?? []
+
+  // Tokenized like a shell rather than split on whitespace. shell_write used
+  // to do `command.trim().split(/\s+/)`, so `touch "my file"` became two
+  // arguments and created two files — and `args` was never examined for
+  // operators at all, which is how `[">", "/tmp/out.txt"]` got through.
+  let found: string[] = []
+  if (command.includes(" ") || /["'\\]/.test(command)) {
+    const parsed = tokenize(command)
+    command = parsed.tokens[0] ?? command
+    args = [...parsed.tokens.slice(1), ...args]
+    found = parsed.operators
+  }
+
+  const operators = chainingOperators(
+    [command, ...args],
+    [...found, ...argOperators(args)]
+  )
+
+  return { command, args: expandHome(args, homedir()), operators }
+}
+
 export const shellWriteTool: Tool = {
   name: "shell_write",
   description:
@@ -68,28 +111,45 @@ export const shellWriteTool: Tool = {
     required: ["command"],
   },
   requiresConfirmation: true,
+  // Everything that must be settled BEFORE the user is asked.
+  //
+  // Two things, and they are the same thing from two sides. A command that
+  // cannot run must be refused without a prompt, because asking someone to
+  // approve an impossible action wastes their attention and teaches them that
+  // approving is harmless. And the prompt that IS shown has to carry the real
+  // argv, because the rest of it is written by a language model.
+  //
+  // Live: the model called shell_write with args [">", "/tmp/pyfiles.txt"] to
+  // redirect find's output. The user was shown a confirmation describing a
+  // redirect, approved it, and find reported `'>': No such file or directory`.
+  // Both halves failed at once — the call was unrunnable and the description
+  // was fiction — and the user's "yes" is what makes that worse than a bad
+  // tool call: they were asked, and the question was wrong.
+  preflight: (input: unknown) => {
+    const { command, args, operators } = parseInvocation(input as ShellWriteInput)
+    if (operators.length > 0) {
+      return {
+        refusal: shellOperatorRefusal(operators[0]!, "shell_write", WRITE_OPERATOR_ADVICE),
+      }
+    }
+    return { command: displayCommand(command, args) }
+  },
   isFailure: isShellFailure,
   // Same argument as shell_read: the result is a function of the command and
   // the directory, so a repeat is a repeat. See registry.ts.
   dedupeFailures: true,
   execute: async (input) => {
     const raw = input as ShellWriteInput
-    let command = raw.command
-    let args = raw.args ?? []
     const cwd = raw.cwd ?? homedir()
+    const { command, args, operators } = parseInvocation(raw)
 
-    if (command.includes(" ")) {
-      const parts = command.trim().split(/\s+/)
-      command = parts[0] ?? command
-      args = [...parts.slice(1), ...args]
+    // Normally unreachable: `preflight` refuses these before the user is even
+    // asked. Kept because `execute` is reachable on its own — the tool is
+    // called directly by scripts and tests — and a tool whose safety depends
+    // on its caller having run a different method first is not safe.
+    if (operators.length > 0) {
+      return shellOperatorRefusal(operators[0]!, "shell_write", WRITE_OPERATOR_ADVICE)
     }
-
-    const home = homedir()
-    args = args.map((arg) => {
-      if (arg === "~" || arg === "$HOME") return home
-      if (arg.startsWith("~/")) return home + arg.slice(1)
-      return arg
-    })
 
     // Hard blocks — applied on Unix command name before translation
     if (command === "sudo") {

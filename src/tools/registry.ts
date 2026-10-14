@@ -1,5 +1,12 @@
 import type OpenAI from "openai"
 
+// What `preflight` can say. Both fields are optional: a tool may refuse
+// without a command to show, or offer a command with nothing to refuse.
+export interface ToolPreflight {
+  refusal?: string
+  command?: string
+}
+
 export interface Tool {
   name: string
   description: string
@@ -22,6 +29,27 @@ export interface Tool {
   // behaviour change too. `dedupeFailures` below is that behaviour, opted into
   // on its own.
   isFailure?: (result: string) => boolean
+  // Settled BEFORE the user is asked anything, and before `execute` runs.
+  //
+  // Two different jobs, both of which have to happen ahead of the
+  // confirmation prompt rather than inside `execute`:
+  //
+  //   `refusal`  this call cannot run, so do not ask about it and do not run
+  //              it. The string becomes the tool result the model reads.
+  //              Asking someone to approve an action that cannot work spends
+  //              their attention on nothing and teaches them that saying yes
+  //              is free.
+  //   `command`  exactly what will be executed, built by code, to be shown in
+  //              the confirmation beside the model's prose. The prose comes
+  //              from `generateDescription`, which is an LLM call — so without
+  //              this, a user approving a confirmation is approving a CLAIM
+  //              about the command. Live, that claim described a shell
+  //              redirect that could not run.
+  //
+  // Must be pure and synchronous: it runs on the path to a prompt the user is
+  // waiting for, and a preflight with side effects would be a side effect
+  // nobody confirmed.
+  preflight?: (input: unknown) => ToolPreflight
   // Whether an identical call that already failed this turn should be refused
   // rather than run again. Requires `isFailure` — there is no way to know a
   // call failed without it — and is deliberately a SEPARATE flag.

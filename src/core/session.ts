@@ -13,7 +13,7 @@ import {
   type Message,
   type ToolCall,
 } from "./llm"
-import { registry, type Tool } from "../tools/registry"
+import { registry, type Tool, type ToolPreflight } from "../tools/registry"
 import { config } from "../config"
 import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
@@ -395,6 +395,24 @@ export function parsingFailureRecord(toolCalls: number): string {
 // which is what makes "yes, keep going" answerable.
 export function budgetExhaustedRecord(toolCalls: number): string {
   return `${BUDGET_EXHAUSTED_FALLBACK} [tool budget spent after ${toolCalls} calls; no answer produced]`
+}
+
+// The text of a confirmation prompt: the model's description, and under it
+// the exact command the tool says it will run.
+//
+// THE CODE-GENERATED LINE IS NEVER REPLACED BY THE PROSE, only accompanied by
+// it. `generateDescription` is an LLM call, so the prose is a claim about the
+// command rather than the command — live, it described a shell redirect that
+// could not run, and the user approved that description. The argv goes last,
+// immediately above the yes/no prompt, so the last thing read before
+// answering is the only part nothing invented.
+//
+// Multi-line is safe on both clients and nothing speaks it: the desktop client
+// prints the prompt to the terminal and the browser /test page renders it in a
+// `white-space: pre-wrap` element. A confirmation never goes through TTS.
+export function confirmationText(description: string, command?: string): string {
+  if (!command) return description
+  return `${description.trim()}\n\nExactly this will run:\n  ${command}`
 }
 
 // What a tool result says when a confirming tool was not confirmed. Three
@@ -1403,6 +1421,23 @@ export class Session {
           const signature = callSignature(tc.name, tc.arguments)
           const alreadyFailed = failedCalls.get(signature)
 
+          // What the tool can say before anything happens: a refusal, or the
+          // exact command for the confirmation. Also after the cwd injection,
+          // so the line the user reads names the directory the call will
+          // actually run in.
+          //
+          // Arguments that will not parse are left to `executeTool`, which
+          // turns the throw into an error result the model can read. A
+          // preflight on arguments nobody can read would only guess.
+          let preflight: ToolPreflight | undefined
+          if (tool?.preflight) {
+            try {
+              preflight = tool.preflight(JSON.parse(tc.arguments || "{}"))
+            } catch {
+              preflight = undefined
+            }
+          }
+
           if (!tool) {
             result = JSON.stringify({ error: `Unknown tool: ${tc.name}` })
             logToolCall(tc.name, "unknown", Date.now(), tc.arguments)
@@ -1445,8 +1480,24 @@ export class Session {
               tc.arguments,
               `${searchesThisTurn} already run this turn`
             )
+          } else if (preflight?.refusal) {
+            // Refused before the user is asked, which is the point: the live
+            // failure was a user approving a redirect that could not run. A
+            // call the tool already knows is impossible must not become a
+            // question — see `preflight` in registry.ts.
+            result = preflight.refusal
+            logToolCall(
+              tool.name,
+              "refused",
+              Date.now(),
+              tc.arguments,
+              firstLine(preflight.refusal)
+            )
           } else if (tool.requiresConfirmation) {
-            const description = await this.generateDescription(tc.name, tc.arguments, origin)
+            const description = confirmationText(
+              await this.generateDescription(tc.name, tc.arguments, origin),
+              preflight?.command
+            )
             // Deliberately OUTSIDE the tool deadline. The user may take as
             // long as they like to answer, and the confirmer has its own
             // 30-second limit; charging their thinking time to the tool's
