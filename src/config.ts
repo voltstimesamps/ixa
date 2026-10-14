@@ -9,6 +9,41 @@ dotenv.config()
 // the default data directory is the same whether Ixa runs via tsx or node.
 const repoRoot = path.resolve(__dirname, "..")
 
+// How hard the model is told to think, for the turns that set it at all.
+//
+// MEASURED, which is the only reason it is set: on the long-note voice case,
+// `reasoning_effort: low` cut 0 of 10 turns off against 2 of 10 unset, spent
+// 85 median completion tokens against 1781, and answered in 1.3s median
+// against 3.2s — with the read-back guard 6/6 verbatim in every arm and
+// routing no worse. See ARCHITECTURE.md's length findings.
+//
+// An empty value means SEND NOTHING and let the provider choose, which is
+// what the code did before this existed. A value that is not one of the three
+// the API accepts would be a 400 on every voice turn, so it is refused at
+// startup rather than at the first thing the user says — and refused loudly,
+// because falling back silently would mean the operator's typo reads as the
+// setting working.
+const REASONING_EFFORTS = ["low", "medium", "high"] as const
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
+
+// Exported for the tests: config is read once per process from the real
+// environment, so the only way to prove what a typo does is to call this.
+export function parseReasoningEffort(
+  raw: string | undefined,
+  fallback: ReasoningEffort | null
+): ReasoningEffort | null {
+  if (raw === undefined) return fallback
+  const value = raw.trim()
+  if (value === "") return null
+  if ((REASONING_EFFORTS as readonly string[]).includes(value)) return value as ReasoningEffort
+  console.warn(
+    `config: IXA_VOICE_REASONING_EFFORT="${value}" is not one of ` +
+      `${REASONING_EFFORTS.join("|")} (or empty for the provider default) — ` +
+      `using "${fallback ?? "unset"}"`
+  )
+  return fallback
+}
+
 // The STT hint vocabulary, read from the file the sidecar's own hints.py reads.
 // Blank lines and # comments are dropped; entries are comma-joined because
 // that is the shape STT_HOTWORDS travels in.
@@ -49,6 +84,25 @@ export const config = {
     // silent default is a thing nobody knows is there. Retries happen inside
     // one request ceiling, so they cannot extend a turn without bound.
     maxRetries: parseInt(process.env.LLM_MAX_RETRIES ?? "2"),
+    // How much completion one TURN may have. 0 means send nothing.
+    //
+    // MEASURED, and the measurement inverted the reason for setting it. With
+    // nothing sent, every truncated reply was cut at EXACTLY 2048 completion
+    // tokens — so what this request gets by default is 2048, not the 65,536
+    // the model page gives `openai/gpt-oss-20b`. Setting 4096 therefore RAISES
+    // the ceiling rather than bounding a runaway, and it halved truncation
+    // (2/10 to 1/10) on the long-note voice case.
+    //
+    // 4096, not higher: the cut turns that remain are ones where reasoning
+    // keeps going, and a ceiling that is never reached is a ceiling that
+    // cannot bound the wait. It is the floor under `voiceReasoningEffort`
+    // above, which is what actually removed the truncation.
+    maxCompletionTokens: parseInt(process.env.IXA_MAX_COMPLETION_TOKENS ?? "4096"),
+    // Sent on VOICE turns only, where the measurement was made and where the
+    // user is waiting for speech. A typed turn keeps the provider's default,
+    // because nothing has measured what `low` costs a long written answer and
+    // a text reply nobody is listening to can afford to think.
+    voiceReasoningEffort: parseReasoningEffort(process.env.IXA_VOICE_REASONING_EFFORT, "low"),
   },
   tools: {
     // A backstop above every tool's own limit, not a substitute for one: a

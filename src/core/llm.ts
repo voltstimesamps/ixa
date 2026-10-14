@@ -351,16 +351,23 @@ function withDeadline<T>(promise: Promise<T>, ms: number, reason: string): Promi
 
 // Per-call overrides for the two request parameters that bound a completion.
 //
-// NOTHING IN PRODUCTION PASSES EITHER ONE, and that is deliberate: the
-// defaults are the provider's (65,536 max completion tokens and
-// `reasoning_effort: medium` for `openai/gpt-oss-20b`) and changing them is a
-// behaviour change that has to be measured before it ships. This exists so the
-// measurement can be made at all — `voice-behavior-verify.ts length` runs the
-// same case under four combinations of them and reports what each one costs.
+// MEASURED BEFORE EITHER WAS SET, by `voice-behavior-verify.ts length`, which
+// ran one case under four combinations of them. What it found is in
+// ARCHITECTURE.md and the short version is that the provider's documented
+// 65,536-token completion for `openai/gpt-oss-20b` is NOT what this request
+// gets: every truncated reply was cut at exactly 2048, so `4096` raises the
+// ceiling rather than bounding a runaway, and `reasoning_effort: low` is what
+// actually removed the truncation.
 //
-// When the measurement settles, whichever value wins moves into `config.llm`
-// and is passed from one place. Until then an unset field means "send nothing
-// and let the provider decide", which is exactly what the live code does.
+// WHO PASSES THEM: the turn layer, and only the turn layer — `turnCallOptions`
+// in session.ts, from `config.llm`, chosen by whether the turn came from
+// voice or from text. Everything else (the episode summarizer, and any
+// caller that is not answering a person) passes nothing and gets the
+// provider's defaults, which is what every call did before this existed.
+//
+// An unset field means "send nothing and let the provider decide". That is
+// not the same as sending the provider's default value, and it is what both
+// `IXA_MAX_COMPLETION_TOKENS=0` and an empty `IXA_VOICE_REASONING_EFFORT` do.
 export type CallOverrides = {
   reasoningEffort?: "low" | "medium" | "high"
   maxCompletionTokens?: number

@@ -2624,13 +2624,19 @@ async function client_askAudio(ask: string): Promise<Reply> {
 // of thought there"* — about a note that was already on disk and correct. It
 // has since been seen on a SHORT voice turn too, call 1, no tools yet.
 //
-// No `max_tokens` or `max_completion_tokens` is set anywhere in the codebase,
-// so the cap being exhausted is Groq's own: 65,536 max completion tokens for
-// `openai/gpt-oss-20b`, whose `reasoning_effort` defaults to `medium` and also
-// accepts `low` and `high`. The two candidate levers are therefore an explicit
-// completion cap and a cheaper reasoning effort, and the cost of `low` is a
-// quality question, not a token one — which is why the routing and read-back
-// scores are reported BESIDE the truncation rate rather than after it.
+// WHAT THIS RUN FOUND, kept here because the premise it was written on was
+// wrong. Nothing in the codebase set a completion cap at the time, and Groq's
+// model page gives `openai/gpt-oss-20b` 65,536 max completion tokens — but
+// every truncated reply in every arm was cut at EXACTLY its arm's ceiling,
+// 2048 with nothing sent. So the effective default is 2048, setting 4096
+// RAISES it rather than bounding a runaway, and `reasoning_effort: low` is
+// the lever that removed the truncation (0 of 10, at 85 median completion
+// tokens against 1781). The cost of `low` is a quality question, not a token
+// one, which is why the routing and read-back scores are reported BESIDE the
+// truncation rate rather than after it — they held at 6/6 and 8/10.
+//
+// The arms are kept runnable: both values are now config, so this is how a
+// change to either is re-measured rather than argued about.
 //
 // WHAT IS REAL HERE AND WHAT IS NOT. Deliberately NOT the backend: the arms
 // are per-REQUEST parameters and the numbers wanted are per-CALL token counts,
@@ -2679,11 +2685,12 @@ interface LengthArm {
   runs: number
 }
 
-// 10 runs on the capped arms and 5 on the uncapped ones, because an uncapped
-// length cut can burn the whole 65,536-token completion and ten of those is a
-// quarter of a million tokens to learn the same thing twice.
+// Equal runs per arm. This said 5 on the uncapped arms, on the reasoning that
+// one cut there could burn the whole 65,536-token completion — which the first
+// run disproved: an uncapped cut costs 2048, so ten of them are affordable and
+// equal arms are worth more than the tokens saved.
 const LENGTH_RUNS = Number(process.env.IXA_LENGTH_RUNS ?? 10)
-const LENGTH_RUNS_UNCAPPED = Number(process.env.IXA_LENGTH_RUNS_UNCAPPED ?? 5)
+const LENGTH_RUNS_UNCAPPED = Number(process.env.IXA_LENGTH_RUNS_UNCAPPED ?? 10)
 // The guard cases are a guard, not the measurement: one run each per arm by
 // default. Routing is noisy enough that a single run cannot separate a
 // regression from sampling — see ARCHITECTURE.md's routing table — so raise

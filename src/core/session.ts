@@ -8,6 +8,7 @@ import {
   isToolChoiceRejection,
   LLMDeadlineError,
   logFailedGeneration,
+  type CallOverrides,
   type LLMResponse,
   type Message,
   type ToolCall,
@@ -220,6 +221,26 @@ export const EMPTY_REPLY_FALLBACK =
 // for a fault, because there was none.
 export const BUDGET_EXHAUSTED_FALLBACK =
   "I ran out of tool calls before I could finish that one. Want me to keep going?"
+
+// The per-call request parameters a TURN sends, chosen by where the turn came
+// from. Nothing else in the codebase sends either one: see `CallOverrides` in
+// llm.ts, and the note on the summarizer in ARCHITECTURE.md.
+//
+// Both values are measured, and the measurement is in config.ts beside them.
+// The split is not: a voice turn is a person waiting for speech, where `low`
+// removed the truncation outright and answered 2.5x faster; a typed turn is a
+// written answer nobody is listening to, where nothing has measured what
+// `low` costs, so it keeps the provider's default.
+function turnCallOptions(origin: MessageOrigin): CallOverrides {
+  return {
+    ...(config.llm.maxCompletionTokens > 0
+      ? { maxCompletionTokens: config.llm.maxCompletionTokens }
+      : {}),
+    ...(origin === "voice" && config.llm.voiceReasoningEffort
+      ? { reasoningEffort: config.llm.voiceReasoningEffort }
+      : {}),
+  }
+}
 
 // ------------------------------------------------- the reply that was cut off
 //
@@ -743,7 +764,15 @@ export class Session {
     return this.cwd
   }
 
-  private async generateDescription(toolName: string, args: string): Promise<string> {
+  // The confirmation prompt's one-line description. It is part of the turn,
+  // not background work, so it carries the turn's own call parameters: the
+  // user is waiting on a prompt before anything runs, and a sentence
+  // describing one tool call is not the place to spend a long think.
+  private async generateDescription(
+    toolName: string,
+    args: string,
+    origin: MessageOrigin
+  ): Promise<string> {
     try {
       // A blind slice can start in the middle of a tool-call group and send a
       // tool result with no matching call, which the API rejects. Window it.
@@ -759,7 +788,10 @@ export class Session {
           content: `Tool: ${toolName}\nArguments: ${args}\nDescribe what this action will do.`,
         },
       ]
-      const response = await this.chat(describeMessages, [], { silent: true })
+      const response = await this.chat(describeMessages, [], {
+        silent: true,
+        ...turnCallOptions(origin),
+      })
       if (response.type === "text" && response.content) {
         return response.content
       }
@@ -1035,7 +1067,11 @@ export class Session {
       // array that was actually sent rather than a second, rebuilt one.
       const sent = this.messagesForCall(origin)
       try {
-        response = await this.chat(sent, retrying || budgetSpent ? [] : tools)
+        response = await this.chat(
+          sent,
+          retrying || budgetSpent ? [] : tools,
+          turnCallOptions(origin)
+        )
       } catch (err) {
         // A deadline is never a malformed tool call, and asking again without
         // tools would just spend the budget twice.
@@ -1384,7 +1420,7 @@ export class Session {
               `${searchesThisTurn} already run this turn`
             )
           } else if (tool.requiresConfirmation) {
-            const description = await this.generateDescription(tc.name, tc.arguments)
+            const description = await this.generateDescription(tc.name, tc.arguments, origin)
             // Deliberately OUTSIDE the tool deadline. The user may take as
             // long as they like to answer, and the confirmer has its own
             // 30-second limit; charging their thinking time to the tool's

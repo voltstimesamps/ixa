@@ -42,6 +42,8 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
 }
 
 let llm: typeof import("../src/core/llm")
+let manager: import("../src/core/session-manager").SessionManager
+let configured: typeof import("../src/config").config
 
 before(async () => {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
@@ -54,7 +56,17 @@ before(async () => {
   process.env.LLM_REQUEST_TIMEOUT_MS = "4000"
   process.env.LLM_STREAM_IDLE_TIMEOUT_MS = "2000"
 
+  // The two measured turn parameters, set to the values src/config.ts ships
+  // as defaults. Stated here rather than inherited, so a local .env cannot
+  // make this file's assertions depend on the machine it runs on.
+  process.env.IXA_MAX_COMPLETION_TOKENS = "4096"
+  process.env.IXA_VOICE_REASONING_EFFORT = "low"
+
   llm = await import("../src/core/llm.js")
+  configured = (await import("../src/config.js")).config
+  const { SessionManager } = await import("../src/core/session-manager.js")
+  const { TEST_LIMITS } = await import("./helpers.js")
+  manager = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS })
 })
 
 after(() => {
@@ -307,10 +319,10 @@ test("the request asks for usage and changes nothing else", async () => {
   assert.equal(lastBody.model, "stub-model")
   assert.equal(lastBody.stream, true)
 
-  // Every parameter that would change what the model does, absent — not
-  // null, not a default this file chose: ABSENT, so the provider's own
-  // defaults still apply. This is the whole promise of the instrumentation
-  // commit, and the measurement is what decides whether any of them ships.
+  // A bare chat() still sends NOTHING that changes what the model does. The
+  // turn layer is what adds the measured parameters, per origin, and the
+  // callers that are not turns — the episode summarizer, the confirmation
+  // description's fallback path — go through this shape.
   for (const key of ["max_completion_tokens", "max_tokens", "reasoning_effort"]) {
     assert.ok(!(key in lastBody), `${key} must not be sent: ${JSON.stringify(lastBody[key])}`)
   }
@@ -385,4 +397,91 @@ test("the provider's remaining per-minute allowance is readable", async () => {
   }
   await llm.chat([{ role: "user", content: "hi" }], [], { silent: true })
   assert.equal(llm.rateLimit()?.remainingTokens, 1234)
+})
+
+// ------------------------------------------ what a TURN sends, by origin
+//
+// The split is the whole of COMMIT L: a voice turn is a person waiting for
+// speech, where `reasoning_effort: low` removed the truncation outright and
+// answered 2.5x faster; a typed turn is a written answer nobody is listening
+// to, where nothing has measured what `low` costs. Driven through a real
+// session against the stub, because what is under test is the request that
+// leaves the turn layer, not the value of a config field.
+
+function plainReply(): void {
+  handler = async (req, res) => {
+    lastBody = await readBody(req)
+    sseHead(res)
+    res.write(contentFrame("Twenty past three."))
+    res.write(finishFrame("stop"))
+    res.write(usageFrame({ prompt_tokens: 900, completion_tokens: 85, total_tokens: 985 }))
+    res.write("data: [DONE]\n\n")
+    res.end()
+  }
+}
+
+test("a VOICE turn sends both measured parameters", async () => {
+  plainReply()
+  const { makeConnection } = await import("./helpers.js")
+
+  const reply = await manager.submitTurn("what time is it", makeConnection(), "voice")
+  assert.equal(reply, "Twenty past three.")
+
+  assert.equal(lastBody.reasoning_effort, "low")
+  assert.equal(lastBody.max_completion_tokens, 4096)
+  // And the values that actually shipped, not just whatever was configured.
+  assert.equal(lastBody.reasoning_effort, configured.llm.voiceReasoningEffort)
+  assert.equal(lastBody.max_completion_tokens, configured.llm.maxCompletionTokens)
+  assert.deepEqual(lastBody.stream_options, { include_usage: true })
+  // Still never this one: `max_tokens` is the deprecated spelling and sending
+  // both is how a request gets two ceilings.
+  assert.ok(!("max_tokens" in lastBody))
+})
+
+test("a TEXT turn sends the completion cap and no reasoning effort", async () => {
+  plainReply()
+  const { makeConnection } = await import("./helpers.js")
+
+  await manager.submitTurn("what time is it", makeConnection(), "text")
+
+  assert.equal(lastBody.max_completion_tokens, 4096)
+  assert.ok(
+    !("reasoning_effort" in lastBody),
+    `a typed turn keeps the provider's default: ${JSON.stringify(lastBody.reasoning_effort)}`
+  )
+})
+
+// ---------------------------------------------- the effort value itself
+//
+// A value the API does not accept would be a 400 on every voice turn, so it
+// is refused at startup rather than at the first thing the user says. Tested
+// on the parser rather than through config, which is read once per process
+// from the real environment.
+test("the reasoning effort is validated, and a typo does not reach the wire", async () => {
+  const { parseReasoningEffort } = await import("../src/config.js")
+
+  for (const value of ["low", "medium", "high"]) {
+    assert.equal(parseReasoningEffort(value, "low"), value)
+  }
+  // Empty means "send nothing", which is what the code did before this
+  // existed and is how the setting is turned off.
+  assert.equal(parseReasoningEffort("", "low"), null)
+  assert.equal(parseReasoningEffort("   ", "low"), null)
+  // Unset keeps the shipped default.
+  assert.equal(parseReasoningEffort(undefined, "low"), "low")
+
+  const warnings: string[] = []
+  const realWarn = console.warn
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "))
+  try {
+    // Loudly, because a silent fallback means the operator's typo reads as
+    // the setting working.
+    assert.equal(parseReasoningEffort("lo", "low"), "low")
+    assert.equal(parseReasoningEffort("none", null), null)
+  } finally {
+    console.warn = realWarn
+  }
+  assert.equal(warnings.length, 2, warnings.join(" | "))
+  assert.match(warnings[0]!, /IXA_VOICE_REASONING_EFFORT="lo" is not one of low\|medium\|high/)
+  assert.match(warnings[1]!, /using "unset"/)
 })
