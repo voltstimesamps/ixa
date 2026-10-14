@@ -231,7 +231,7 @@ export function createWsServer(port: number, sessions: SessionManager): Promise<
             }
           } else if (msg.type === "confirmReply") {
             if (msg.requestId && msg.content) {
-              resolveConfirmation(msg.requestId, msg.content, connectionId)
+              resolveConfirmation(msg.requestId, msg.content, connectionId, msg.reason)
             }
           } else {
             console.log(`WS: ignoring message type "${msg.type}"`)

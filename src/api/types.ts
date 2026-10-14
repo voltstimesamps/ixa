@@ -25,4 +25,10 @@ export interface WsMessage {
   // page ignores it today — and the backend's own timer remains the
   // authority, so nothing depends on the client honouring it.
   timeoutMs?: number
+  // ADDITIVE AND OPTIONAL, read only on `confirmReply`: why this answer is
+  // being sent. The one value that means anything is "expired", which says
+  // the client's own deadline fired rather than a person answering — so a
+  // "no" that carries it is recorded as a timeout and not as a refusal the
+  // user never made. A client that omits it behaves exactly as before.
+  reason?: string
 }

@@ -180,17 +180,30 @@ class Expiring(RouterTestCase):
         self.assertIn("9s left", first.message)
         self.assertIsNone(self.router.tick(), "a warning is said once, not every 100ms")
 
-    def test_expiry_answers_no_and_says_so(self) -> None:
+    def test_expiry_answers_no_and_says_WHY(self) -> None:
         self.openPrompt(60_000)
         self.clock.advance(59)
 
         result = self.router.tick()
         self.assertIsInstance(result, Expired)
-        self.assertEqual(result.reply, Reply("req-1", "no"))
+        # The "no" still goes, because the backend has to stop waiting. What
+        # is new is the reason beside it: without it the backend records
+        # "Action declined by user" for a prompt nobody ever saw answered,
+        # which puts a refusal in history that was never made.
+        self.assertEqual(result.reply, Reply("req-1", "no", reason="expired"))
         self.assertIn("expired", result.message)
-        self.assertIn("Nothing was executed", result.message)
+        self.assertIn("nothing", result.message.lower())
+        # And it no longer tells the user they answered no.
+        self.assertNotIn("answered no", result.message)
         self.assertFalse(self.router.pending)
         self.assertIsNone(self.router.tick(), "and it expires once")
+
+    def test_a_real_answer_carries_no_reason(self) -> None:
+        self.openPrompt(60_000)
+        result = self.router.line("no")
+        self.assertIsInstance(result, Reply)
+        self.assertIsNone(result.reason, "a person saying no IS a decline")
+        self.assertEqual(result, Reply("req-1", "no"))
 
     def test_an_answer_after_expiry_is_explained_not_swallowed(self) -> None:
         self.openPrompt(60_000)

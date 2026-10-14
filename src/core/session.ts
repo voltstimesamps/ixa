@@ -397,6 +397,27 @@ export function budgetExhaustedRecord(toolCalls: number): string {
   return `${BUDGET_EXHAUSTED_FALLBACK} [tool budget spent after ${toolCalls} calls; no answer produced]`
 }
 
+// What a tool result says when a confirming tool was not confirmed. Three
+// results, because there are three different things to have happened, and the
+// model acts on the difference: a refusal is a decision about the action, and
+// the other two are about nobody having answered.
+//
+// All three are written for the model and say the same two things first —
+// nothing ran, and why — because a result that leaves either in doubt is one
+// the model retries. The timeout adds the sentence the other two do not need:
+// do not ask again on your own. A prompt the user walked away from is not an
+// invitation to re-offer the same action on the next turn.
+const CONFIRM_DECLINED = "Action declined by user."
+
+const CONFIRM_CANCELLED =
+  "Action cancelled: the client that requested it disconnected before confirming. " +
+  "Nothing was executed."
+
+const CONFIRM_TIMED_OUT =
+  "Action not taken: the user did not answer the confirmation in time. Nothing was " +
+  "executed, and this is NOT a refusal — they may simply have been away. Do not run it " +
+  "again or ask again unless they raise it themselves."
+
 // What a tool result says when the turn failed before that call ever ran.
 // Truthful on purpose: the model is told nothing happened, not handed a
 // vague error it might read as "the action may have gone through".
@@ -1436,12 +1457,27 @@ export class Session {
               // Recorded distinctly from a decline so the LLM knows the action
               // did not happen because the asking client vanished, not because
               // the user refused. Nothing executed either way.
-              result =
-                "Action cancelled: the client that requested it disconnected before confirming. " +
-                "Nothing was executed."
+              result = CONFIRM_CANCELLED
               logToolCall(tool.name, "cancelled", askedAt, tc.arguments)
+            } else if (outcome === "timeout") {
+              // Distinct from BOTH of the others. The question was delivered
+              // and nobody answered it, which is neither a refusal nor a
+              // client that vanished.
+              //
+              // The log word is "unanswered" rather than "timeout", which this
+              // file already uses for a tool whose EXECUTION was abandoned —
+              // two very different events, and a log that calls them the same
+              // thing is a log that cannot be read.
+              result = CONFIRM_TIMED_OUT
+              logToolCall(
+                tool.name,
+                "unanswered",
+                askedAt,
+                tc.arguments,
+                "the confirmation was not answered in time; nothing ran"
+              )
             } else if (outcome === "declined") {
-              result = "Action declined by user."
+              result = CONFIRM_DECLINED
               logToolCall(tool.name, "declined", askedAt, tc.arguments)
             } else {
               const outcome = await this.executeTool(tool, tc)

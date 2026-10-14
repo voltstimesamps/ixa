@@ -48,6 +48,12 @@ class Reply:
 
     request_id: str
     content: str  # "yes" or "no"
+    # Why this answer is being sent, when it is not a person answering.
+    # "expired" is the only value the backend reads, and it is what keeps a
+    # local deadline from being recorded as a refusal the user never made:
+    # without it, the "no" below lands in history as "Action declined by
+    # user". A None is a real answer and carries nothing.
+    reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -196,7 +202,7 @@ class ConfirmationRouter:
         # an ordinary thing to say to Ixa and goes through as one.
         if self._recently_expired() and (normalized in YES or normalized in NO):
             return AlreadyExpired(
-                "[that request already expired — it was answered as no. "
+                "[that request already expired — nothing was executed. "
                 "Ask again if you still want it.]"
             )
 
@@ -216,8 +222,9 @@ class ConfirmationRouter:
             self._clear()
             self._last_expired_at = self._clock()
             return Expired(
-                Reply(request_id, "no"),
-                "[confirmation expired — answered no. Nothing was executed.]",
+                Reply(request_id, "no", reason="expired"),
+                "[confirmation expired — nobody answered in time, so nothing "
+                "was executed. Ask again if you still want it.]",
             )
 
         if not self._warned and remaining * 1000.0 <= WARN_AT_MS:

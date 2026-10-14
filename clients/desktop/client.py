@@ -166,11 +166,17 @@ async def main() -> None:
         confirmations = ConfirmationRouter()
 
         async def sendConfirmReply(reply: Reply) -> None:
-            await ws.send(json.dumps({
+            message = {
                 "type": "confirmReply",
                 "content": reply.content,
                 "requestId": reply.request_id,
-            }))
+            }
+            # Only on a local expiry. The backend reads it to record a timeout
+            # rather than a decline the user never made; a backend that does
+            # not know the field ignores it.
+            if reply.reason is not None:
+                message["reason"] = reply.reason
+            await ws.send(json.dumps(message))
             await gate.note_utterance_sent()
 
         async def finishPlayback() -> None:

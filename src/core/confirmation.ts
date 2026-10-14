@@ -73,11 +73,19 @@ export async function* stdinLineGenerator(): AsyncGenerator<string> {
 
 // --- Confirmer ---
 
-// Three outcomes, not a boolean: "declined" is the user saying no, while
-// "cancelled" is the request going unanswered because the client that was
-// asked went away. Both block execution, but they are recorded differently in
-// history so the LLM can tell a refusal from an interruption.
-export type ConfirmationOutcome = "confirmed" | "declined" | "cancelled"
+// FOUR outcomes, not a boolean, and three of them block execution for
+// different reasons the model has to be able to tell apart:
+//
+//   declined   the user said no. A decision, and the only one of the three
+//              that says anything about whether the action should happen.
+//   cancelled  the client that was asked went away. Nobody saw the question.
+//   timeout    the question was seen and not answered inside the limit.
+//
+// `timeout` used to be reported as `declined`, which put words in the user's
+// mouth: a prompt nobody got to in sixty seconds became "Action declined by
+// user", and the model then had a refusal on the record that was never made.
+// A person who walked away from the keyboard is not a person who said no.
+export type ConfirmationOutcome = "confirmed" | "declined" | "cancelled" | "timeout"
 
 export type Confirmer = (description: string) => Promise<ConfirmationOutcome>
 
@@ -93,10 +101,15 @@ export function createStdinConfirmer(timeoutMs = config.confirm.timeoutMs): Conf
     process.stdout.write(`\n${description}\nConfirm? (yes/no): `)
 
     let pendingCancel: (() => void) | null = null
+    // Which non-line ending happened. The read is cancelled either way, so
+    // the flag is the only thing that can tell "nobody answered in time" from
+    // "stdin closed and nobody ever will".
+    let timedOut = false
 
     const timer = setTimeout(() => {
+      timedOut = true
       pendingCancel?.()
-      process.stdout.write("\nConfirmation timed out, treating as no.\n")
+      process.stdout.write(`\nConfirmation not answered within ${timeoutMs}ms. Nothing was run.\n`)
     }, timeoutMs)
 
     try {
@@ -107,7 +120,9 @@ export function createStdinConfirmer(timeoutMs = config.confirm.timeoutMs): Conf
         const result = await promise
         pendingCancel = null
 
-        if (result.kind !== "line") return "declined"
+        // Neither of these is the user saying no. A closed stdin is the
+        // terminal equivalent of the socket going away, which is `cancelled`.
+        if (result.kind !== "line") return timedOut ? "timeout" : "cancelled"
 
         const normalized = result.value.trim().toLowerCase()
         if (normalized === "yes" || normalized === "y") return "confirmed"
@@ -151,8 +166,10 @@ export function createWsConfirmer(
       }
 
       const timer = setTimeout(() => {
-        console.log("Confirmation timed out, treating as no.")
-        settle("declined")
+        console.log(
+          `confirmation timed out: no answer in ${timeoutMs}ms — nothing was executed`
+        )
+        settle("timeout")
       }, timeoutMs)
 
       pendingConfirmations.set(requestId, { connectionId, settle })
@@ -164,10 +181,18 @@ export function createWsConfirmer(
     })
 }
 
+// `reason` is how a client says that the "no" it is sending is its OWN
+// deadline firing rather than a person refusing. The desktop client expires a
+// prompt a second before the backend does — deliberately, so the user is told
+// the prompt closed instead of typing into a request that was already
+// declined in silence — and without this that local expiry would land as an
+// explicit decline, which is the exact inaccuracy `timeout` exists to remove.
+// Optional: a client that sends nothing behaves as it always did.
 export function resolveConfirmation(
   requestId: string,
   answer: string,
-  connectionId: string
+  connectionId: string,
+  reason?: string
 ): void {
   const pending = pendingConfirmations.get(requestId)
   if (!pending) {
@@ -180,7 +205,16 @@ export function resolveConfirmation(
     )
     return
   }
-  pending.settle(answer === "yes" ? "confirmed" : "declined")
+  if (answer === "yes") {
+    pending.settle("confirmed")
+    return
+  }
+  if (reason === "expired") {
+    console.log(`confirmation expired on the client — nothing was executed`)
+    pending.settle("timeout")
+    return
+  }
+  pending.settle("declined")
 }
 
 // Called when a connection goes away. Everything it was asked resolves as
