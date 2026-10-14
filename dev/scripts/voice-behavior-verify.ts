@@ -21,6 +21,13 @@
 //   npx tsx dev/scripts/voice-behavior-verify.ts priceguard   # 7
 //   npx tsx dev/scripts/voice-behavior-verify.ts tokens       # prompt cost
 //   npx tsx dev/scripts/voice-behavior-verify.ts strays       # 6, read-only
+//   npx tsx dev/scripts/voice-behavior-verify.ts readback     # 11
+//
+// `readback` also needs a THROWAWAY VAULT, because it writes notes:
+//
+//   IXA_DB_PATH=/tmp/ixa-voice.db QDRANT_COLLECTION=ixa_voice \
+//     IXA_NOTES_COLLECTION=ixa_voice_notes OBSIDIAN_VAULT_PATH=/tmp/ixa-voice-vault \
+//     VOICE_MODE=true npm run dev
 //
 // `detector` needs none of that: it checks the clock judge offline, against the
 // replies two live failures actually produced. Run it before `clock`, because a
@@ -68,6 +75,8 @@ import {
   episodeRows,
   liveSession,
   messagesOf,
+  noteChunkText,
+  noteRows,
   sessionRows,
   toolCallsInLastTurn,
   toolResultsIn,
@@ -2330,6 +2339,265 @@ async function verifyNonsense(): Promise<void> {
   )
 }
 
+// ------------------------------------------------- 11. the written value
+//
+// Does the reply say what was WRITTEN?
+//
+// The live failure: asked to note the repo path, STT delivered "slash home
+// slash WALLET slash project slash Ixa", the note went to disk saying
+// `/home/wallet/project/Ixa`, and Ixa said *"I saved a reference note titled
+// 'Ixa repo location.'"* — obedient to the instruction the result carried,
+// and useless. save_note's result now quotes the body back for a short note
+// and tells the reply to repeat it word for word.
+//
+// WHAT IS JUDGED IS THE REPLY AGAINST THE FILE, not the reply against what
+// was asked for. That is deliberate and it is the only honest comparison
+// here: these turns go in as synthesized speech through the real STT, so the
+// value can be mangled on the way in — and if it is, the note on disk holds
+// the mangled value and reading THAT back is the feature working. A run where
+// STT corrupts the path and the reply recites the corruption is a PASS, and
+// the transcript below shows it so the mishearing is still visible.
+//
+// Spoken, not typed: VOICE_RESPONSE_PROMPT is only appended to a voice turn,
+// and the collision this is really measuring lives there — "SPELL NUMBERS
+// OUT" against "repeat the body word for word".
+
+interface ReadBackCase {
+  slug: string
+  // What to say. A save request, so the turn ends in save_note.
+  ask: string
+  // Which shape of value is at stake, for the report's grouping.
+  kind: "path" | "name" | "digits" | "long"
+}
+
+const READ_BACK_CASES: ReadBackCase[] = [
+  {
+    slug: "path",
+    kind: "path",
+    ask: "Write a note in your notebook that the Ixa repo is at slash home slash wyatt slash Projects slash ixa.",
+  },
+  {
+    slug: "name",
+    kind: "name",
+    ask: "Write a note in your notebook that the person who owns this machine is called Wyatt Fisher.",
+  },
+  {
+    slug: "digits",
+    kind: "digits",
+    ask: "Write a note in your notebook that the STT sidecar listens on port five thousand and two.",
+  },
+  {
+    slug: "long",
+    kind: "long",
+    ask:
+      "Write a long note in your notebook about where the backend runs: it runs in WSL two on the gaming PC, " +
+      "the speech sidecars are started by the harness itself, Qdrant and Ollama are both in Docker, and the " +
+      "desktop client connects over the local network rather than loopback.",
+  },
+]
+
+const READ_BACK_RUNS = 5
+
+// The value a reply has to reproduce: the note's body as written, with the
+// chunk's heading line and the code-appended price caveat removed.
+function bodyOnDisk(noteId: string): string {
+  return noteChunkText(noteId)
+    .map((chunk) =>
+      chunk
+        .split("\n")
+        .filter((line) => !line.startsWith("#") && !line.startsWith("_Prices as stated on"))
+        .join(" ")
+    )
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+// Case, spacing and surrounding punctuation are not the question. A path, a
+// name or a port said with every character in the right order is a pass
+// however it is wrapped; "Projects" rendered as "projects" is not a
+// mishearing anybody can hear.
+function flattenValue(text: string): string {
+  return text.toLowerCase().replace(/[\s]+/g, " ").trim()
+}
+
+// The parts of a body that MUST survive into the reply. Not the whole
+// sentence: the model is asked for one short spoken sentence, and demanding
+// its phrasing match the note's would score English rather than the value.
+function valueTokens(body: string): string[] {
+  const tokens = new Set<string>()
+  // Anything path-shaped, and any token with a digit or an internal capital.
+  for (const match of body.match(/\/[^\s,;]+/g) ?? []) tokens.add(match.replace(/[.,;]+$/, ""))
+  for (const word of body.split(/\s+/)) {
+    const bare = word.replace(/^[^\w/$]+|[.,;:!?]+$/g, "")
+    if (!bare) continue
+    if (/\d/.test(bare)) tokens.add(bare)
+    // A proper noun that is not the first word of a sentence.
+    else if (/^[A-Z][a-z]{2,}$/.test(bare) && !/^(The|This|That|Ixa|It)$/.test(bare)) tokens.add(bare)
+  }
+  return [...tokens]
+}
+
+async function verifyReadBack(): Promise<void> {
+  section("11. the reply says what was written")
+
+  console.log(`  model:    ${config.llm.model}`)
+  console.log(`  backstop: ${config.voice.maxSpokenSentences} sentences / ${config.voice.maxSpokenWords} words`)
+  console.log(`  runs:     ${READ_BACK_RUNS} per case\n`)
+
+  interface Run {
+    slug: string
+    kind: ReadBackCase["kind"]
+    run: number
+    transcript: string
+    reply: string
+    noteId: string | null
+    body: string
+    tokens: string[]
+    missing: string[]
+    hadBodyReadBack: boolean
+    // `summarized` is the long-note path working, not a failure.
+    verdict: "verbatim" | "paraphrased" | "summarized" | "no-note" | "error"
+  }
+
+  const runs: Run[] = []
+
+  for (const item of READ_BACK_CASES) {
+    console.log(`  --- ${item.slug} (${item.kind}) ---`)
+    for (let run = 1; run <= READ_BACK_RUNS; run++) {
+      // A fresh conversation each run: a note already in the vault turns the
+      // next request into a supersede, which is a different code path and a
+      // different result string.
+      await resetSession()
+
+      let reply: Reply
+      try {
+        reply = await client_askAudio(item.ask)
+      } catch (err) {
+        runs.push({
+          slug: item.slug, kind: item.kind, run, transcript: "", reply: "",
+          noteId: null, body: "", tokens: [], missing: [],
+          hadBodyReadBack: false, verdict: "error",
+        })
+        console.log(`    ${run}. ERROR ${err instanceof Error ? err.message : String(err)}`)
+        continue
+      }
+
+      const transcript = lastTranscript()
+
+      // The id comes out of save_note's OWN result, not from diffing the note
+      // rows. Diffing is wrong here and the first run proved it: re-saving
+      // identical content under the same title UPDATES IN PLACE and adds no
+      // row, so a perfectly good read-back scored as "no note was written".
+      const row = liveSession()
+      const results = row ? toolResultsIn(row, "save_note") : []
+      const saved = results.filter((result) => result.startsWith("Saved "))
+      const noteId = saved.at(-1)?.match(/\(id ([^)]+)\)/)?.[1] ?? null
+      const note = noteId ? (noteRows().find((entry) => entry.id === noteId) ?? null) : null
+      const body = note ? bodyOnDisk(note.id) : ""
+      const tokens = body ? valueTokens(body) : []
+
+      // What save_note's result actually offered the model, so a note too
+      // long to read back is never counted as a paraphrase.
+      const hadBodyReadBack = saved.some((result) => result.includes("Body on disk:"))
+
+      const flatReply = flattenValue(reply.text)
+      const missing = tokens.filter((token) => !flatReply.includes(flattenValue(token)))
+
+      // A long note is SUMMARIZED by design, so it is never "paraphrased":
+      // that word is for a reply that was handed the value and reworded it.
+      const verdict: Run["verdict"] = !note
+        ? "no-note"
+        : !hadBodyReadBack
+          ? "summarized"
+          : missing.length === 0
+            ? "verbatim"
+            : "paraphrased"
+
+      runs.push({
+        slug: item.slug, kind: item.kind, run, transcript, reply: reply.text,
+        noteId: note?.id ?? null, body, tokens, missing, hadBodyReadBack, verdict,
+      })
+
+      console.log(`    ${run}. ${verdict.toUpperCase()}${hadBodyReadBack ? "" : " (summary read-back)"}`)
+      console.log(`       heard:  ${JSON.stringify(transcript)}`)
+      console.log(`       disk:   ${JSON.stringify(body)}`)
+      console.log(`       reply:  ${JSON.stringify(reply.text)}`)
+      if (missing.length > 0) console.log(`       missing: ${missing.join(", ")}`)
+    }
+    console.log("")
+  }
+
+  // ------------------------------------------------------------- the table
+
+  section("verbatim reproduction, by case")
+  // Counted because the first run found it: told to repeat the body, the model
+  // sometimes recites the RESULT instead of composing a sentence — note id and
+  // all. "id 2026-10-13-machine-owner-3" read out loud is not an answer.
+  const leakedId = runs.filter((entry) => /\(id [0-9]{4}-[0-9]{2}-[0-9]{2}-/.test(entry.reply))
+  const leakedNewline = runs.filter((entry) => entry.reply.includes("\n"))
+  for (const item of READ_BACK_CASES) {
+    const mine = runs.filter((entry) => entry.slug === item.slug)
+    const verbatim = mine.filter((entry) => entry.verdict === "verbatim").length
+    const scored = mine.filter((entry) => entry.verdict !== "error" && entry.verdict !== "no-note")
+    console.log(
+      `  ${item.slug.padEnd(8)} ${item.kind.padEnd(7)} verbatim ${verbatim}/${mine.length}` +
+        `   body read-back offered ${mine.filter((e) => e.hadBodyReadBack).length}/${mine.length}` +
+        (scored.length < mine.length ? `   (${mine.length - scored.length} unscored)` : "")
+    )
+  }
+
+  // The threshold the branch was measured against: a path or a name
+  // paraphrased in more than one run of five is the signal to move the
+  // read-back out of the instruction and into code.
+  for (const kind of ["path", "name"] as const) {
+    const mine = runs.filter((entry) => entry.kind === kind)
+    const paraphrased = mine.filter((entry) => entry.verdict === "paraphrased").length
+    check(
+      `${kind}: reproduced verbatim in at least 4 of ${READ_BACK_RUNS}`,
+      paraphrased <= 1,
+      `${paraphrased} paraphrased`
+    )
+  }
+
+  const long = runs.filter((entry) => entry.kind === "long")
+  check(
+    "a long note is not offered a body read-back",
+    long.every((entry) => !entry.hadBodyReadBack),
+    `${long.filter((e) => e.hadBodyReadBack).length}/${long.length} were`
+  )
+
+  console.log("")
+  console.log(`  replies that read the note id out loud: ${leakedId.length}/${runs.length}`)
+  for (const entry of leakedId) console.log(`    ${entry.slug} ${entry.run}: ${JSON.stringify(entry.reply)}`)
+  console.log(`  replies carrying a line break (the result's shape): ${leakedNewline.length}/${runs.length}`)
+  for (const entry of leakedNewline) console.log(`    ${entry.slug} ${entry.run}: ${JSON.stringify(entry.reply)}`)
+
+  // The type rejection is not what this subcommand measures, but it is in
+  // every run's log and the honest log word is what made it visible: the model
+  // sends a `type` outside the three on its FIRST attempt and corrects on the
+  // next, so every save costs a wasted round trip. Counted from history.
+  const liveRow = liveSession()
+  if (liveRow) {
+    const all = toolResultsIn(liveRow, "save_note")
+    const rejected = all.filter((result) => result.startsWith("Nothing was saved: 'type'")).length
+    console.log(`  'type' rejections in this session's history: ${rejected}/${all.length} save_note results`)
+  }
+}
+
+// One spoken ask, synthesized, on its own connection — a fresh socket per run
+// so a reset session cannot be answered on a stale one.
+async function client_askAudio(ask: string): Promise<Reply> {
+  console.log(`       > (spoken) ${ask.slice(0, 72)}${ask.length > 72 ? "…" : ""}`)
+  const pcm = await synthesize(ask)
+  const client = await connect()
+  try {
+    return await client.askAudio(pcm)
+  } finally {
+    await client.close()
+  }
+}
+
 // ------------------------------------------------------------------- main
 
 const commands: Record<string, () => void | Promise<void>> = {
@@ -2346,6 +2614,7 @@ const commands: Record<string, () => void | Promise<void>> = {
   source: verifySource,
   rejudge: verifyRejudge,
   nonsense: verifyNonsense,
+  readback: verifyReadBack,
 }
 
 async function main(): Promise<void> {

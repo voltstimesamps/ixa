@@ -119,3 +119,39 @@ export function episodeRows(): Array<{ id: number; session_id: string; summary: 
       }>
   )
 }
+
+// ------------------------------------------------------------- the notebook
+
+export interface NoteRow {
+  id: string
+  type: string
+  title: string
+  summary: string
+  path: string
+  status: string
+  created_at: number
+}
+
+export function noteRows(): NoteRow[] {
+  return withDb(
+    (db) =>
+      db
+        .prepare(
+          "SELECT id, type, title, summary, path, status, created_at FROM notes ORDER BY created_at"
+        )
+        .all() as NoteRow[]
+  )
+}
+
+// The chunk text of one note, in order — which is the body as it was written,
+// because chunks are built from the sections. Read from SQLite rather than
+// from the file so the measurement does not have to parse frontmatter.
+export function noteChunkText(noteId: string): string[] {
+  return withDb((db) =>
+    (
+      db
+        .prepare("SELECT text FROM note_chunks WHERE note_id = ? ORDER BY ordinal")
+        .all(noteId) as Array<{ text: string }>
+    ).map((row) => row.text)
+  )
+}

@@ -30,8 +30,12 @@ import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 //      asserted to be inside the vault. That is the difference from
 //      shell_write, which does confirm: not "we trust it with files" but "it
 //      cannot choose one".
-//   2. READ-BACK. The result returns the title and summary that were actually
-//      written, so the reply says what is on disk rather than what was meant.
+//   2. READ-BACK. The result returns the title, the summary AND — for a note
+//      whose body fits a spoken reply — the body itself, all as they were
+//      actually written, so the reply says what is on disk rather than what
+//      was meant. The body is there because the title was not enough: a live
+//      turn saved a misheard path and reported the title, which was right.
+//      See READ_BACK_THE_BODY.
 //   3. PROVENANCE IS STAMPED BY THE HARNESS. Source, session and date come
 //      from the turn, never from the model — asked for them in the spike it
 //      invented a session id ("?").
@@ -117,6 +121,36 @@ function renderHit(hit: NoteHit, index: number): string {
   const where = hit.headingPath ? ` (${hit.headingPath})` : ""
   return `${head}${where}\n   ${hit.note.summary}\n   ---\n${hit.text}`
 }
+
+// -------------------------------------------------------------- read-back
+//
+// WHAT THE REPLY MUST SAY. The result used to end "Tell the user in one short
+// sentence what you saved, using the title above", and the model obeyed it to
+// the letter on a note whose body was wrong — see the live turn quoted at the
+// read-back itself. The title is the one part of a note that a mishearing is
+// least likely to land in, because the model composes it; the body is where
+// the user's own words go, mangled or not.
+//
+// 120 chars, which is about twenty spoken words: enough for a path, a name, a
+// version or a price, and short enough that reading it back cannot push a
+// spoken reply past the ~35-word budget VOICE_RESPONSE_PROMPT asks for.
+// Measured against the real speech path, "I wrote it down: the Ixa repo is at
+// /home/wyatt/Projects/ixa." is ten words and one spoken unit, because
+// `countWords` charges a whole path as ONE word and shortenForSpeech only ever
+// cuts at a unit boundary — so a one-sentence read-back cannot be truncated
+// mid-path.
+export const BODY_READBACK_MAX_CHARS = 120
+
+const READ_BACK_THE_BODY =
+  "Tell the user in one short sentence what you saved, and REPEAT THE BODY ABOVE WORD FOR WORD " +
+  "— the value exactly as it is written, every character of it, not a paraphrase and not a " +
+  "description of it. The user cannot see the file. If you heard them wrongly, reading it back " +
+  "is the only way they find out, and a note nobody corrects is read back as fact months later."
+
+const READ_BACK_THE_SUMMARY =
+  "This note is too long to read back in a spoken reply. Tell the user in one short sentence " +
+  "what you saved, using the title and the summary above, and say the note is long so they know " +
+  "they can ask for any part of it."
 
 // ------------------------------------------------------------ what failed
 //
@@ -276,10 +310,26 @@ export const saveNoteTool: Tool = {
 
       // The read-back. Deliberately quotes the title and summary that were
       // WRITTEN, so the reply describes the file rather than the intention.
+      //
+      // The title and summary were not enough, and a live turn showed exactly
+      // how. Asked to note the repo path, STT delivered "slash home slash
+      // WALLET slash project slash Ixa", the note went to disk saying
+      // `/home/wallet/project/Ixa`, and Ixa said: *"I saved a reference note
+      // titled 'Ixa repo location.'"* — true, compliant with this instruction,
+      // and useless. Both the title and the summary were "Ixa repo location",
+      // identical whether the path was right or wrong, because the mishearing
+      // was in the BODY and nothing read the body back.
       const lines = [
         `Saved ${result.note.type} note "${result.note.title}" (id ${result.note.id}).`,
         `Summary on disk: ${result.note.summary}`,
       ]
+      // `sections`, not `stamped`: the price caveat is appended by code and
+      // announced on its own line below, and it is not a value the user needs
+      // to hear back to check.
+      const writtenBody = sections.map((section) => section.body.trim()).join(" ")
+      if (writtenBody.length <= BODY_READBACK_MAX_CHARS) {
+        lines.push(`Body on disk: ${writtenBody}`)
+      }
       if (result.superseded) {
         lines.push(
           `Superseded "${result.superseded.title}" (id ${result.superseded.id}); its text is ` +
@@ -324,7 +374,11 @@ export const saveNoteTool: Tool = {
             "search_notes until the index recovers. Say so if the user asks."
         )
       }
-      lines.push("Tell the user in one short sentence what you saved, using the title above.")
+      lines.push(
+        writtenBody.length <= BODY_READBACK_MAX_CHARS
+          ? READ_BACK_THE_BODY
+          : READ_BACK_THE_SUMMARY
+      )
       return lines.join("\n")
     } catch (err) {
       return `Nothing was saved: ${err instanceof Error ? err.message : String(err)}`
