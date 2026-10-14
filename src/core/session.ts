@@ -221,6 +221,83 @@ export const EMPTY_REPLY_FALLBACK =
 export const BUDGET_EXHAUSTED_FALLBACK =
   "I ran out of tool calls before I could finish that one. Want me to keep going?"
 
+// ------------------------------------------------- the reply that was cut off
+//
+// Spoken when `finish_reason=length` leaves NO content and the last tool of
+// the turn succeeded, and recorded as the reply to that turn.
+//
+// The case, measured: on the long-note voice case 4 of 10 turns came back cut
+// off with reasoning deltas and zero characters of content, so the user heard
+// EMPTY_REPLY_FALLBACK — "Sorry, I lost my train of thought there" — about a
+// note that was already on disk, correctly, under the title they asked for.
+// That is not a lost thought. It is a finished action and an unfinished
+// sentence, and saying the first thing when the second is true teaches the
+// user that Ixa does not know what she just did.
+//
+// FOUR RULES, and each of them is the reply NOT being built from the tool
+// result:
+//
+//   1. One fixed sentence per tool name, chosen by code. The result text never
+//      reaches the user, because the result is written for the model — it
+//      carries note ids, body quotes and instructions — and reading it aloud
+//      is the failure the read-back work already measured once.
+//   2. Nothing is claimed that the tool did not report. `ok` comes from the
+//      tool's own `isFailure`, and a timeout is NOT ok: its work may still
+//      complete, so "I saved that note" would be a guess.
+//   3. No sentence claims a read-back. The read-back is the part the cut
+//      completion never got to, and it is exactly what the user is owed an
+//      honest account of.
+//   4. The spoken words and the recorded words come from the SAME constant,
+//      for the reason TURN_FAILURE_APOLOGY lives in this file: they cannot
+//      drift if there is only one of them.
+//
+// The map is deliberately short. Every entry is a fixed claim that a side
+// effect happened, so a tool only earns one when its success means one plain
+// thing; everything else — the searches, the reads, the clock — gets the
+// generic sentence, which claims no more than that the call went through.
+export const LENGTH_CUT_SAVE_NOTE =
+  "I saved that note, but I ran out of room before I could read it back."
+export const LENGTH_CUT_REMEMBER_PREFERENCE =
+  "I saved that preference, but I ran out of room before I could finish my answer."
+export const LENGTH_CUT_FORGET_PREFERENCE =
+  "I forgot that preference, but I ran out of room before I could finish my answer."
+export const LENGTH_CUT_SHELL_WRITE =
+  "That command ran, but I ran out of room before I could finish my answer."
+export const LENGTH_CUT_NOTIFY =
+  "I sent that notification, but I ran out of room before I could finish my answer."
+export const LENGTH_CUT_GENERIC =
+  "That went through, but I ran out of room before I could finish my answer."
+
+const LENGTH_CUT_FALLBACKS: Record<string, string> = {
+  save_note: LENGTH_CUT_SAVE_NOTE,
+  remember_preference: LENGTH_CUT_REMEMBER_PREFERENCE,
+  forget_preference: LENGTH_CUT_FORGET_PREFERENCE,
+  shell_write: LENGTH_CUT_SHELL_WRITE,
+  notify: LENGTH_CUT_NOTIFY,
+}
+
+// A tool with no sentence of its own — including a Phase 4 MCP tool nobody
+// here has seen — gets the generic one rather than a guess assembled from its
+// name.
+export function lengthCutFallback(toolName: string): string {
+  return LENGTH_CUT_FALLBACKS[toolName] ?? LENGTH_CUT_GENERIC
+}
+
+// The assistant message recorded for a turn the provider cut off.
+//
+// Same contract as emptyReplyRecord: the spoken sentence verbatim, plus a
+// bracketed note for the model. The note says what the user was NOT told —
+// that the reply was truncated rather than finished — because restored into
+// this history the model has to be able to answer "so did you save it?" and
+// "what was in it?", and the second question is the one the cut took away.
+export function lengthCutRecord(toolName: string, toolCalls: number): string {
+  const calls = toolCalls === 1 ? "1 tool call" : `${toolCalls} tool calls`
+  return (
+    `${lengthCutFallback(toolName)} [the reply was cut off: finish_reason=length with no ` +
+    `content after ${calls}; ${toolName} had already succeeded, and nothing was read back]`
+  )
+}
+
 // A voice reply with no sentence boundary in it cannot be trimmed, so past
 // this length it is logged instead. Only diagnostics: nothing branches on it.
 const UNBROKEN_REPLY_CHARS = 400
@@ -442,6 +519,13 @@ function logToolCall(
   console.log(
     `tool ${name} ${status} ${Date.now() - startedAt}ms ${shown}${note ? ` — ${note}` : ""}`
   )
+}
+
+// One tool execution's result, and whether the tool itself calls it a
+// success. The second half used to live only in the log line.
+interface ToolOutcome {
+  result: string
+  ok: boolean
 }
 
 export class ToolTimeoutError extends Error {
@@ -809,7 +893,14 @@ export class Session {
   // Runs one tool call under the generic ceiling, and logs it. Every path
   // that actually invokes a tool goes through here, so there is exactly one
   // place where a tool can hang and exactly one place that reports it.
-  private async executeTool(tool: Tool, tc: ToolCall): Promise<string> {
+  //
+  // Returns `ok` as well as the result, which is the same question the log
+  // word already answered and now has a second reader: the length-cut
+  // fallback may only claim a tool went through if it actually did. A
+  // TIMEOUT is not ok — the work may still complete, and "I saved that note"
+  // about a save that was abandoned mid-flight is exactly the claim
+  // ToolTimeoutError's own wording exists to prevent.
+  private async executeTool(tool: Tool, tc: ToolCall): Promise<ToolOutcome> {
     const startedAt = Date.now()
     try {
       const input = JSON.parse(tc.arguments || "{}")
@@ -826,10 +917,13 @@ export class Session {
       // only picks the word, and the result handed back is untouched.
       if (tool.isFailure?.(result)) {
         logToolCall(tool.name, "failed", startedAt, tc.arguments, firstLine(result))
-      } else {
-        logToolCall(tool.name, "ok", startedAt, tc.arguments)
+        return { result, ok: false }
       }
-      return result
+      logToolCall(tool.name, "ok", startedAt, tc.arguments)
+      // A tool with no `isFailure` has not said this result is a failure, so
+      // it is taken at its word. That is the same reading the log has always
+      // given it.
+      return { result, ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (err instanceof ToolTimeoutError) {
@@ -843,7 +937,7 @@ export class Session {
       } else {
         logToolCall(tool.name, "error", startedAt, tc.arguments, message)
       }
-      return JSON.stringify({ error: message })
+      return { result: JSON.stringify({ error: message }), ok: false }
     }
   }
 
@@ -903,6 +997,10 @@ export class Session {
     // of what they returned. Per TURN, not per session: a command that failed
     // because a file was missing may well work after the next one creates it.
     const failedCalls = new Map<string, string>()
+    // The last tool this turn touched, and whether it succeeded. Null until
+    // one does, which is itself an answer: a turn with no tool calls behind it
+    // has nothing to report having gone through.
+    let lastTool: { name: string; ok: boolean } | null = null
 
     // AN ITERATION IS NOT A CALL, which is why this is no longer the limit.
     //
@@ -1081,6 +1179,31 @@ export class Session {
             describeCost(response.cost)
         )
 
+        // THE PROVIDER CUT IT OFF, and a tool had already succeeded.
+        //
+        // Measured on the long-note voice case: 4 of 10 turns came back
+        // `finish_reason=length` with reasoning deltas and no content, and the
+        // user heard "Sorry, I lost my train of thought there" about a note
+        // that was on disk, correct, under the title they had asked for.
+        //
+        // So the words change, and only the words: nothing is retried, nothing
+        // is re-run, and the sentence is chosen by code from the tool's NAME
+        // and its own success — never assembled from the result text, which is
+        // written for the model and full of ids and instructions. See
+        // lengthCutFallback.
+        const lengthCut = response.finishReason === "length"
+        if (lengthCut && lastTool?.ok) {
+          this.messages.push({
+            role: "assistant",
+            content: lengthCutRecord(lastTool.name, toolCallsThisTurn),
+          })
+          console.warn(
+            `length cut: no content, but ${lastTool.name} had already succeeded — ` +
+              `saying so instead of the empty-reply fallback`
+          )
+          return lengthCutFallback(lastTool.name)
+        }
+
         // Asked again once, with no tools, which is the lever the malformed
         // tool call path already pulls: with nothing to call, a reply can only
         // be text. Measured at roughly one empty attempt in three against
@@ -1090,7 +1213,19 @@ export class Session {
         // Not retried when `retrying` is already set: the call that just came
         // back empty was itself a no-tools call, and issuing the identical
         // request again would spend a call to ask the same question twice.
-        if (!emptyRetryUsed && !retrying) {
+        //
+        // AND NOT ON A LENGTH CUT, whatever the tools did. The second call
+        // reasons just as much as the first and is cut off in the same place —
+        // measured: the retry fired on every one of those four turns and
+        // failed identically — so it buys nothing and costs another long call
+        // while the user waits. Logged, because a retry that silently does not
+        // happen is worse than one that does.
+        if (lengthCut && !emptyRetryUsed && !retrying) {
+          console.log(
+            `empty reply: not retrying a length cut — the same call reasons just as much ` +
+              `and is cut off in the same place`
+          )
+        } else if (!emptyRetryUsed && !retrying) {
           emptyRetryUsed = true
           retrying = true
           console.log("llm retry without tools: the reply was empty")
@@ -1166,6 +1301,7 @@ export class Session {
               content: NOT_EXECUTED_OVER_BUDGET,
             })
             answered.add(tc.id)
+            lastTool = { name: tc.name, ok: false }
             logToolCall(
               tc.name,
               "over-budget",
@@ -1182,6 +1318,13 @@ export class Session {
           // declined or cancelled. The price guard asks "did a search
           // happen", and a search the user declined did not happen.
           let ran = false
+          // Whether it ran AND the tool calls its own result a success. A
+          // narrower question than `ran`, and the one the length-cut fallback
+          // asks: it may only say an action went through if it went through.
+          // Default false, so every branch below that does not execute —
+          // unknown tool, refused repeat, capped search, declined, cancelled,
+          // over budget — answers "no" without having to say so.
+          let succeeded = false
 
           if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
             try {
@@ -1260,13 +1403,26 @@ export class Session {
               result = "Action declined by user."
               logToolCall(tool.name, "declined", askedAt, tc.arguments)
             } else {
-              result = await this.executeTool(tool, tc)
+              const outcome = await this.executeTool(tool, tc)
+              result = outcome.result
+              succeeded = outcome.ok
               ran = true
             }
           } else {
-            result = await this.executeTool(tool, tc)
+            const outcome = await this.executeTool(tool, tc)
+            result = outcome.result
+            succeeded = outcome.ok
             ran = true
           }
+
+          // The last tool of the turn, whatever happened to it. Read by the
+          // length-cut fallback, which needs BOTH halves: the name picks the
+          // sentence, and the success decides whether there is anything
+          // truthful to say at all. Written for every call that reached this
+          // point, including the ones that never ran, because "the last tool
+          // failed" and "no tool ran" are the same answer and a stale name
+          // from three calls ago would not be.
+          lastTool = { name: tc.name, ok: succeeded }
 
           // Remembered only for a call that RAN, that the tool itself calls a
           // failure, and that belongs to a tool enrolled in the refusal. A
