@@ -215,7 +215,10 @@ test("the tool validates its own arguments and says what was wrong", async (t) =
   harness(t)
 
   const cases: Array<[Record<string, unknown>, RegExp]> = [
-    [{ ...BASE, type: "note" }, /'type' must be one of/],
+    // `type` is NOT in this list any more: an unrecognized value is coerced
+    // to `reference` and saved (tool-arguments.test.ts), because refusing it
+    // cost a round trip on 20 of 20 measured saves. These four are different
+    // — without a title, a summary or a body there is nothing to write.
     [{ ...BASE, title: "  " }, /'title' is required/],
     [{ ...BASE, summary: "" }, /'summary' is required/],
     [{ ...BASE, sections: [] }, /'sections' must be a non-empty list/],

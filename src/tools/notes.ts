@@ -78,6 +78,39 @@ const TYPE_DESCRIPTION =
   'project: "the homelab GPU budget is settled". ' +
   'reference: "the backend runs in WSL2 on the gaming PC".'
 
+// WHAT THE MODEL ACTUALLY SENDS. Measured over twenty spoken saves: the FIRST
+// save_note call of every single one carried a type outside the set — "note"
+// nineteen times, "FACT" once — was refused, and was corrected on the next
+// iteration. Twenty of twenty. The refusal worked; it just cost an LLM round
+// trip on every note the user has ever saved, and before the log word was
+// honest (`noteFailure`) it was invisible, logged as `tool save_note ok 0ms`.
+//
+// So the value is coerced instead of refused. Case and surrounding whitespace
+// are a typing slip, not a decision, and "FACT" is the model agreeing with the
+// description and disagreeing with the vocabulary. Anything else becomes
+// `reference`, which is where five of six notes land when the model DOES pick
+// (see TYPE_DESCRIPTION above), so the coercion mostly agrees with the choice
+// it would have made on the second attempt.
+//
+// The correction is reported in the result rather than swallowed: without it
+// the model describes a note it has just saved as a `fact` note, because its
+// own arguments are all it has to go on. The log needs no help — it already
+// prints the arguments that were sent — but a coercion nobody is told about
+// would make `reference` the behaviour and the description a decoration.
+export function coerceNoteType(value: unknown): { type: NoteType; given: string | null } {
+  const given = typeof value === "string" ? value.trim() : ""
+  const match = NOTE_TYPES.find((valid) => valid === given.toLowerCase())
+  if (match) return { type: match, given: null }
+  return { type: "reference", given }
+}
+
+export function typeCoercedLine(given: string): string {
+  const what = given
+    ? `'type' was "${given}", which is not one of ${NOTE_TYPES.join(", ")}`
+    : "'type' was missing"
+  return `${what}, so this was saved as a reference note.`
+}
+
 interface SaveNoteInput {
   type?: unknown
   title?: unknown
@@ -209,10 +242,11 @@ export const saveNoteTool: Tool = {
       //   parameters for tool save_note did not match schema:
       //   [`/type`: value must be one of 'decision', 'project', 'reference']
       // — no note, no answer, and the search paid for nothing. With the enum
-      // gone the same mistake reaches execute(), which replies "'type' must
-      // be one of decision, project, reference" and the model fixes it on the
-      // next iteration. A schema constraint costs the whole turn; the same
-      // constraint in code costs one round trip.
+      // gone the same mistake reaches execute(), where it costs nothing at
+      // all: coerceNoteType maps it to `reference` and the result says so.
+      // A schema constraint costs the whole turn; the enum here would also be
+      // enforcing a distinction the model has never once got right on the
+      // first try.
       type: { type: "string", description: TYPE_DESCRIPTION },
       title: {
         type: "string",
@@ -250,14 +284,11 @@ export const saveNoteTool: Tool = {
     if (!notebook) return NOTEBOOK_UNAVAILABLE
 
     const raw = (typeof input === "object" && input !== null ? input : {}) as SaveNoteInput
-    const type = typeof raw.type === "string" ? raw.type : ""
+    const { type, given: typeGiven } = coerceNoteType(raw.type)
     const title = typeof raw.title === "string" ? raw.title.trim() : ""
     const summary = typeof raw.summary === "string" ? raw.summary.trim() : ""
     const sections = asSections(raw.sections)
 
-    if (!NOTE_TYPES.includes(type as NoteType)) {
-      return `Nothing was saved: 'type' must be one of ${NOTE_TYPES.join(", ")}.`
-    }
     if (!title) return "Nothing was saved: 'title' is required."
     if (!summary) return "Nothing was saved: 'summary' is required."
     if (!sections) {
@@ -298,7 +329,7 @@ export const saveNoteTool: Tool = {
 
     try {
       const result = await notebook.save({
-        type: type as NoteType,
+        type,
         title,
         summary,
         sections: stamped,
@@ -321,6 +352,9 @@ export const saveNoteTool: Tool = {
       // was in the BODY and nothing read the body back.
       const lines = [
         `Saved ${result.note.type} note "${result.note.title}" (id ${result.note.id}).`,
+        // Only when the model's own value was not used, so the ordinary save
+        // reads exactly as it did before.
+        ...(typeGiven === null ? [] : [typeCoercedLine(typeGiven)]),
         `Summary on disk: ${result.note.summary}`,
       ]
       // `sections`, not `stamped`: the price caveat is appended by code and

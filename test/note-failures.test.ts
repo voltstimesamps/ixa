@@ -30,12 +30,17 @@ import type { LLMResponse } from "../src/core/llm"
 // The call returned "Nothing was saved: 'type' must be one of …" and wrote
 // nothing. Both note tools catch their own problems and return them as result
 // strings — right by the model, and a lie to the one place a human looks.
+//
+// That particular refusal no longer exists: the honest log word showed it
+// firing on 20 of 20 saves, so an unrecognized type is now coerced to
+// `reference` (tool-arguments.test.ts). The lesson outlived the case — the
+// refusals BELOW are the ones that still write nothing, and the only reason
+// anyone knows how often any of them fire is that the log says the word.
 
 // ------------------------------------------------------------ the predicate
 
 test("every refusal save_note writes is a failure", () => {
   for (const result of [
-    "Nothing was saved: 'type' must be one of decision, project, reference.",
     "Nothing was saved: 'title' is required.",
     "Nothing was saved: 'summary' is required.",
     "Nothing was saved: 'sections' must be a non-empty list of {heading, body}, both non-empty.",
@@ -82,7 +87,7 @@ function harness(t: { after: (fn: () => void) => void }) {
   return h
 }
 
-function saveCall(id: string, type: string): LLMResponse {
+function saveCall(id: string, broken: Record<string, unknown> = {}): LLMResponse {
   return {
     type: "tool_calls",
     calls: [
@@ -90,10 +95,11 @@ function saveCall(id: string, type: string): LLMResponse {
         id,
         name: "save_note",
         arguments: JSON.stringify({
-          type,
+          type: "reference",
           title: "Ixa repo location",
           summary: "Ixa repo location",
           sections: [{ heading: "Ixa repo location", body: "The Ixa repo is at /home/wyatt/ixa." }],
+          ...broken,
         }),
       },
     ],
@@ -107,9 +113,11 @@ test("a save_note refusal logs as failed, and the save that follows logs as ok",
   let n = 0
   const chat: ChatFn = async () => {
     n++
-    // The live sequence: an invalid type, corrected on the next iteration.
-    if (n === 1) return saveCall("c1", "note")
-    if (n === 2) return saveCall("c2", "reference")
+    // The live sequence was an invalid type corrected on the next iteration,
+    // and an invalid type is no longer a refusal. The shape is what matters:
+    // a call that writes nothing, then the same call put right.
+    if (n === 1) return saveCall("c1", { title: "   " })
+    if (n === 2) return saveCall("c2", {})
     return { type: "text", content: "I saved it." }
   }
 
@@ -122,7 +130,7 @@ test("a save_note refusal logs as failed, and the save that follows logs as ok",
   const calls = logs.filter((line) => line.startsWith("tool save_note"))
   assert.equal(calls.length, 2)
   assert.match(calls[0]!, /^tool save_note failed /)
-  assert.match(calls[0]!, /'type' must be one of/, "and says which failure it was")
+  assert.match(calls[0]!, /'title' is required/, "and says which failure it was")
   assert.match(calls[1]!, /^tool save_note ok /)
 })
 

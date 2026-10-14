@@ -8,7 +8,7 @@ import { setNotebook } from "../src/memory/notebook"
 import { PreferenceStore, setPreferenceStore } from "../src/memory/preferences"
 import { registry } from "../src/tools/registry"
 import { searchMemoryTool } from "../src/tools/search-memory"
-import { saveNoteTool, searchNotesTool } from "../src/tools/notes"
+import { coerceNoteType, saveNoteTool, searchNotesTool } from "../src/tools/notes"
 import { rememberPreferenceTool, listPreferencesTool } from "../src/tools/preferences"
 import "../src/tools/register"
 
@@ -184,7 +184,18 @@ test("a null category falls back to the default, and does not filter a listing",
 
 // --------------------------------------------------- a value outside the set
 
-test("a wrong note type is a correction, not a dead turn", async (t) => {
+// REVERSED DELIBERATELY, and this is the test that used to say the opposite.
+//
+// It asserted that a type outside the set returned "Nothing was saved: 'type'
+// must be one of …" and wrote nothing, which was right while the alternative
+// was Groq killing the turn: a correctable mistake beats a dead turn.
+//
+// Then the log word got honest and the cost became visible. In TWENTY OF
+// TWENTY spoken saves the model's FIRST save_note call carried a type outside
+// the set ("note", "FACT"), was refused, and was corrected on the next
+// iteration. Not a guard catching a mistake — a tax on every note the user
+// has ever saved, one LLM round trip each, previously logged as `ok 0ms`.
+test("a wrong note type is coerced and saved, not refused", async (t) => {
   const h = makeNotebook()
   setNotebook(h.notebook)
   t.after(() => {
@@ -192,14 +203,8 @@ test("a wrong note type is a correction, not a dead turn", async (t) => {
     h.cleanup()
   })
 
-  // Measured: asked to look up a 3090 price and write it down, the model ran
-  // its web_search and then chose a type outside the three. With `enum` in
-  // the schema Groq rejected the whole call —
-  //   parameters for tool save_note did not match schema:
-  //   [`/type`: value must be one of 'decision', 'project', 'reference']
-  // — and the turn produced nothing at all.
   const output = String(
-    await withTurn({ userText: "write down what a 3090 costs" }, () =>
+    await withTurn({ userText: "a used 3090 is about $600 — write that down" }, () =>
       saveNoteTool.execute({
         type: "fact",
         title: "A used 3090 is about $600",
@@ -209,10 +214,65 @@ test("a wrong note type is a correction, not a dead turn", async (t) => {
     )
   )
 
-  assert.match(output, /'type' must be one of decision, project, reference/)
-  assert.ok(output.startsWith("Nothing was saved"), "and it says so first, not in passing")
-  assert.equal(h.store.count(), 0, "no row")
-  assert.deepEqual(fs.readdirSync(h.vault), [], "and no file: the vault is untouched")
+  assert.match(output, /^Saved reference note/, "saved, and saved as reference")
+  assert.ok(!output.startsWith("Nothing was saved"), "the old behaviour, gone on purpose")
+  assert.match(
+    output,
+    /'type' was "fact", which is not one of decision, project, reference, so this was saved/,
+    "and the model is told, so its reply does not call this a fact note"
+  )
+  assert.equal(h.store.count(), 1, "one row")
+  assert.equal(h.store.all()[0]!.type, "reference", "with the coerced type, not the sent one")
+  assert.equal(fs.readdirSync(h.vault).length, 1, "and one file")
+})
+
+// The five shapes the model is known to send, plus one that nothing sends.
+// Case and surrounding whitespace are a typing slip; "FACT" and "note" are
+// the model agreeing with the description and disagreeing with the
+// vocabulary; "banana" is the case the mapping exists for at all.
+test("every type the model sends resolves to one of the three", () => {
+  const cases: Array<[unknown, string, string | null]> = [
+    ["FACT", "reference", "FACT"],
+    ["note", "reference", "note"],
+    ["Decision", "decision", null],
+    [" reference ", "reference", null],
+    ["banana", "reference", "banana"],
+    // Not in the brief, but `required` does not stop the model omitting it,
+    // and an absent type must not be a dead save either.
+    [undefined, "reference", ""],
+    [null, "reference", ""],
+  ]
+
+  for (const [sent, expected, given] of cases) {
+    const resolved = coerceNoteType(sent)
+    assert.equal(resolved.type, expected, `${JSON.stringify(sent)} -> ${expected}`)
+    assert.equal(resolved.given, given, `${JSON.stringify(sent)} reported as ${given}`)
+  }
+})
+
+// A value that only needed trimming or lower-casing was never a mistake, so
+// saying so would be noise in a spoken reply.
+test("a type that was merely mistyped is corrected silently", async (t) => {
+  const h = makeNotebook()
+  setNotebook(h.notebook)
+  t.after(() => {
+    setNotebook(null)
+    h.cleanup()
+  })
+
+  const output = String(
+    await withTurn({ userText: "write down that we picked Tavily" }, () =>
+      saveNoteTool.execute({
+        type: "Decision",
+        title: "Tavily replaced Brave for search",
+        summary: "Search goes through Tavily now.",
+        sections: [{ heading: "Why", body: "Brave's result bodies were too short." }],
+      })
+    )
+  )
+
+  assert.match(output, /^Saved decision note/, "the value the model meant")
+  assert.ok(!output.includes("'type' was"), "and nothing to read out about it")
 })
 
 test("save_note's type carries no enum, so the model can be told instead", () => {
