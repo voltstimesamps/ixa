@@ -191,7 +191,57 @@ export const VOICE_RESPONSE_PROMPT =
 
   "And this is a mishearing, not a question:\n" +
   "User: Let's cheat last here.\n" +
-  "Ixa: Sorry, I did not catch that. Could you say it again?"
+  "Ixa: Sorry, I did not catch that. Could you say it again?\n" +
+
+  // THE LAST LINE, AND THIS PROMPT IS WHY IT HAS TO EXIST.
+  //
+  // Live, five times over two sessions: "from now on keep answers short" made
+  // NO tool call and Ixa said "Sure. I'll keep it concise." Nothing was
+  // stored — the preferences table has never held an answer_length row — and
+  // twice the whole reply was "Understood." or "Got it."
+  //
+  // The cause is this prompt. Measured, same messages, same tools, the same
+  // reasoning_effort low in both halves, the only difference being whether
+  // the prompt below was appended at all:
+  //
+  //   "From now on, keep your answers short."   with it 0/10   without it 10/10
+  //
+  // Everything above this line is a rule about answer length, and it is the
+  // last thing the model reads before it answers. A user asking for shorter
+  // answers reads as a rule it has just been handed and is already obeying,
+  // so there is nothing left to do and no reason to call a tool. That is not
+  // a routing failure in remember_preference's description, which already
+  // names "from now on…" as a trigger in so many words, and the same
+  // utterance reaches the tool 10 times out of 10 once this block is gone.
+  //
+  // So the sentence contradicts exactly that reading: these rules are for ONE
+  // reply, and a standing one has to be stored. Measured against the three
+  // utterances that failed, 10 runs each, this prompt in both halves:
+  //
+  //   without this line  0/30 reached remember_preference
+  //   with it           30/30, and no save_note in any of them
+  //
+  // It also fixes the STT-garbled form ("So now on, keep answers short"),
+  // which failed 0 of 40 in every arm and both halves of the control — so the
+  // garbling was never the barrier once the model is told a standing
+  // instruction has to be written down. 77 tokens per voice call, and nothing
+  // on a text turn.
+  //
+  // Four other levers were measured and are not here: forcing the tool with
+  // tool_choice (15 of 15 HTTP 400, because the model has decided not to call
+  // it), reasoning_effort medium (0/10, 0/10, 1/10, and it sampled
+  // shell_write and start_new_conversation on a turn about answer length), a
+  // worked example in remember_preference's description (tried, measured,
+  // reverted — it is a comment in that file), and a guard on the draft reply
+  // (its ceiling is 3 of the 5 live misses, because "Got it." carries no
+  // pattern to catch). See ARCHITECTURE.md.
+  //
+  // Placement is the pilot's: after the examples, the last line of the block.
+  // The pilot measured it there and nowhere else.
+  "- AN INSTRUCTION ABOUT HOW YOU ANSWER IS NOT SATISFIED BY THIS REPLY. These rules apply to " +
+  "this one answer; a rule the user wants from now on has to be stored or it is gone. When they " +
+  "state a standing one — shorter, longer, no jargon, a different tone — call " +
+  "remember_preference, then say in one sentence what you saved."
 
 // Spoken when a turn fails, and recorded as the assistant's reply to the turn
 // that failed. Short, fixed, and free of any suggestion about what went wrong:
