@@ -19,6 +19,34 @@ const execFile = promisify(execFileCb)
 
 const MAX_OUTPUT = 8000
 
+// What a command that worked and printed nothing reports.
+//
+// It used to return "", and an empty tool result is not a report of anything.
+// Live, in one voice conversation: a confirmed `touch MyFile.txt` and a
+// confirmed `rm MyFile.txt` each came back as "" and each was answered
+// correctly — and the history the model then carried was twice the pattern
+//
+//   shell_write touch MyFile.txt -> (nothing) -> "I created MyFile.txt."
+//
+// Three turns later a DECLINED touch, whose result said "Action declined by
+// user." in so many words, was answered "I've created MyFile.txt." Removing
+// those two exchanges from a replay of that history dropped the false claim
+// from 8 of 30 turns to 0 of 10, so what success looks like in history is part
+// of what a later turn copies. A result that says nothing is a result that
+// teaches nothing, and the model has to fill it in.
+//
+// DELIBERATELY NOT shell_read's "(no output)". That one answers a question —
+// the listing really was empty, and nothing happened. This one reports an
+// ACTION that completed. They are different claims, and a model reading its
+// own history has to be able to tell a read that found nothing from a write
+// that did something.
+//
+// Not matched by `isShellFailure`: it begins "Command ran", and the only
+// "Command ..." forms that predicate matches are "Command failed:", "Command
+// timed out", "Command blocked:" and "Command '<x>' is not allowed". Held by a
+// test, because the prefix list lives in another file.
+export const RAN_NO_OUTPUT = "Command ran successfully (no output)."
+
 function truncate(s: string): string {
   if (s.length <= MAX_OUTPUT) return s
   const omitted = s.length - MAX_OUTPUT
@@ -186,7 +214,7 @@ export const shellWriteTool: Tool = {
       const { stdout, stderr } = await execFile(spec.exe, spec.args, { cwd, timeout: 30000, shell: false, env: { ...process.env } })
       if (stdout) return truncate(stdout)
       if (stderr) return truncate(stderr)
-      return ""
+      return RAN_NO_OUTPUT
     } catch (err: unknown) {
       const execErr = err as { killed?: boolean; stderr?: string; message?: string }
       if (execErr.killed) return "Command timed out after 30 seconds."

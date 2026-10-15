@@ -70,7 +70,7 @@ const OUTPUT_TOO_LARGE =
 // from a tool that broke, and live that ambiguity cost two calls: `find` with
 // a pattern that could not match returned "" twice, and the model read it as
 // the tool failing rather than as the answer being "nothing here".
-const NO_OUTPUT = "(no output)"
+export const NO_OUTPUT = "(no output)"
 
 const WHITELIST = new Set([
   "ls", "cat", "head", "tail", "grep", "find", "pwd", "echo", "wc",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtemp, readdir, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { shellWriteTool } from "../src/tools/shell-write"
+import { RAN_NO_OUTPUT, shellWriteTool } from "../src/tools/shell-write"
 // The real registry, because two of these tests drive a real turn and the
 // session resolves a tool by name. Neither of those two ever executes
 // anything — one is refused before the prompt and the other declines it — so
@@ -13,6 +13,8 @@ import "../src/tools/register"
 import { SessionManager } from "../src/core/session-manager"
 import { registry } from "../src/tools/registry"
 import { confirmationText, type ChatFn } from "../src/core/session"
+import { NO_OUTPUT } from "../src/tools/shell-read"
+import { isShellFailure } from "../src/tools/shell-result"
 import type { ConfirmationOutcome } from "../src/core/confirmation"
 import type { WsMessage } from "../src/api/types"
 import { makeConnection, TEST_LIMITS } from "./helpers"
@@ -52,7 +54,7 @@ after(async () => {
 
 test("a quoted filename with a space is ONE file", async () => {
   const result = await run(`touch "my file.txt"`, [], dir)
-  assert.equal(result, "", "touch says nothing when it works")
+  assert.equal(result, RAN_NO_OUTPUT, "a touch that worked says so")
 
   const entries = await readdir(dir)
   assert.deepEqual(entries, ["my file.txt"], `created instead: ${entries.join(", ")}`)
@@ -60,7 +62,7 @@ test("a quoted filename with a space is ONE file", async () => {
 
 test("single quotes work too, and the quotes are not part of the name", async () => {
   const result = await run(`touch 'two words.txt'`, [], dir)
-  assert.equal(result, "")
+  assert.equal(result, RAN_NO_OUTPUT)
 
   const entries = await readdir(dir)
   assert.ok(entries.includes("two words.txt"), `created instead: ${entries.join(", ")}`)
@@ -208,7 +210,7 @@ test("the displayed command matches what is executed", async () => {
   assert.equal(shown, `touch "spaced name.txt"`)
 
   const result = await shellWriteTool.execute(input)
-  assert.equal(result, "")
+  assert.equal(result, RAN_NO_OUTPUT)
 
   const entries = await readdir(dir)
   assert.ok(
@@ -247,4 +249,72 @@ test("shell_write is still the only tool with a preflight", () => {
     .filter((tool) => tool.preflight)
     .map((tool) => tool.name)
   assert.deepEqual(withPreflight, ["shell_write"])
+})
+
+// ------------------------------------------- success that printed nothing
+
+// A SUCCESSFUL WRITE HAS TO SAY SO.
+//
+// This returned "" until a live voice conversation showed what an empty
+// result teaches. A confirmed `touch` and a confirmed `rm` both reported
+// nothing and were both answered correctly, so the history the model carried
+// was twice the pattern
+//
+//   shell_write touch MyFile.txt -> (nothing) -> "I created MyFile.txt."
+//
+// Three turns later a DECLINED touch, whose result said "Action declined by
+// user." in so many words, was answered "I've created MyFile.txt." Replaying
+// that history reproduced the false claim in 8 of 30 turns; replaying it with
+// those two empty-result exchanges removed reproduced it in 0 of 10.
+test("a command that worked and printed nothing says that it worked", async () => {
+  const result = await run("mkdir", ["silent-success"], dir)
+  assert.equal(result, RAN_NO_OUTPUT)
+  // The two things the sentence has to carry, named rather than assumed: that
+  // the command ran, and that the silence was its output and not an error.
+  assert.match(result, /ran successfully/)
+  assert.match(result, /no output/)
+
+  const made = await stat(join(dir, "silent-success"))
+  assert.ok(made.isDirectory(), "and it really ran")
+})
+
+test("the success sentence is not shell_read's, because they are different claims", () => {
+  // shell_read's "(no output)" answers a question: the listing really was
+  // empty and nothing happened. This reports an action that completed. A model
+  // reading its own history has to be able to tell the two apart.
+  assert.notEqual(RAN_NO_OUTPUT, NO_OUTPUT)
+  // The difference that carries it: this one says the command RAN. shell_read's
+  // says only that there was nothing, which is true of a write that never
+  // happened as well as of one that did.
+  assert.match(RAN_NO_OUTPUT, /\bran\b/)
+  assert.ok(!/\bran\b/.test(NO_OUTPUT), `shell_read's result now claims a run: ${NO_OUTPUT}`)
+})
+
+test("the success sentence is not read as a failure", () => {
+  // The prefix list is in shell-result.ts, a different file from the sentence,
+  // so this is asserted rather than inspected: "Command ran successfully" sits
+  // one word away from "Command failed:" and "Command blocked:", and a success
+  // logged as a failure would also be remembered as one by dedupeFailures.
+  assert.equal(isShellFailure(RAN_NO_OUTPUT), false, "a success read as a failure")
+  assert.equal(shellWriteTool.isFailure!(RAN_NO_OUTPUT), false)
+})
+
+test("failure results are unchanged", async () => {
+  // Nothing about the success wording moved these, and each is still
+  // recognised as a failure by the tool's own predicate.
+  const blocked = await run("rm", ["/etc/passwd"], dir)
+  assert.match(blocked, /^Command blocked: access to system paths/)
+
+  const missing = await run("cd", ["no-such-directory-here"], dir)
+  assert.match(missing, /^Directory not found:/)
+
+  const failed = await run("rm", ["definitely-not-a-file.txt"], dir)
+  assert.match(failed, /^Command failed:/)
+
+  const refused = await run("find", [">", join(dir, "out2.txt")], dir)
+  assert.match(refused, /^Not run: ">" is a shell operator/)
+
+  for (const result of [blocked, missing, failed, refused]) {
+    assert.equal(isShellFailure(result), true, `not seen as a failure: ${result}`)
+  }
 })
