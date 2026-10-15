@@ -20,6 +20,12 @@ import { buildWindow, type ContextWindowLimits } from "./context-window"
 import { currentTurnEvidence, runWithSessionControl } from "./session-context"
 import { shortenForSpeech } from "../voice/shorten"
 import { findCurrencyAmounts, priceCorrectionPrompt } from "./prices"
+import {
+  claimCorrectionPrompt,
+  findCompletionClaim,
+  outcomePhrase,
+  type UnmetOutcome,
+} from "./claims"
 import type { Connection } from "./connection"
 import type { PersistedSession } from "./session-store"
 
@@ -436,6 +442,65 @@ const CONFIRM_TIMED_OUT =
   "executed, and this is NOT a refusal — they may simply have been away. Do not run it " +
   "again or ask again unless they raise it themselves."
 
+// ----------------------------------------------- the reply that claimed too much
+//
+// Spoken when the model has twice told the user that an action happened on a
+// turn where a confirming tool call was declined, unanswered, cancelled or
+// failed and NOTHING succeeded. Recorded as the reply to that turn.
+//
+// The case, live: a voice turn called `shell_write touch MyFile.txt`, the user
+// typed "no", the tool result said `Action declined by user.` in those four
+// words, and the reply was "I've created MyFile.txt." The file did not exist.
+//
+// One constant per outcome, for the reason TURN_FAILURE_APOLOGY is one
+// constant: the words the user hears and the words history keeps cannot drift
+// apart if there is only one of them. Four sentences rather than one because
+// the user is owed the actual reason — "you said no" and "nobody answered" are
+// different facts about them, and the second one is the one that must never be
+// reported as the first. No em dashes and nothing bracketed, like every other
+// spoken constant in this file: these go through TTS.
+//
+// `failed` is deliberately the odd one out. The other three can say nothing
+// happened, because nothing ran. A tool that ran and failed may have done
+// part of its work, and a tool ABANDONED on its deadline may yet finish — so
+// the only honest claim left is about what Ixa can say, not about what the
+// machine did.
+export const CLAIM_GUARD_DECLINED =
+  "I didn't do that. You said no, so nothing happened."
+export const CLAIM_GUARD_UNANSWERED =
+  "I didn't do that. Nobody answered the confirmation, so nothing happened."
+export const CLAIM_GUARD_CANCELLED =
+  "I didn't do that. The confirmation was cancelled, so nothing happened."
+export const CLAIM_GUARD_FAILED =
+  "That didn't work, so I can't tell you it went through."
+
+const CLAIM_GUARD_SENTENCES: Record<UnmetOutcome, string> = {
+  declined: CLAIM_GUARD_DECLINED,
+  unanswered: CLAIM_GUARD_UNANSWERED,
+  cancelled: CLAIM_GUARD_CANCELLED,
+  failed: CLAIM_GUARD_FAILED,
+}
+
+export function claimGuardFallback(outcome: UnmetOutcome): string {
+  return CLAIM_GUARD_SENTENCES[outcome]
+}
+
+// The assistant message recorded for a turn whose reply code had to write.
+//
+// Same contract as lengthCutRecord: the spoken sentence verbatim, plus a
+// bracketed note for the model. The note says the part the user was not told —
+// that this sentence is not the model's — because restored into this history
+// the model would otherwise read it as its own considered answer and have no
+// idea that its two drafts were rejected.
+export function claimGuardRecord(outcome: UnmetOutcome, toolName: string): string {
+  return (
+    `${claimGuardFallback(outcome)} [this sentence was written by code: the draft reply ` +
+    `claimed the action had happened, was corrected once, and claimed it again. ` +
+    `${toolName} was not carried out because ${outcomePhrase(outcome)}, and no tool call ` +
+    `succeeded in this turn]`
+  )
+}
+
 // What a tool result says when the turn failed before that call ever ran.
 // Truthful on purpose: the model is told nothing happened, not handed a
 // vague error it might read as "the action may have gone through".
@@ -688,6 +753,12 @@ export class Session {
   // history — see priceCorrectionPrompt.
   private priceCorrection: string | null = null
 
+  // The claim guard's corrective instruction, set for exactly one retry. Same
+  // single-field, never-stored reasoning as priceCorrection, and never set at
+  // the same time as it: the price guard runs first and clears itself before
+  // the claim guard is reached.
+  private claimCorrection: string | null = null
+
   // The tool-budget notice, set for the calls made after the budget is spent.
   // Same single-field, never-stored reasoning as priceCorrection.
   private toolBudgetNotice: string | null = null
@@ -776,6 +847,7 @@ export class Session {
           } finally {
             this.recalled = null
             this.priceCorrection = null
+            this.claimCorrection = null
             this.toolBudgetNotice = null
             this.noToolCallNotice = null
           }
@@ -914,6 +986,12 @@ export class Session {
     // above it for this one call.
     if (this.priceCorrection) {
       messages = [...messages, { role: "system", content: this.priceCorrection }]
+    }
+
+    // Beside it, never with it: at most one of the two is ever set, because
+    // the price guard clears itself before the claim guard is reached.
+    if (this.claimCorrection) {
+      messages = [...messages, { role: "system", content: this.claimCorrection }]
     }
 
     return messages
@@ -1078,6 +1156,26 @@ export class Session {
     // has nothing to report having gone through.
     let lastTool: { name: string; ok: boolean } | null = null
 
+    // What the claim guard needs, and nothing more than that.
+    //
+    // `unmet` is the most recent CONFIRMING tool call that did not do its
+    // work — declined, unanswered, cancelled, or ran and failed. Most recent
+    // rather than first, because a reply is about the last thing attempted.
+    // Restricted to tools that confirm because that is the failure being
+    // guarded: the user was asked a question, and the answer was no or
+    // nothing. A failed `shell_read` arms nothing.
+    //
+    // `someToolSucceeded` is asked of EVERY tool, not just confirming ones,
+    // and it is what makes the guard cheap to be sure of: a turn in which
+    // anything at all worked is a turn where "I saved that note" may well be
+    // true, and the guard does not go near it.
+    let unmet: { name: string; outcome: UnmetOutcome } | null = null
+    let someToolSucceeded = false
+    // Once per turn, for the reason the price guard retries once: a model that
+    // claims the action twice, having been told plainly that it did not
+    // happen, is not going to stop on the third ask.
+    let claimGuardUsed = false
+
     // AN ITERATION IS NOT A CALL, which is why this is no longer the limit.
     //
     // It was a hard-coded 10, and the live turn that prompted all this made
@@ -1113,7 +1211,14 @@ export class Session {
       try {
         response = await this.chat(
           sent,
-          retrying || budgetSpent ? [] : tools,
+          // No tools on the claim-guard retry either, and that is the point of
+          // it rather than an economy: the action the draft lied about is one
+          // the user declined or ignored, so the correction must not be able
+          // to answer by running it or by asking again. Measured: avoiding the
+          // false claim with `reasoning_effort: medium` instead put a median of
+          // 2 and a maximum of SEVEN confirmation prompts in front of the user
+          // for one `touch` — and a voice turn cannot answer a prompt at all.
+          retrying || budgetSpent || this.claimCorrection ? [] : tools,
           turnCallOptions(origin)
         )
       } catch (err) {
@@ -1228,6 +1333,52 @@ export class Session {
             )
           }
           this.priceCorrection = null
+
+          // The claim guard, in the same place and for the same reason as the
+          // price guard above: before anything is recorded or delivered, so a
+          // draft that is rejected is one the user never heard and history
+          // never says Ixa said.
+          //
+          // THREE CONDITIONS, and the first two are what make the third one
+          // safe to act on. A confirming tool call this turn did not do its
+          // work; nothing in the turn succeeded; and only then is the draft
+          // read for a claim that something did. A turn where `save_note`
+          // worked and the reply says "I saved that note" cannot reach the
+          // pattern at all — which is why the pattern can stay small.
+          //
+          // Both origins. The measured failure was a voice turn, but nothing
+          // about it is spoken: the same history, the same cut-short
+          // reasoning and the same ambiguous user message arrive by text.
+          if (unmet && !someToolSucceeded) {
+            const claim = findCompletionClaim(response.content)
+            if (claim) {
+              if (!claimGuardUsed) {
+                claimGuardUsed = true
+                this.claimCorrection = claimCorrectionPrompt(claim, unmet.outcome, unmet.name)
+                console.warn(
+                  `claim guard: draft said "${claim}" but ${unmet.name} was ` +
+                    `${unmet.outcome} and nothing succeeded this turn — asking again`
+                )
+                continue
+              }
+              // Twice. The difference from the price guard, which delivers the
+              // second draft anyway: an unsearched price is a figure that may
+              // be wrong, and this is a statement about what Ixa just did to
+              // the user's machine. There is no version of delivering it that
+              // is better than saying the true thing in four fixed words, and
+              // the model has already been told plainly and declined to.
+              console.warn(
+                `claim guard: second draft still said "${claim}" — replacing it with the ` +
+                  `${unmet.outcome} sentence`
+              )
+              this.messages.push({
+                role: "assistant",
+                content: claimGuardRecord(unmet.outcome, unmet.name),
+              })
+              return claimGuardFallback(unmet.outcome)
+            }
+          }
+          this.claimCorrection = null
 
           const spoken = this.shortenIfSpoken(response.content, origin)
           this.messages.push({ role: "assistant", content: spoken.recorded })
@@ -1405,6 +1556,10 @@ export class Session {
           // unknown tool, refused repeat, capped search, declined, cancelled,
           // over budget — answers "no" without having to say so.
           let succeeded = false
+          // Which of the four ways this call failed to do its work, for the
+          // claim guard. Null for a call that worked and for one that never
+          // reached the user's question at all.
+          let unmetOutcome: UnmetOutcome | null = null
 
           if (tool && (tool.name === "shell_read" || tool.name === "shell_write")) {
             try {
@@ -1509,6 +1664,7 @@ export class Session {
               // did not happen because the asking client vanished, not because
               // the user refused. Nothing executed either way.
               result = CONFIRM_CANCELLED
+              unmetOutcome = "cancelled"
               logToolCall(tool.name, "cancelled", askedAt, tc.arguments)
             } else if (outcome === "timeout") {
               // Distinct from BOTH of the others. The question was delivered
@@ -1520,6 +1676,7 @@ export class Session {
               // two very different events, and a log that calls them the same
               // thing is a log that cannot be read.
               result = CONFIRM_TIMED_OUT
+              unmetOutcome = "unanswered"
               logToolCall(
                 tool.name,
                 "unanswered",
@@ -1529,6 +1686,7 @@ export class Session {
               )
             } else if (outcome === "declined") {
               result = CONFIRM_DECLINED
+              unmetOutcome = "declined"
               logToolCall(tool.name, "declined", askedAt, tc.arguments)
             } else {
               const outcome = await this.executeTool(tool, tc)
@@ -1551,6 +1709,15 @@ export class Session {
           // failed" and "no tool ran" are the same answer and a stale name
           // from three calls ago would not be.
           lastTool = { name: tc.name, ok: succeeded }
+
+          // The claim guard's two facts, recorded in the one place that knows
+          // what happened to this call. A confirming tool that RAN and failed
+          // joins the three confirmation outcomes above: from the user's side
+          // "you said no" and "it broke" are different, but "do not tell them
+          // it worked" is the same.
+          if (tool?.requiresConfirmation && ran && !succeeded) unmetOutcome = "failed"
+          if (unmetOutcome) unmet = { name: tc.name, outcome: unmetOutcome }
+          if (succeeded) someToolSucceeded = true
 
           // Remembered only for a call that RAN, that the tool itself calls a
           // failure, and that belongs to a tool enrolled in the refusal. A
