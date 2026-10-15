@@ -1,14 +1,19 @@
 # Comparison run: WITHOUT the `save_note` routing clause
 
-The shipped description says:
+The clause this run was taken without:
 
 > "Remember that ..." is this tool when what follows is a fact or a decision.
 
-This run is the same script with that clause **absent** — the comparison that decided
-it. Request 12 (*"remember that the stt sidecar uses base.en, not small"*) reached
-`search_notes` and then `remember_preference`, filing a fact as a preference, which is
-what the clause fixes. Request 15 writes a redundant note here too, which is how that
-regression was shown **not** to be the clause's fault.
+It shipped on the strength of this comparison and was **reverted on 2026-10-14** when the
+live tripwire fired, so the shipped description now matches this run again — see
+`notes-verify-report.md` for the current state and ARCHITECTURE.md for why. This file is
+kept as history: it is the comparison that decided the clause ships.
+
+Request 12 (*"remember that the stt sidecar uses base.en, not small"*) reached
+`search_notes` and then `remember_preference`, filing a fact as a preference — the case
+the clause fixed, and the case that is a known limitation again now. Request 15 writes a
+redundant note here too, which is how that regression was shown **not** to be the
+clause's fault.
 
 `notes-verify-report.md` beside this file is the shipped state. Same seed, both on a
 freshly cleaned vault, database and collection.

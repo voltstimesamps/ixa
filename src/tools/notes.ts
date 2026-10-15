@@ -47,16 +47,38 @@ import { OPTIONAL_STRING, optionalString, type Tool } from "./registry"
 
 const SAVE_NOTE_DESCRIPTION =
   "Write a note in your notebook: a FACT, a DECISION and why it was made, or ongoing WORK. " +
-  // THIS CLAUSE CLAIMS THE VERB, and it is the only thing measured to fix the
-  // reverse-routing failure. Measured: "remember that the stt sidecar uses
-  // base.en, not small" was filed as a PREFERENCE in 4 runs of 4 without this
-  // clause, and wrote a reference note in 2 of 2 with it. The cost seen once,
-  // in a single run: "from now on keep your spoken answers really short" made
-  // no tool call at all and replied "Got it" having stored nothing. Routing is
-  // noisy enough that one run per state is suggestive, not conclusive — see
-  // ARCHITECTURE.md, which carries the per-probe table and the condition for
-  // reverting this.
-  "\"Remember that ...\" is this tool when what follows is a fact or a decision. " +
+  // A CLAUSE CLAIMING THE VERB WAS TRIED HERE, SHIPPED, AND IS NOW REVERTED:
+  //
+  //   "Remember that ..." is this tool when what follows is a fact or a
+  //   decision.                                                    (+76 chars)
+  //
+  // It is still the only thing measured to fix the reverse-routing failure —
+  // "remember that the stt sidecar uses base.en, not small" was filed as a
+  // PREFERENCE in 4 runs of 4 without it, reached save_note in 2 of 2 with it,
+  // and in 3 of 3 on a re-run against a seeded vault. It shipped on that, with
+  // a one-strike revert condition in ARCHITECTURE.md, because the cost seen
+  // in a single run was the same shape as the failure it fixes: a thing the
+  // user said, not recorded.
+  //
+  // THE REVERT CONDITION FIRED LIVE (voice, 2026-10-14). "from now on keep
+  // answers short" made no tool call at all and Ixa said "I'll keep it
+  // concise" — a preference the user stated out loud and nothing stored. That
+  // is the exact symptom the condition names, so the string is gone. A
+  // behaviour instruction silently not stored is worse than a fact filed as a
+  // preference: the misfiled fact is still recorded and still injected into
+  // later turns, it is only unfindable by search_notes, while the preference
+  // does not exist anywhere and was reported as accepted.
+  //
+  // One live data point went the other way the same day and is recorded
+  // because it is what the revert costs: on a TEXT turn, with the clause still
+  // in, "remember that the stt sidecar uses base.en" DID reach save_note —
+  // the file is in the vault as 2026-10-14-stt-sidecar-uses-base-en.
+  //
+  // So "remember that <fact>" is now a KNOWN LIMITATION and not a fixed case
+  // — it may land as a preference, and "write a note ..." is the wording that
+  // routes. Do not re-add this string without a measurement that separates it
+  // from sampling: repeated runs per state, which is what the two runs it
+  // shipped on were not. See ARCHITECTURE.md for the per-probe table.
   "Not how the user wants you to behave — that is remember_preference. " +
   "Call search_notes first, every time: if a note already covers this, set 'supersedes' to its " +
   "id rather than writing a second note that disagrees with the first. Write only what the user " +

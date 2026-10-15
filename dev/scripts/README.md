@@ -40,11 +40,13 @@ Run them against a backend already started with `npm run dev`.
 
   Run `--cleanup` **between** runs that are meant to be compared: without it the next
   run starts on the previous run's vault, which changes every duplicate advisory and
-  every search result. `notes-verify-report-no-clause.md` beside it is the same
-  script's output with `save_note`'s "Remember that ..." clause removed — the comparison
-  that decided the clause ships, and the run that shows the "remember that \<fact>" case
-  filing a fact as a preference without it. Routing is noisy: expect one run per state to be
-  suggestive and not conclusive.
+  every search result. `notes-verify-report.md` is the SHIPPED state, which no longer
+  carries `save_note`'s "Remember that ..." clause — it was reverted after the live
+  tripwire in ARCHITECTURE.md fired. `notes-verify-report-no-clause.md` beside it is the
+  older comparison run that decided the clause ships, kept because it predates the change
+  to probe 1's subject; the clause-era run of this harness is in git history, at the
+  commit before the revert. Routing is noisy: expect one run per state to be suggestive
+  and not conclusive.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping
