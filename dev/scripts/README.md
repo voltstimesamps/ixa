@@ -47,6 +47,14 @@ Run them against a backend already started with `npm run dev`.
   to probe 1's subject; the clause-era run of this harness is in git history, at the
   commit before the revert. Routing is noisy: expect one run per state to be suggestive
   and not conclusive.
+- `decline-verify.ts` — what Ixa says right after the user DECLINES a confirmation. Replays
+  the live history (session `560f3451`, the `touch test.tx` turn) through a REAL `Session` at
+  the production settings, with a confirmer that answers "declined", and lists every reply.
+  Arms are wordings of the declined tool result, interleaved, swapped in by a spy in front of
+  `chat()` so a wording can be measured without editing source; `shipped` is no swap. Needs
+  Groq only. Reads a COPY of `data/ixa.db` (`IXA_DB_PATH`) and refuses the live one, the live
+  vault and the live collections. Usage: `decline-verify.ts [runsPerArm] [arm,arm]`. The
+  summary's counts are a heuristic for sorting; the verdict is reading the replies.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping
