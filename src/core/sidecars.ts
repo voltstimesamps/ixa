@@ -32,6 +32,7 @@ const specs: SidecarSpec[] = [
       STT_HINT_MODE: config.voice.sttHintMode,
       STT_MAX_NO_SPEECH_PROB: String(config.voice.sttMaxNoSpeechProb),
       STT_MIN_AVG_LOGPROB: String(config.voice.sttMinAvgLogprob),
+      STT_NO_SPEECH_CONFIRM_LOGPROB: String(config.voice.sttNoSpeechConfirmLogprob),
     },
   },
   {

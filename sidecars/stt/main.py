@@ -8,7 +8,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from faster_whisper import WhisperModel
 
-from hints import hintArgs, parseHintWords, segmentRejection
+from hints import (
+    NO_SPEECH_CONFIRM_LOGPROB,
+    describeSegment,
+    hintArgs,
+    parseHintWords,
+    segmentRejection,
+)
 
 modelName = os.environ.get('STT_MODEL', 'base.en')
 port = int(os.environ.get('STT_PORT', '5002'))
@@ -20,6 +26,7 @@ hintWords = parseHintWords(os.environ.get('STT_HOTWORDS', ''))
 hintKwargs = hintArgs(hintMode, hintWords)
 maxNoSpeechProb = float(os.environ.get('STT_MAX_NO_SPEECH_PROB', '0.6'))
 minAvgLogprob = float(os.environ.get('STT_MIN_AVG_LOGPROB', '-1.0'))
+confirmLogprob = float(os.environ.get('STT_NO_SPEECH_CONFIRM_LOGPROB', str(NO_SPEECH_CONFIRM_LOGPROB)))
 
 print(f"Loading faster-whisper model '{modelName}'...")
 model = WhisperModel(modelName, device='cpu', compute_type='int8')
@@ -28,7 +35,10 @@ if hintKwargs:
     print(f"[STT] hint mode '{hintMode}' with {len(hintWords)} word(s): {', '.join(hintWords)}")
 else:
     print(f"[STT] hint mode '{hintMode}' — no vocabulary hints")
-print(f"[STT] dropping segments with no_speech_prob > {maxNoSpeechProb} or avg_logprob < {minAvgLogprob}")
+print(
+    f"[STT] dropping segments with no_speech_prob > {maxNoSpeechProb} (only if avg_logprob < "
+    f"{confirmLogprob}), avg_logprob < {minAvgLogprob}, or the hint prompt read back"
+)
 
 
 def transcribeWav(wavBytes: bytes):
@@ -48,10 +58,14 @@ def transcribeWav(wavBytes: bytes):
     # transcript the transport already handles as a false VAD trigger.
     kept = []
     for segment in segments:
-        rejection = segmentRejection(segment, maxNoSpeechProb, minAvgLogprob)
+        rejection = segmentRejection(segment, maxNoSpeechProb, minAvgLogprob, confirmLogprob)
         if rejection:
-            print(f"[STT] dropped segment ({rejection}): {segment.text.strip()!r}")
+            print(f"[STT] dropped segment ({rejection}; {describeSegment(segment)}): {segment.text.strip()!r}")
             continue
+        # A high no_speech_prob that the filter let through is the new path,
+        # so it is logged: it is how a wrongly kept segment would show up.
+        if segment.no_speech_prob > maxNoSpeechProb:
+            print(f"[STT] kept despite no_speech_prob ({describeSegment(segment)}): {segment.text.strip()!r}")
         kept.append(segment.text)
 
     return "".join(kept).strip(), info.language

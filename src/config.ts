@@ -211,6 +211,9 @@ export const config = {
     // the check script will measure it.
     sttMaxNoSpeechProb: parseFloat(process.env.IXA_STT_MAX_NO_SPEECH_PROB ?? "0.6"),
     sttMinAvgLogprob: parseFloat(process.env.IXA_STT_MIN_AVG_LOGPROB ?? "-1.0"),
+    // A high no_speech_prob only drops a segment whose avg_logprob is also
+    // below this. 0 restores the old rule, where no_speech_prob alone dropped.
+    sttNoSpeechConfirmLogprob: parseFloat(process.env.IXA_STT_NO_SPEECH_CONFIRM_LOGPROB ?? "-0.55"),
   },
   qdrant: {
     url: process.env.QDRANT_URL ?? "http://localhost:6333",
