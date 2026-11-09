@@ -207,6 +207,65 @@ const READ_BACK_THE_SUMMARY =
   "what you saved, using the title and the summary above, and say the note is long so they know " +
   "they can ask for any part of it."
 
+// ------------------------------------------------------- the duplicate check
+//
+// What the description asks for and does not get. Verification measured
+// search_notes being called before only three of eight writes, and the write
+// that skipped it duplicated a note that was already there. So the search runs
+// in code on every save (Notebook.save) and its result is reported here.
+//
+// ADVISORY STILL, and still without a threshold: it never stops the write and
+// nothing in it is gated on a score. What changed is that the model now ACTS on
+// it, and three things are why:
+//
+//   1. IT IS THE LAST THING IN THE RESULT. Above the read-back it was read and
+//      then overridden by the read-back's "tell the user in one short
+//      sentence", which was the final instruction standing.
+//   2. IT IS AN INSTRUCTION, not a remark: "decide this BEFORE you reply", and
+//      the exact call to make, `supersedes` set to the first candidate's id
+//      written out. One probe once sent `supersedes="<note_id>"`, a
+//      placeholder, off a description that described the id instead of giving
+//      it.
+//   3. IT IS GONE ONCE THE MODEL HAS SUPERSEDED SOMETHING. The second call's
+//      candidates are the notes it did not pick, and listing them again with
+//      "decide this" invited the model to supersede a second, unrelated note.
+//
+// WHAT WAS TRIED AND IS NOT HERE, because the pattern is the finding. Each
+// wording below was run against the same 30 restatements and the same
+// different-fact negatives (dev/scripts/note-duplicate-verify.ts):
+//
+//   this wording                              restated  "a 4080 costs ..." (a
+//                                             resolved   different fact)
+//   advisory above the read-back (before)      5 / 30     fine
+//   this one, last and imperative             75 / 90     fine (0 of 15 superseded)
+//   "same note unless the user added more"     30 / 30    SUPERSEDED 5 of 5
+//   refusal, nothing written until it chooses  30 / 30    superseded 2 of 5
+//   same as this, plus "or ignore if it is a   21 / 30    fine
+//     different thing"
+//   NEW and OLD side by side                   19 / 30    fine
+//
+// The match score cannot arbitrate: the 4080 note scored 0.82, the restated
+// ones 0.83 to 0.90, so a push strong enough to catch every restatement
+// catches its neighbours too, and a push gentle enough to spare them is this
+// one. A SCORE GATE ON THE WORDING WAS TRIED TOO (strong match, strong text) and
+// is the "same note unless" row above. What this wording still costs: a note
+// that differs from a stored one in a single token ("RTX 3080" against a stored
+// "RTX 3090" purchase, which could equally be a correction of a misheard model
+// number) was superseded 10 of 15 times, against 1 of 5 with no advisory. The
+// superseded note's text is kept, so nothing is lost, only moved out of search.
+export function duplicateAdvisory(duplicates: NoteHit[]): string[] {
+  const first = duplicates[0]
+  if (!first) return []
+  return [
+    `DUPLICATE CHECK — decide this BEFORE you reply. You already have ${duplicates.length} ` +
+      `note(s) that may cover this subject:`,
+    ...duplicates.map((hit) => `  - id ${hit.note.id} — "${hit.note.title}": ${hit.note.summary}`),
+    `If the first one is about the same thing as what you just saved, your very next step is to ` +
+      `call save_note again with exactly the same content and supersedes="${first.note.id}", and ` +
+      `only then reply. If none of them is about the same thing, ignore this and reply as above.`,
+  ]
+}
+
 // ------------------------------------------------------------ what failed
 //
 // Exported, and compared against rather than prefix-matched, for the reason
@@ -405,24 +464,6 @@ export const saveNoteTool: Tool = {
             `supersedes="${result.titleClash.id}".`
         )
       }
-      // What the description asks for and does not get. Verification measured
-      // search_notes being called before only three of eight writes, and the
-      // write that skipped it duplicated a note that was already there. So the
-      // search runs in code on every save and its result is reported here.
-      if (result.duplicates.length > 0) {
-        lines.push(
-          `You already have ${result.duplicates.length} note(s) that may cover this subject:`
-        )
-        for (const hit of result.duplicates) {
-          lines.push(`  - id ${hit.note.id} — "${hit.note.title}": ${hit.note.summary}`)
-        }
-        lines.push(
-          "If one of them is about the same thing as what you just saved, the two will disagree " +
-            "later. Call save_note again with the same content and supersedes set to that id, " +
-            "which marks the old one superseded instead of leaving both active. If none of them " +
-            "is about the same thing, ignore this."
-        )
-      }
       if (priced) lines.push(`A dated price caveat was added to the note automatically.`)
       if (!result.indexed) {
         lines.push(
@@ -435,6 +476,13 @@ export const saveNoteTool: Tool = {
           ? READ_BACK_THE_BODY
           : READ_BACK_THE_SUMMARY
       )
+      // LAST, and that is the whole point of where it is. The advisory used to
+      // sit above the read-back, and the model read the result top to bottom,
+      // reached "Tell the user in one short sentence what you saved" as the
+      // final instruction, and answered: 5 of 30 restatements were resolved.
+      // Moved below it, as an imperative, 75 of 90 were — the voice prompt's
+      // last line wins for the same reason. See duplicateAdvisory.
+      if (!result.superseded) lines.push(...duplicateAdvisory(result.duplicates))
       return lines.join("\n")
     } catch (err) {
       return `Nothing was saved: ${err instanceof Error ? err.message : String(err)}`
