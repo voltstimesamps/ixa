@@ -219,6 +219,116 @@ test("the guard retries once and then delivers, rather than looping", async () =
   sessions.shutdown()
 })
 
+// ------------------------------------- a figure the user gave is not invented
+//
+// Live, 2026-11-08, voice: the user dictated "...below my price range of
+// $300", the model wrote the note and read it back as "three hundred dollars",
+// and the guard rejected that draft for a price nobody had searched. The
+// figure was the user's. The corrective prompt already said so; the guard did
+// not.
+
+test("a figure the user said this turn is not retried, spelled out or not", async () => {
+  const { chat, sent } = scripted([
+    text("Saved note: considering a Dell Precision, price above three hundred dollars."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  const reply = await sessions.submitTurn(
+    "You write a note about my home lab. I don't think I'm going to find one below my price range of $300.",
+    makeConnection({ id: "u1" }),
+    "voice"
+  )
+
+  assert.equal(reply, "Saved note: considering a Dell Precision, price above three hundred dollars.")
+  assert.equal(sent.length, 1, "no corrective call for the user's own figure")
+
+  sessions.shutdown()
+})
+
+test("the user's words and the reply may disagree about how the figure is written", async () => {
+  // Said in words, written in digits: the pair the note guard was built on.
+  const spoken = scripted([text("Your budget of $600 is enough for a used 3090.")])
+  const a = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat: spoken.chat })
+  const replyA = await a.submitTurn(
+    "I have like six hundred bucks, what can I do?",
+    makeConnection({ id: "u2" }),
+    "text"
+  )
+  assert.equal(replyA, "Your budget of $600 is enough for a used 3090.")
+  assert.equal(spoken.sent.length, 1)
+  a.shutdown()
+
+  // And the other way round, with a thousands separator on one side.
+  const typed = scripted([text("Staying under one thousand two hundred dollars is realistic.")])
+  const b = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat: typed.chat })
+  const replyB = await b.submitTurn(
+    "My ceiling is $1,200.",
+    makeConnection({ id: "u3" }),
+    "text"
+  )
+  assert.equal(replyB, "Staying under one thousand two hundred dollars is realistic.")
+  assert.equal(typed.sent.length, 1)
+  b.shutdown()
+})
+
+test("a figure the user did not say is still retried, once, and then delivered", async () => {
+  const { chat, sent } = scripted([
+    text("Around $250 used."),
+    text("Still around $250 used."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  const reply = await sessions.submitTurn(
+    "My budget is $300, how much is a 3060?",
+    makeConnection({ id: "u4" }),
+    "text"
+  )
+
+  assert.equal(reply, "Still around $250 used.", "$250 is not $300")
+  assert.equal(sent.length, 2, "one retry, not a loop")
+  assert.match(String(sent[1]!.at(-1)!.content), /\$250/)
+
+  sessions.shutdown()
+})
+
+test("only the unbacked figures are named in the correction", async () => {
+  const { chat, sent } = scripted([
+    text("Within your $300 budget, the 3060 is about $250 and the 4070 runs $500."),
+    text("Within your three hundred dollar budget, I would have to look up current prices."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+
+  await sessions.submitTurn("My budget is $300, which GPU?", makeConnection({ id: "u5" }), "text")
+
+  assert.equal(sent.length, 2)
+  const correction = String(sent[1]!.at(-1)!.content)
+  assert.match(correction, /\$250/)
+  assert.match(correction, /\$500/)
+  assert.doesNotMatch(correction, /\$300/, "the user's own figure is not something to go and search")
+
+  sessions.shutdown()
+})
+
+test("a figure from an earlier turn is not exempt: the evidence is this turn's", async () => {
+  // The same boundary save_note has. Widening it to the whole conversation is
+  // a separate decision, and this test is where that decision would show.
+  const { chat, sent } = scripted([
+    text("Noted."),
+    text("Your $500 budget fits a 4070."),
+    text("A 4070 fits, but I would have to look up the current price."),
+  ])
+  const sessions = new SessionManager({ idleTimeoutMs: 60_000, limits: TEST_LIMITS, chat })
+  const connection = makeConnection({ id: "u6" })
+
+  await sessions.submitTurn("My budget is $500.", connection, "text")
+  const reply = await sessions.submitTurn("What fits?", connection, "text")
+
+  assert.equal(reply, "A 4070 fits, but I would have to look up the current price.")
+  assert.equal(sent.length, 3, "the second turn was retried")
+
+  sessions.shutdown()
+})
+
 // Registered for the whole file, not per test. The registry has no
 // unregister, and it does not need one: node's test runner gives each file its
 // own process, and the scripted chat below decides what is called, so a tool
