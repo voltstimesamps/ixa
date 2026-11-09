@@ -347,6 +347,59 @@ export function unsupportedAmounts(text: string, evidence: string[]): string[] {
   return unsupported
 }
 
+// A figure the model spelled out that the user said in digits, put back the
+// way the user said it.
+//
+// WHY THIS IS CODE AND NOT A SENTENCE IN A PROMPT. VOICE_RESPONSE_PROMPT tells
+// a SPOKEN reply to write "three hundred dollars", not "$300", and it is the
+// last thing the model reads before it fills in a tool call, so the rule bleeds
+// into text that is never spoken: a note body said "below three hundred
+// dollars" for an utterance that said "$300", while the same call's summary
+// kept the "$300". That file is what Obsidian shows and what a later search
+// hands back. Replaying the live turn 30 times, 6 bodies leaked. A line in the
+// body's schema description made it 10 of 30 and a scoped line in the voice
+// prompt made it 7 of 30 — neither beats the sampling noise — so the figure is
+// fixed where it can be checked.
+//
+// ONLY A VALUE THE USER GAVE IN DIGITS IS RESTORED. The spelled-out amount has
+// to normalize to exactly the same {value, currency} as a digit amount in the
+// user's own turn, and then it becomes that amount's text. Nothing is
+// converted on the strength of the model's wording alone, a spelled-out figure
+// the user did not say in digits is left as written (the price check on the
+// way in has already decided whether it may be there at all), and a figure
+// the user said in WORDS needs nothing: there is no digit form to restore.
+// Currency only — "sixteen gigabytes" for "16 GB" is the same leak in another
+// shape and is deliberately not handled here.
+export interface RestoredFigure {
+  from: string
+  to: string
+}
+
+export function restoreUserDigits(
+  text: string,
+  userText: string
+): { text: string; restored: RestoredFigure[] } {
+  const said = new Map<string, string>()
+  for (const amount of findCurrencyAmounts(userText)) {
+    if (!/\d/.test(amount)) continue
+    const n = normalizeAmount(amount)
+    if (n && !said.has(`${n.currency} ${n.value}`)) said.set(`${n.currency} ${n.value}`, amount)
+  }
+  if (said.size === 0) return { text, restored: [] }
+
+  let out = text
+  const restored: RestoredFigure[] = []
+  for (const amount of findCurrencyAmounts(text)) {
+    if (/\d/.test(amount)) continue
+    const n = normalizeAmount(amount)
+    const digits = n ? said.get(`${n.currency} ${n.value}`) : undefined
+    if (!digits || !out.includes(amount)) continue
+    out = out.split(amount).join(digits)
+    restored.push({ from: amount, to: digits })
+  }
+  return { text: out, restored }
+}
+
 // What a tool says when it refuses to write a figure nobody gave it.
 //
 // It names the amounts and offers both ways out, unlike priceCorrectionPrompt
