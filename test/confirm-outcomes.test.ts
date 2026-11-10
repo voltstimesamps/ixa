@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { SessionManager } from "../src/core/session-manager"
 import { registry } from "../src/tools/registry"
-import type { ChatFn } from "../src/core/session"
+import { CONFIRM_DECLINED, type ChatFn } from "../src/core/session"
 import type { ConfirmationOutcome } from "../src/core/confirmation"
 import { makeConfirmingTool, makeConnection, TEST_LIMITS } from "./helpers"
 
@@ -69,7 +69,8 @@ test("a timeout, a decline and a cancel are three different results, and none of
   assert.equal(cancelled.ran, 0, "a cancel does not run the tool")
 
   // And each says the one thing only it can say.
-  assert.match(declined.result, /declined by user/i)
+  assert.equal(declined.result, CONFIRM_DECLINED)
+  assert.match(declined.result, /declined/i)
   assert.match(cancelled.result, /disconnected/i)
   assert.match(timedOut.result, /did not answer the confirmation in time/i)
 
@@ -86,9 +87,33 @@ test("a timeout, a decline and a cancel are three different results, and none of
 
   // All three say plainly that nothing happened, because a result that leaves
   // that in doubt is one the model retries.
-  for (const outcome of [timedOut, cancelled]) {
+  for (const outcome of [timedOut, declined, cancelled]) {
     assert.match(outcome.result, /[Nn]othing was executed/)
   }
+})
+
+// A DECLINE IS AN ANSWER, AND THE RESULT HAS TO SAY SO.
+//
+// It used to read "Action declined by user." and live that was taken for a
+// decision still to be made: the reply to the user's "no" was "I'll need your
+// confirmation before creating the file. Shall I create ...?" Replaying that
+// history, the bare wording was answered with a fresh question 30 of 30 turns
+// at reasoning_effort low, and this one 4 of 30 and again 4 of 30.
+test("a decline says who answered, what they answered, and not to ask again", () => {
+  // The user answered, and what they answered was no. "Declined by user" named
+  // an event; this names the reply.
+  assert.match(CONFIRM_DECLINED, /the user answered the confirmation with no/)
+  // The two things every unmet outcome says, because a result that leaves
+  // either in doubt is one the model retries.
+  assert.match(CONFIRM_DECLINED, /Nothing was executed/)
+  // The sentence the timeout already carried: re-offering is the user's call.
+  assert.match(
+    CONFIRM_DECLINED,
+    /do not run it again and do not ask again unless they raise it themselves/
+  )
+  // Still distinguishable from the timeout, which is NOT a refusal. If these
+  // ever read alike the model loses the difference the timeout work bought.
+  assert.ok(!/NOT a refusal/.test(CONFIRM_DECLINED), "a decline is a refusal")
 })
 
 test("a confirmed call still runs, which is the control", async () => {

@@ -559,11 +559,23 @@ Tool **descriptions** are read by the LLM when it chooses tools, so they must st
 
 | outcome | what the model reads |
 |---|---|
-| `declined` | *"Action declined by user."* |
+| `declined` | *"Action declined: the user answered the confirmation with no. Nothing was executed. That is their decision for this request, so do not run it again and do not ask again unless they raise it themselves."* |
 | `cancelled` | *"Action cancelled: the client that requested it disconnected before confirming. Nothing was executed."* |
 | `timeout` | *"Action not taken: the user did not answer the confirmation in time. Nothing was executed, and this is NOT a refusal — they may simply have been away. Do not run it again or ask again unless they raise it themselves."* |
 
-A timeout used to be reported as `declined`, which put a decision in the user's mouth: a prompt nobody reached in sixty seconds became a refusal on the record, and a later question about it was answered from a choice that was never made. Only the timeout carries the "do not ask again" sentence — a prompt someone walked away from is not an invitation to re-offer the same action next turn — and only a real "no" keeps the declined wording. The log word is **`unanswered`**, not `timeout`, because this file already logs `timeout` for a tool whose *execution* was abandoned, and a log that calls two different events the same thing cannot be read.
+A timeout used to be reported as `declined`, which put a decision in the user's mouth: a prompt nobody reached in sixty seconds became a refusal on the record, and a later question about it was answered from a choice that was never made. The timeout says it is *not* a refusal; a decline says it *is* one. The log word is **`unanswered`**, not `timeout`, because this file already logs `timeout` for a tool whose *execution* was abandoned, and a log that calls two different events the same thing cannot be read.
+
+**A bare "Action declined by user." was read as a decision still to be made.** Found on the first live run (2026-11-08, session `560f3451`): the user typed no to `shell_write touch test.tx`, and the reply was *"I'll need your confirmation before creating the file. Shall I create an empty file named test.tx in your home directory?"* — a question about the answer the user had just given. Replaying that history through a real `Session` (restored messages, preference block, working-directory line, voice constraint, `reasoning_effort: low`, the confirmer answering `declined`), 30 runs per arm, arms interleaved, with `dev/scripts/decline-verify.ts`:
+
+| wording of the declined result | replies that asked again |
+|---|---|
+| bare *"Action declined by user."* | **30 / 30** |
+| the shipped wording, first batch | **4 / 30** |
+| the shipped wording, second batch (interleaved with the next row) | **4 / 30** |
+| the shipped wording, run through the real constant with no rewrite | **2 / 30** |
+| *"…That is their answer, not a question waiting to be answered, so do not ask them to confirm…"* | **30 / 30**, every one *"Do you want me to create…?"* or *"Would you like me to create…?"* |
+
+Counted by reading every reply, not by pattern: "asked again" is a direct question about doing the action (*"Should I proceed?"*, *"Do you want me to create…?"*). The two words in the last row are the finding — **naming the question primes it**, so the shipped sentence names the decision (*"the user answered the confirmation with no"*) and says it is theirs. It carries the sentence the timeout already had, *do not run it again and do not ask again unless they raise it themselves*, and `shell_write` was not re-called in any of the 150 measured runs, in any arm. **What is still open:** about one reply in nine (10 of 90 across the three runs of the shipped wording) still asks, and another 11 of the 90 end *"just say yes"* or *"just confirm"* — an open offer, not a pending question, but it invites an answer the user was not asked for. This is a wording lever on a sampled model, not a guarantee; the claim guard is unchanged and still arms on `declined`. Not measured: the live turn also carried three recalled episodes, which the replay omits.
 
 **And the client's own expiry says so too, or the fix would stop at the backend.** The desktop client expires its prompt a second early and sends a `"no"`, so in practice the backend's timer rarely fires for it — that `"no"` would have landed as an explicit decline, the same inaccuracy one layer out. `confirmReply` therefore carries an **optional, additive `reason`**, and the one value the backend reads is `"expired"`. A client that sends nothing behaves exactly as before, an unknown reason is ignored (so no future client can turn a refusal into a timeout with a word this code has never heard of), and the client no longer tells the user it "answered no" on their behalf. On the terminal confirmer the same distinction is drawn by a flag: the timer firing is a `timeout`, while **stdin closing is a `cancelled`** — nobody can answer, which is the terminal's version of the socket going away.
 

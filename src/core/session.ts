@@ -481,7 +481,23 @@ export function confirmationText(description: string, command?: string): string 
 // the model retries. The timeout adds the sentence the other two do not need:
 // do not ask again on your own. A prompt the user walked away from is not an
 // invitation to re-offer the same action on the next turn.
-const CONFIRM_DECLINED = "Action declined by user."
+//
+// The decline carries that sentence too, now, and it did not always. It used
+// to be the bare "Action declined by user.", and live that was read as a
+// decision still to be made: the reply to a "no" was "I'll need your
+// confirmation before creating the file. Shall I create ...?" Replaying that
+// history 30 times at reasoning_effort low, the bare wording was answered with
+// a fresh question 30 of 30; this one, 4 of 30 and then 4 of 30 again. It
+// says WHO answered and WHAT they answered, because "declined by user" names
+// an event and not a reply, and it says the answer is theirs for this request.
+//
+// Not "that is their answer, not a question waiting to be answered": measured
+// as a second wording, it was answered with "Do you want me to create ...?"
+// 30 of 30. Naming the question primes it, so the sentence names the decision.
+export const CONFIRM_DECLINED =
+  "Action declined: the user answered the confirmation with no. Nothing was executed. " +
+  "That is their decision for this request, so do not run it again and do not ask again " +
+  "unless they raise it themselves."
 
 const CONFIRM_CANCELLED =
   "Action cancelled: the client that requested it disconnected before confirming. " +
