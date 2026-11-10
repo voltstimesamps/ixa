@@ -63,6 +63,15 @@ Run them against a backend already started with `npm run dev`.
   is long" was told to it by `save_note`'s own result. Throwaway db/vault/collections required
   (it refuses the live ones, and refuses a working database equal to the replay source); needs
   Ollama, Qdrant and Groq, not the backend. `lib/direct-turn.ts` is the tool loop it drives.
+- `note-duplicate-verify.ts` — does the model ACT on `save_note`'s duplicate advisory? Drives the
+  real `Session` (voice origin, preference block, voice prompt), the real tools and a real
+  Notebook, from a fresh copy of the live vault's seven notes for EVERY trial, and scores the
+  state the turn leaves: restatements of a seeded note must end with one active note, and
+  different-fact negatives must not supersede anything. Its own throwaway paths and collection
+  (`/tmp/ixa-note-duplicate-verify`, `notes_duplicate_verify`), so it can run beside
+  `notes-verify.ts`. `--only P1,N10`, `--scale 2` for twice the runs, `--arm <label>` and
+  `--out file.json` to keep a run, `--cleanup`. The cases include hard negatives that score as
+  high as the restatements; without them a stronger advisory looks free.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping
@@ -93,6 +102,7 @@ Usage:
     npx tsx dev/scripts/rebuild-note-index.ts
     npx tsx dev/scripts/notes-verify.ts
     npx tsx dev/scripts/notes-verify.ts --cleanup
+    npx tsx dev/scripts/note-duplicate-verify.ts --only P1,N10 --scale 0.4
     npx tsx dev/scripts/forget-episode.ts 12 --dry-run
     npx tsx dev/scripts/tts-abort.ts            # expect the one-line disconnect
     npx tsx dev/scripts/tts-abort.ts complete   # control: expect "done: N chunk(s)"

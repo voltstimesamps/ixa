@@ -227,11 +227,86 @@ test("the tool tells the model to supersede the duplicate, with its id", async (
 
   assert.match(output, /may cover this subject/)
   assert.match(output, new RegExp(`id ${first.note.id}`), "the id 'supersedes' needs")
-  assert.match(output, /supersedes set to that id/)
+  // The call itself, written out with the id in it: a description of the id
+  // once came back as the literal string "<note_id>".
+  assert.ok(
+    output.includes(`supersedes="${first.note.id}"`),
+    "the advisory names the exact argument to send"
+  )
   assert.match(output, /If none of them is about the same thing, ignore this/)
-  // The read-back still comes first: the note WAS saved, and the reply has to
-  // say so rather than reporting a near-miss as a failure.
   assert.ok(output.indexOf("Saved decision note") < output.indexOf("may cover this subject"))
+})
+
+// WHERE THE ADVISORY SITS IS THE FIX, not decoration. Above the read-back it
+// was read and then overridden by "tell the user in one short sentence", the
+// last instruction standing, and the model resolved 5 restatements of 30.
+// Last, as an imperative, 75 of 90 were resolved. A refactor that
+// tidies it back above the read-back would pass every other test in this file.
+test("the duplicate advisory is the LAST thing in the result, after the read-back", async (t) => {
+  const h = makeNotebook()
+  t.after(() => {
+    setNotebook(null)
+    h.cleanup()
+  })
+  setNotebook(h.notebook)
+
+  await h.notebook.save(GROQ)
+  offerEverything(h)
+
+  const output = String(
+    await withTurn({ userText: "make a note that we're on the groq dev tier now" }, () =>
+      saveNoteTool.execute({
+        type: "decision",
+        title: GROQ_AGAIN.title,
+        summary: GROQ_AGAIN.summary,
+        sections: GROQ_AGAIN.sections,
+      })
+    )
+  )
+
+  const readBack = output.indexOf("REPEAT THE BODY ABOVE WORD FOR WORD")
+  const advisory = output.indexOf("DUPLICATE CHECK")
+  assert.ok(readBack >= 0 && advisory >= 0)
+  assert.ok(readBack < advisory, "the read-back instruction comes before the advisory")
+  const lastLine = output.trimEnd().split("\n").at(-1)!
+  assert.match(lastLine, /ignore this and reply as above/, "the advisory is what the result ends on")
+})
+
+// The second call's candidates are the notes the model did NOT pick. Listing
+// them again with "decide this before you reply" is how a second, unrelated
+// note gets superseded.
+test("no advisory once the call has superseded a note", async (t) => {
+  const h = makeNotebook()
+  t.after(() => {
+    setNotebook(null)
+    h.cleanup()
+  })
+  setNotebook(h.notebook)
+
+  const first = await h.notebook.save(GROQ)
+  await h.notebook.save({
+    ...GROQ,
+    title: "Tavily is the search provider",
+    summary: "Web search goes through Tavily.",
+    sections: [{ heading: "The choice", body: "Tavily returns extracted content." }],
+  })
+  offerEverything(h)
+
+  const output = String(
+    await withTurn({ userText: "make a note that we're on the groq dev tier now" }, () =>
+      saveNoteTool.execute({
+        type: "decision",
+        title: GROQ_AGAIN.title,
+        summary: GROQ_AGAIN.summary,
+        sections: GROQ_AGAIN.sections,
+        supersedes: first.note.id,
+      })
+    )
+  )
+
+  assert.match(output, /Superseded "/)
+  assert.ok(!output.includes("DUPLICATE CHECK"), output)
+  assert.ok(!output.includes("may cover this subject"), output)
 })
 
 test("nothing is said about duplicates when there are none", async (t) => {
