@@ -19,7 +19,7 @@ import { requestConfirmation } from "./confirmation"
 import { buildWindow, type ContextWindowLimits } from "./context-window"
 import { currentTurnEvidence, runWithSessionControl } from "./session-context"
 import { shortenForSpeech } from "../voice/shorten"
-import { findCurrencyAmounts, priceCorrectionPrompt } from "./prices"
+import { priceCorrectionPrompt, unsupportedAmounts } from "./prices"
 import {
   claimCorrectionPrompt,
   findCompletionClaim,
@@ -1364,7 +1364,22 @@ export class Session {
           // rejected draft is deliberately NOT pushed to history: the user
           // never heard it, and history claiming she said it would be the same
           // drift the turn-failure path exists to prevent.
-          const amounts = findCurrencyAmounts(response.content)
+          //
+          // Only figures nothing in this turn backs. The corrective prompt
+          // has always promised that the user's own figure is exempt ("your
+          // $500 budget"), but it promised that to a model the guard had
+          // already sent back for it: live, the user said "$300", the reply
+          // read it back, and the guard spent a second LLM call on the user's
+          // own number (first audio 2.97s against about 1s). save_note's
+          // comparison settles it, on value and currency, so "$300" heard and
+          // "three hundred dollars" written are one figure. Its evidence too:
+          // this turn's user text and search results, so a figure from an
+          // EARLIER turn is not exempt here.
+          const evidence = currentTurnEvidence()
+          const amounts = unsupportedAmounts(response.content, [
+            evidence?.userText ?? "",
+            ...(evidence?.searchResults ?? []),
+          ])
           if (amounts.length > 0 && !searchedThisTurn) {
             if (!priceGuardUsed) {
               priceGuardUsed = true
