@@ -55,6 +55,14 @@ Run them against a backend already started with `npm run dev`.
   Groq only. Reads a COPY of `data/ixa.db` (`IXA_DB_PATH`) and refuses the live one, the live
   vault and the live collections. Usage: `decline-verify.ts [runsPerArm] [arm,arm]`. The
   summary's counts are a heuristic for sorting; the verdict is reading the replies.
+- `note-numbers-verify.ts` — replays the live turn that wrote "three hundred dollars" into a
+  note body for an utterance that said "$300": the real history (read from the live database
+  read-only at run time, never copied), the saved preference, the voice prompt trailing, the
+  real tools, `reasoning_effort: low`. Scores, per run, whether the model's FIRST `save_note`
+  call and the note FILE it produced spelled the figure out, and whether the reply's "the note
+  is long" was told to it by `save_note`'s own result. Throwaway db/vault/collections required
+  (it refuses the live ones, and refuses a working database equal to the replay source); needs
+  Ollama, Qdrant and Groq, not the backend. `lib/direct-turn.ts` is the tool loop it drives.
 - `tts-abort.ts` — hangs up on the TTS sidecar mid-stream, the way the harness
   does when a client disconnects during a reply. Needs only the sidecar, not
   the backend. The sidecar should log one "client disconnected, stopping

@@ -3,7 +3,9 @@ import {
   findCurrencyAmounts,
   priceAsOfLine,
   priceRefusal,
+  restoreUserDigits,
   unsupportedAmounts,
+  type RestoredFigure,
 } from "../core/prices"
 import { getNotebook } from "../memory/notebook"
 import { NOTE_TYPES, type NoteSection, type NoteType } from "../memory/notes-markdown"
@@ -131,6 +133,20 @@ export function typeCoercedLine(given: string): string {
     ? `'type' was "${given}", which is not one of ${NOTE_TYPES.join(", ")}`
     : "'type' was missing"
   return `${what}, so this was saved as a reference note.`
+}
+
+// Said only when a spelled-out figure was put back as the user's digits, so an
+// ordinary save reads exactly as it did before. Distinct figures only: a
+// figure repeated in the title, summary and body is one correction.
+export function figuresRestoredLine(restored: RestoredFigure[]): string {
+  const seen = new Set<string>()
+  const parts: string[] = []
+  for (const { from, to } of restored) {
+    if (seen.has(from)) continue
+    seen.add(from)
+    parts.push(`"${from}" as "${to}"`)
+  }
+  return `Written the way the user said it: ${parts.join(", ")}.`
 }
 
 interface SaveNoteInput {
@@ -307,9 +323,9 @@ export const saveNoteTool: Tool = {
 
     const raw = (typeof input === "object" && input !== null ? input : {}) as SaveNoteInput
     const { type, given: typeGiven } = coerceNoteType(raw.type)
-    const title = typeof raw.title === "string" ? raw.title.trim() : ""
-    const summary = typeof raw.summary === "string" ? raw.summary.trim() : ""
-    const sections = asSections(raw.sections)
+    let title = typeof raw.title === "string" ? raw.title.trim() : ""
+    let summary = typeof raw.summary === "string" ? raw.summary.trim() : ""
+    let sections = asSections(raw.sections)
 
     if (!title) return "Nothing was saved: 'title' is required."
     if (!summary) return "Nothing was saved: 'summary' is required."
@@ -327,6 +343,23 @@ export const saveNoteTool: Tool = {
         "note's provenance and any price in it come from the turn."
       )
     }
+
+    // A price the user said in digits is stored in digits. See restoreUserDigits
+    // for why this is code: VOICE_RESPONSE_PROMPT's "spell numbers out" is for
+    // what is SPOKEN and bleeds into what is written. Before the price check, so
+    // the check reads what will be on disk.
+    const restored: RestoredFigure[] = []
+    const restore = (text: string): string => {
+      const result = restoreUserDigits(text, evidence.userText)
+      restored.push(...result.restored)
+      return result.text
+    }
+    title = restore(title)
+    summary = restore(summary)
+    sections = sections.map((section) => ({
+      heading: restore(section.heading),
+      body: restore(section.body),
+    }))
 
     const body = noteText(title, summary, sections)
     const unsupported = unsupportedAmounts(body, [evidence.userText, ...evidence.searchResults])
@@ -377,6 +410,7 @@ export const saveNoteTool: Tool = {
         // Only when the model's own value was not used, so the ordinary save
         // reads exactly as it did before.
         ...(typeGiven === null ? [] : [typeCoercedLine(typeGiven)]),
+        ...(restored.length === 0 ? [] : [figuresRestoredLine(restored)]),
         `Summary on disk: ${result.note.summary}`,
       ]
       // `sections`, not `stamped`: the price caveat is appended by code and
